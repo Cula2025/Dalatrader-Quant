@@ -1,0 +1,5 @@
+up = st.file_uploader("Välj fil", type=["json"], key="profile_uploader")
+up =
+
+
+

@@ -1,0 +1,14 @@
+[Unit]
+Description=Trader UI (Streamlit)
+After=network.target
+
+[Service]
+User=claes
+WorkingDirectory=/srv/trader/app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/srv/trader/app/.venv/bin/python -m streamlit run /srv/trader/app/Home.py --server.headless true --server.address 127.0.0.1 --server.port 8501
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
