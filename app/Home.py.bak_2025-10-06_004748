@@ -1,0 +1,9 @@
+import streamlit as st
+st.set_page_config(page_title="Trader 2.0", page_icon="🚀")
+st.title("🚀 Trader 2.0 – start")
+st.write("Vi kör endast V2-spåret.")
+try:
+    # Streamlit 1.30+: direktlänk till sidan
+    st.page_link("pages/7_Portfolio_V2_Lines.py", label="➡️ Öppna Portfolio V2 – linjer", icon="📈")
+except Exception:
+    st.info("Öppna ”Portfolio V2 – linjer” i menyn till vänster.")

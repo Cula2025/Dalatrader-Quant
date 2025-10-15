@@ -1,0 +1,115 @@
+{
+  "groups": [
+    {
+      "key": "basic",
+      "label": "Bas",
+      "collapsed": false,
+      "fields": [
+        {
+          "key": "strategy",
+          "label": "Strategi",
+          "type": "select",
+          "options": ["RSI", "MA", "MACD", "BB"],
+          "default": "RSI",
+          "help": "Välj huvudsaklig signalgenerator."
+        },
+        {
+          "key": "start_capital",
+          "label": "Startkapital",
+          "type": "number",
+          "default": 100000.0,
+          "min": 1000.0,
+          "max": 1000000000.0,
+          "step": 1000.0
+        },
+        {
+          "key": "risk_pct",
+          "label": "Max % per affär",
+          "type": "number",
+          "default": 10.0,
+          "min": 0.1,
+          "max": 100.0,
+          "step": 0.5
+        }
+      ]
+    },
+    {
+      "key": "rsi",
+      "label": "RSI",
+      "collapsed": false,
+      "visible_if": { "strategy": "RSI" },
+      "fields": [
+        { "key": "rsi_n", "label": "RSI-fönster", "type": "number", "default": 14, "min": 2, "max": 200, "step": 1 },
+        { "key": "rsi_buy", "label": "Köp-tröskel", "type": "number", "default": 55, "min": 0, "max": 100, "step": 1, "help": "Köp när RSI korsar UPP genom detta värde." },
+        { "key": "rsi_sell", "label": "Sälj-tröskel", "type": "number", "default": 45, "min": 0, "max": 100, "step": 1, "help": "Sälj när RSI korsar NED genom detta värde. (OK att vara > buy om din strategi är byggd så.)" }
+      ]
+    },
+    {
+      "key": "ma",
+      "label": "MA-kors",
+      "collapsed": true,
+      "visible_if": { "strategy": "MA" },
+      "fields": [
+        { "key": "ma_fast", "label": "Snabb MA", "type": "number", "default": 10, "min": 1, "max": 400, "step": 1 },
+        { "key": "ma_slow", "label": "Långsam MA", "type": "number", "default": 100, "min": 2, "max": 800, "step": 1 },
+        { "key": "ma_type", "label": "Typ", "type": "select", "options": ["SMA", "EMA", "HMA"], "default": "EMA" }
+      ]
+    },
+    {
+      "key": "macd",
+      "label": "MACD",
+      "collapsed": true,
+      "visible_if": { "strategy": "MACD" },
+      "fields": [
+        { "key": "macd_fast",   "label": "Snabb",  "type": "number", "default": 12, "min": 1, "max": 200, "step": 1 },
+        { "key": "macd_slow",   "label": "Långsam","type": "number", "default": 26, "min": 2, "max": 400, "step": 1 },
+        { "key": "macd_signal", "label": "Signal", "type": "number", "default": 9,  "min": 1, "max": 200, "step": 1 }
+      ]
+    },
+    {
+      "key": "bb",
+      "label": "Bollinger",
+      "collapsed": true,
+      "visible_if": { "strategy": "BB" },
+      "fields": [
+        { "key": "bb_n", "label": "Fönster", "type": "number", "default": 20, "min": 2, "max": 400, "step": 1 },
+        { "key": "bb_k", "label": "Std-mult", "type": "number", "default": 2.0, "min": 0.5, "max": 4.0, "step": 0.1 }
+      ]
+    },
+    {
+      "key": "trend",
+      "label": "Trendfilter",
+      "collapsed": true,
+      "fields": [
+        { "key": "trend_on", "label": "Använd trendfilter", "type": "checkbox", "default": false },
+        { "key": "trend_n", "label": "Trend-MA", "type": "number", "default": 200, "min": 2, "max": 800, "step": 1, "visible_if": { "trend_on": true } },
+        { "key": "trend_type", "label": "Typ", "type": "select", "options": ["SMA","EMA","HMA"], "default": "EMA", "visible_if": { "trend_on": true } }
+      ]
+    },
+    {
+      "key": "atr",
+      "label": "ATR-stopp",
+      "collapsed": true,
+      "fields": [
+        { "key": "atr_stop_on", "label": "Aktivera ATR-stopp", "type": "checkbox", "default": false },
+        { "key": "atr_n", "label": "ATR-fönster", "type": "number", "default": 14, "min": 2, "max": 200, "step": 1, "visible_if": { "atr_stop_on": true } },
+        { "key": "atr_mult", "label": "ATR-multiplikator", "type": "number", "default": 3.0, "min": 0.5, "max": 10.0, "step": 0.5, "visible_if": { "atr_stop_on": true } }
+      ]
+    },
+    {
+      "key": "costs",
+      "label": "Kostnader & Ränta",
+      "collapsed": true,
+      "fields": [
+        { "key": "cost_bps", "label": "Kostnad (bps per affär)", "type": "number", "default": 0.0, "min": 0.0, "max": 200.0, "step": 1.0 },
+        { "key": "cash_rate_apy", "label": "Kontoränta (APY %)", "type": "number", "default": 0.0, "min": 0.0, "max": 20.0, "step": 0.25 }
+      ]
+    }
+  ],
+  "defaults_always": {
+    "max_positions": 1,
+    "per_trade_pct": 100.0,
+    "max_exposure_pct": 100.0
+  }
+}
+

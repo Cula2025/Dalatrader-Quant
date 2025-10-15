@@ -1,0 +1,256 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json, math, random, itertools
+from dataclasses import asdict
+from datetime import date
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# Branding (optional)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title="Dala Trader – Optimizer", page_icon="⚙️")
+
+st.title("⚙️ Optimizer")
+st.caption("Random-search (Monte Carlo) med 10 000 simuleringar. Skapar tre profiler per aktie: conservative, balanced, aggressive.")
+
+# ---------- helpers ----------
+def _normalize_ticker_out(t: str) -> str:
+    t = (t or "").strip()
+    if not t: return t
+    if t.upper().endswith(".ST"):
+        t = t[:-3]
+    t = t.replace("-", " ").strip()
+    return t
+
+def _score(metrics: Dict[str, Any]) -> float:
+    # Högre är bättre. SharpeD driver, TotalReturn hjälper, MaxDD (negativ) straffar.
+    sh = float(metrics.get("SharpeD") or 0.0)
+    tr = float(metrics.get("TotalReturn") or 0.0)
+    dd = float(metrics.get("MaxDD") or 0.0)  # typiskt negativ
+    return 0.7*sh + 0.4*tr + 0.15*dd
+
+def _sample_params(rng: random.Random) -> Dict[str, Any]:
+    # Sampla alla parametrar över rimliga intervall
+    rsi_window = rng.randint(5, 35)
+    rsi_min = rng.uniform(5.0, 40.0)
+    rsi_max = rng.uniform(max(rsi_min+5.0, 50.0), 85.0)
+
+    use_trend_filter = rng.random() < 0.7
+    trend_ma_window = rng.randint(50, 250)
+
+    breakout_lookback = rng.choice([0, 20, 55, 100])  # 0 = av, annars klassiska nivåer
+    exit_lookback     = rng.choice([10, 20, 55])
+
+    use_macd_filter = rng.random() < 0.4
+    macd_fast = rng.randint(8, 15)
+    macd_slow = rng.randint(18, 30)
+    macd_signal = rng.randint(6, 12)
+
+    use_bb_filter = rng.random() < 0.3
+    bb_window = rng.randint(18, 26)
+    bb_nstd = rng.uniform(1.6, 2.4)
+    bb_min = rng.uniform(0.0, 0.6)
+
+    use_stop_loss = rng.random() < 0.25
+    stop_mode = rng.choice(["pct", "atr"])
+    stop_loss_pct = rng.uniform(0.03, 0.15)
+
+    atr_window = rng.randint(10, 20)
+    atr_mult = rng.uniform(1.2, 3.0)
+    use_atr_trailing = rng.random() < 0.3
+    atr_trail_mult = rng.uniform(1.2, 3.5)
+
+    # Lägg även in trend_ma_type i exporten (för kompatibilitet), även om backtest ignorerar den
+    trend_ma_type = "EMA"
+
+    return {
+        "use_rsi_filter": True,  # vår strategi använder RSI
+        "rsi_window": rsi_window,
+        "rsi_min": rsi_min,
+        "rsi_max": rsi_max,
+
+        "use_trend_filter": use_trend_filter,
+        "trend_ma_type": trend_ma_type,
+        "trend_ma_window": trend_ma_window,
+
+        "breakout_lookback": breakout_lookback,
+        "exit_lookback": exit_lookback,
+
+        "use_macd_filter": use_macd_filter,
+        "macd_fast": macd_fast,
+        "macd_slow": macd_slow,
+        "macd_signal": macd_signal,
+
+        "use_bb_filter": use_bb_filter,
+        "bb_window": bb_window,
+        "bb_nstd": bb_nstd,
+        "bb_min": bb_min,
+
+        "use_stop_loss": use_stop_loss,
+        "stop_mode": stop_mode,
+        "stop_loss_pct": stop_loss_pct,
+        "atr_window": atr_window,
+        "atr_mult": atr_mult,
+        "use_atr_trailing": use_atr_trailing,
+        "atr_trail_mult": atr_trail_mult,
+    }
+
+def _run_bt(ticker: str, params: Dict[str, Any], start: str, end: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    from app.btwrap import run_backtest
+    profile = {"ticker": ticker, "params": {**params, "from_date": start, "to_date": end}}
+    res = run_backtest(profile)
+    summ: Dict[str, Any] = res.get("summary", {}) if isinstance(res, dict) else {}
+    return profile, summ
+
+def _pick_three(df: pd.DataFrame, ticker_out: str) -> List[Dict[str, Any]]:
+    # df innehåller kolumner: params, metrics, SharpeD, TotalReturn, MaxDD, score
+    # Välj tre profiler ur df:
+    out: List[Dict[str, Any]] = []
+
+    # 1) balanced: max SharpeD
+    df_bal = df.sort_values("SharpeD", ascending=False)
+    row_bal = df_bal.iloc[0]
+
+    # 2) conservative: lägsta MaxDD bland topp 20% Sharpe
+    topN = max(1, int(0.2 * len(df)))
+    df_top = df_bal.head(topN)
+    row_cons = df_top.sort_values("MaxDD", ascending=False).iloc[-1] if len(df_top) else df_bal.iloc[-1]
+
+    # 3) aggressive: max TotalReturn
+    row_aggr = df.sort_values("TotalReturn", ascending=False).iloc[0]
+
+    picks = [
+        ("conservative", row_cons),
+        ("balanced", row_bal),
+        ("aggressive", row_aggr),
+    ]
+
+    for name, row in picks:
+        params = dict(row["params"])
+        metrics = dict(row["metrics"])
+        out.append({
+            "name": f"{ticker_out} – {name}",
+            "ticker": ticker_out,
+            "params": params,
+            "metrics": {
+                "TotalReturn": float(metrics.get("TotalReturn") or 0.0),
+                "MaxDD": float(metrics.get("MaxDD") or 0.0),
+                "SharpeD": float(metrics.get("SharpeD") or 0.0),
+                "BuyHold": float(metrics.get("BuyHold") or 0.0),
+                "CAGR": float(metrics.get("CAGR") or 0.0),
+            }
+        })
+    return out
+
+# ---------- Sidebar inputs ----------
+with st.sidebar:
+    st.subheader("Indata")
+    ticker = st.text_input("Ticker", value=st.session_state.get("ticker", "VOLV-B.ST")).strip()
+    colA, colB = st.columns(2)
+    with colA:
+        from_date = st.date_input("Från", value=date(2020,1,1))
+    with colB:
+        to_date = st.date_input("Till", value=date.today())
+    sims = st.number_input("Antal simuleringar", min_value=100, max_value=20000, value=10000, step=1000)
+    seed = st.number_input("Slump-seed", min_value=0, max_value=2**31-1, value=42, step=1)
+    run_btn = st.button("🚀 Kör optimering")
+
+# ---------- Run ----------
+if run_btn:
+    if not ticker:
+        st.error("Ange en ticker.")
+        st.stop()
+
+    t_out = _normalize_ticker_out(ticker)
+    rng = random.Random(int(seed))
+    start_s = str(from_date)
+    end_s = str(to_date)
+
+    rows: List[Dict[str, Any]] = []
+    prog = st.progress(0, text="Kör backtester...")
+
+    failures = 0
+    for i in range(int(sims)):
+        try:
+            pars = _sample_params(rng)
+            profile, summ = _run_bt(ticker, pars, start_s, end_s)
+            # Extrahera metrik
+            row = {
+                "params": pars,
+                "metrics": summ,
+                "SharpeD": float(summ.get("SharpeD") or 0.0),
+                "TotalReturn": float(summ.get("TotalReturn") or 0.0),
+                "MaxDD": float(summ.get("MaxDD") or 0.0),
+            }
+            row["score"] = _score(row["metrics"])
+            rows.append(row)
+        except Exception as e:
+            failures += 1
+        if (i+1) % max(1, sims//100) == 0:
+            prog.progress((i+1)/sims, text=f"Kör backtester... {i+1}/{sims}")
+
+    prog.empty()
+
+    if not rows:
+        st.error("Inga lyckade körningar. Kontrollera ticker och datum.")
+        st.stop()
+
+    df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+
+    # Visa topplista
+    st.markdown("### Resultat (topp 50 på score)")
+    show_cols = ["score","SharpeD","TotalReturn","MaxDD"]
+    tbl = df[show_cols].head(50).copy()
+    st.dataframe(tbl, width='stretch')
+
+    # Välj tre profiler och bygg export
+    picks = _pick_three(df, t_out)
+    export = {"profiles": picks}
+
+    # Visa tre profiler
+    st.markdown("### Bästa profiler")
+    for p in picks:
+        st.json(p, expanded=False)
+
+    # Spara till fil
+    outdir = Path("profiles")
+    outdir.mkdir(parents=True, exist_ok=True)
+    outfile = outdir / f"{t_out}.json"
+    outfile.write_text(json.dumps(export, ensure_ascii=False, indent=2), encoding="utf-8")
+    st.success(f"✅ Sparat till {outfile}")
+
+    # Knappar för att applicera direkt till Backtest (balanced som default)
+    def _apply_to_session(pp: Dict[str, Any]):
+        st.session_state["ticker"] = ticker
+        pars = dict(pp.get("params") or {})
+        # Mappa in datumen också så Backtest tar samma period
+        pars["from_date"] = start_s
+        pars["to_date"]   = end_s
+        # Lägg in nycklarna i sessionen (widgets på Backtest/Optimizer läser härifrån)
+        for k, v in pars.items():
+            st.session_state[k] = v
+        st.info("Applicerat till session. Gå till Backtest för att köra.")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button(f"✅ Använd {t_out} – conservative"):
+            _apply_to_session(picks[0])
+    with col2:
+        if st.button(f"✅ Använd {t_out} – balanced"):
+            _apply_to_session(picks[1])
+    with col3:
+        if st.button(f"✅ Använd {t_out} – aggressive"):
+            _apply_to_session(picks[2])
+
+    st.caption(f"Misslyckade körningar: {failures}")
+else:
+    st.caption("Tips: börja med default 10 000 simuleringar. När det ser bra ut – ändra seed och kör igen för robusthet.")

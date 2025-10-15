@@ -1,0 +1,422 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json, random, math
+from datetime import date
+from typing import Dict, Any, List
+
+import pandas as pd
+import streamlit as st
+from app.btwrap import run_backtest as _RUNBT
+
+# Branding (valfritt)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+# Backtest-wrap (UI-oberoende entrypoint vi redan använt)
+try:
+    from app.btwrap import run_backtest as RUN_BT
+except Exception:
+    RUN_BT = None
+
+brand(page_title="Dala Trader – Optimizer", page_icon="⚙️")
+
+st.title("⚙️ Optimizer (steg 2)")
+st.caption("Kör simuleringar, visar en tabell och kan spara tre profiler. Inga grafer ännu.")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Diagnostik
+# ──────────────────────────────────────────────────────────────────────
+# ── diag: safe defaults (do not depend on widgets) ───────────────────
+try:
+    from app.btwrap import run_backtest as RUN_BT
+except Exception:
+    RUN_BT = None
+ticker = (st.session_state.get("ticker") or st.session_state.get("opt_ticker") or "").strip()
+from_date = st.session_state.get("from_date") or st.session_state.get("opt_from") or ""
+to_date   = st.session_state.get("to_date")   or st.session_state.get("opt_to")   or ""
+if "sample_params" not in globals():
+    def sample_params(_rng):
+        return {}
+# ─────────────────────────────────────────────────────────────────────
+
+with st.sidebar.expander("Diagnostik", expanded=False):
+    st.write("**RUN_BT importerat?**", "✅" if RUN_BT else "❌")
+    st.write("**Ticker**:", st.session_state.get('ticker',''))
+    st.write("**Från/Till**:", from_date, "→", to_date)
+    if st.button("🔎 Testa 1 körning (snabb)"):
+        if RUN_BT is None:
+            st.error("RUN_BT är None – kan inte köra backtest. Kontrollera app.btwrap.")
+        elif not ticker:
+            st.error("Ange en ticker först.")
+        else:
+            try:
+                _profile = {"ticker": ticker, "params": sample_params(__import__("random").Random(123))}
+                _res = RUN_BT(_profile)
+                _summ = _res.get("summary", {}) if isinstance(_res, dict) else {}
+                st.success("OK – fick svar från backtest")
+                st.json({"summary": _summ})
+            except Exception as _e:
+                import traceback as _tb
+                st.error(f"Backtest fel: {type(_e).__name__}: {_e}")
+                st.code(_tb.format_exc())
+
+# ──────────────────────────────────────────────────────────────────────
+# Indata
+# ──────────────────────────────────────────────────────────────────────
+c1, c2, c3 = st.columns(3)
+with c1:
+    ticker = st.text_input("Ticker", value=st.session_state.get("opt_ticker", "GETI B"), key="opt_ticker")
+with c2:
+    from_date = st.text_input("Från (YYYY-MM-DD)", value=st.session_state.get("opt_from_date", "2020-10-01"), key="opt_from_date")
+with c3:
+    to_date   = st.text_input("Till (YYYY-MM-DD)", value=st.session_state.get("opt_to_date", "2025-10-01"), key="opt_to_date")
+
+c4, c5, c6 = st.columns(3)
+with c4:
+    sims = st.number_input("Antal simuleringar", min_value=100, max_value=100_000, step=100, value=1000, key="opt_sims")
+with c5:
+    seed = st.number_input("Slumptals-seed", min_value=0, max_value=1_000_000, step=1, value=42, key="opt_seed")
+with c6:
+    score_metric = st.selectbox("Score", options=["SharpeD","TotalReturn"], index=0, key="opt_score_metric")
+
+st.divider()
+
+# ──────────────────────────────────────────────────────────────────────
+# Parametrar – sampling enligt dina spann
+# ──────────────────────────────────────────────────────────────────────
+def _ur(a: float, b: float, rng: random.Random) -> float:
+    return a + (b - a) * rng.random()
+
+def sample_params(rng: random.Random) -> Dict[str, Any]:
+    use_trend_filter = rng.choice([True, False])
+    use_macd_filter  = rng.choice([True, False])
+    use_bb_filter    = rng.choice([True, False])
+    use_stop_loss    = rng.choice([True, False])
+    use_atr_trailing = rng.choice([True, False])
+    trend_ma_type    = rng.choice(["EMA", "SMA"])
+
+    return {
+        "from_date":       st.session_state.get("opt_from_date") or from_date,
+        "to_date":         st.session_state.get("opt_to_date") or to_date,
+
+        "use_rsi_filter":  True,
+        "rsi_window":      rng.randint(5, 35),
+        "rsi_min":         _ur(5.0, 35.0, rng),
+        "rsi_max":         _ur(60.0, 85.0, rng),
+
+        "use_trend_filter": use_trend_filter,
+        "trend_ma_type":    trend_ma_type,
+        "trend_ma_window":  rng.randint(20, 200),
+
+        "breakout_lookback": rng.randint(20, 120),
+        "exit_lookback":     rng.randint(10, 60),
+
+        "use_macd_filter": use_macd_filter,
+        "macd_fast":   rng.randint(8, 16),
+        "macd_slow":   rng.randint(18, 30),
+        "macd_signal": rng.randint(8, 14),
+
+        "use_bb_filter": use_bb_filter,
+        "bb_window": rng.randint(15, 30),
+        "bb_nstd":   _ur(1.6, 2.4, rng),
+        "bb_min":    _ur(0.0, 0.8, rng),
+
+        "use_stop_loss": use_stop_loss,
+        "stop_mode": rng.choice(["pct", "atr"]),
+        "stop_loss_pct": _ur(0.03, 0.20, rng),
+
+        "atr_window": rng.randint(10, 20),
+        "atr_mult":   _ur(1.2, 3.2, rng),
+
+        "use_atr_trailing": use_atr_trailing,
+        "atr_trail_mult":   _ur(1.2, 3.5, rng),
+    }
+
+# ──────────────────────────────────────────────────────────────────────
+# Kör simuleringar
+# ──────────────────────────────────────────────────────────────────────
+def run_sims(ticker: str, sims: int, seed: int) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    if not RUN_BT:
+        st.error("RUN_BT saknas – kan inte köra backtest.")
+        return pd.DataFrame()
+
+    rng = random.Random(int(seed))
+    for i in range(int(sims)):
+        p = sample_params(rng)
+        profile = {"ticker": ticker, "params": p}
+        try:
+            res = RUN_BT(profile)
+            summ = res.get("summary", {}) if isinstance(res, dict) else {}
+            rows.append({
+                "SharpeD":       summ.get("SharpeD"),
+                "TotalReturn":   summ.get("TotalReturn"),
+                "MaxDD":         summ.get("MaxDD"),
+                "BuyHold":       summ.get("BuyHold"),
+                "FinalEquity":   summ.get("FinalEquity"),
+                "Trades":        summ.get("Trades"),
+                "Bars":          summ.get("Bars"),
+                "params":        p,
+            })
+        except Exception as e:
+            # Spara felrad med minimal info så vi kan felsöka vid behov
+            rows.append({
+                "SharpeD": None, "TotalReturn": None, "MaxDD": None,
+                "BuyHold": None, "FinalEquity": None, "Trades": None, "Bars": None,
+                "params": p, "error": f"{type(e).__name__}: {e}",
+            })
+
+    df = pd.DataFrame(rows)
+    # Score & sortering
+    if score_metric == "SharpeD":
+        df["score"] = pd.to_numeric(df["SharpeD"], errors="coerce")
+    else:
+        df["score"] = pd.to_numeric(df["TotalReturn"], errors="coerce")
+    df = df.sort_values(["score"], ascending=[False], na_position="last").reset_index(drop=True)
+    return df
+
+# ──────────────────────────────────────────────────────────────────────
+# UI: Körning + visning
+# ──────────────────────────────────────────────────────────────────────
+run = st.button("🚀 Kör simuleringar", type="primary", width='stretch')
+
+df = None
+if run:
+    if not ticker.strip():
+        st.error("Ange en ticker.")
+    else:
+        with st.spinner(f"Kör {sims} simuleringar på {ticker}…"):
+            df = run_sims(ticker.strip(), sims=int(sims), seed=int(seed))
+
+if df is not None and len(df):
+    st.success(f"Hittade {len(df)} körningar.")
+    show_cols = ["score","SharpeD","TotalReturn","MaxDD","Trades","FinalEquity","Bars"]
+    st.dataframe(df[show_cols].head(30), width='stretch')
+
+    # Välj 3 profiler för sparning
+    st.subheader("Spara tre profiler (conservative/balanced/aggressive)")
+    top = df.dropna(subset=["score"]).head(100) if len(df) > 100 else df.dropna(subset=["score"])
+    if len(top) == 0:
+        st.info("Inga giltiga körningar i toppen.")
+    else:
+        # Heuristik:
+        # - aggressive: rad 1
+        # - balanced : median i topp 10 (eller mitt i topp om <10)
+        # - conservative: bästa (min MaxDD) bland topp 30 (eller topp N)
+        aggressive = top.iloc[0]["params"]
+
+        t10 = top.head(10) if len(top) >= 10 else top
+        balanced = t10.iloc[len(t10)//2]["params"]
+
+        t30 = top.head(30) if len(top) >= 30 else top
+        t30 = t30.copy()
+        t30["absDD"] = t30["MaxDD"].apply(lambda x: abs(x) if pd.notna(x) else math.inf)
+        t30 = t30.sort_values("absDD")
+        conservative = t30.iloc[0]["params"]
+
+        default_names = {
+            "conservative": f"{ticker} – conservative",
+            "balanced":     f"{ticker} – balanced",
+            "aggressive":   f"{ticker} – aggressive",
+        }
+
+        cA, cB, cC = st.columns(3)
+        with cA:
+            name_cons = st.text_input("Namn (conservative)", value=default_names["conservative"])
+        with cB:
+            name_bal  = st.text_input("Namn (balanced)", value=default_names["balanced"])
+        with cC:
+            name_aggr = st.text_input("Namn (aggressive)", value=default_names["aggressive"])
+
+        out = {
+            "profiles": [
+                {"name": name_cons, "ticker": ticker, "params": conservative},
+                {"name": name_bal,  "ticker": ticker, "params": balanced},
+                {"name": name_aggr, "ticker": ticker, "params": aggressive},
+            ]
+        }
+
+        # Spara
+        outdir = st.text_input("Output-katalog", value="profiles")
+        fname  = st.text_input("Filnamn", value=f"{ticker}.json")
+        if st.button("💾 Spara profiler", width='stretch'):
+            try:
+                import os
+                os.makedirs(outdir, exist_ok=True)
+                path = f"{outdir.rstrip('/')}/{fname}"
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+                st.success(f"Sparat: {path}")
+                st.code(json.dumps(out, ensure_ascii=False, indent=2))
+            except Exception as e:
+                st.error(f"Kunde inte spara: {type(e).__name__}: {e}")
+
+else:
+    st.info("Tryck på **Kör simuleringar** för att starta.")
+
+
+# === DalaTrader: FAILSAFE OPT (begin) ===
+# Minimal, self-contained optimizer block (no graphs) to verify engine + sampling loop.
+# Appends at end to avoid clashing with any "from __future__" or earlier imports.
+
+try:
+    import streamlit as _st
+    import random as _random, json as _json, os as _os
+    from datetime import datetime as _dt
+    try:
+        from app.btwrap import run_backtest as _RUNBT
+    except Exception as _e:
+        _RUNBT = None
+except Exception as _e:
+    # If even Streamlit import fails here, just quietly exit this block
+    _RUNBT = None
+
+def __dt_draw_params(_rng):
+    ur = lambda a,b: float(a + (b-a)*_rng.random())
+    return {
+        "use_rsi_filter": True,
+        "rsi_window": int(_rng.randint(5,35)),
+        "rsi_min": ur(5.0, 35.0),
+        "rsi_max": ur(60.0, 85.0),
+
+        "use_trend_filter": bool(_rng.choice([True, False])),
+        "trend_ma_type": _rng.choice(["SMA", "EMA"]),
+        "trend_ma_window": int(_rng.randint(20, 200)),
+
+        "breakout_lookback": int(_rng.randint(20, 120)),
+        "exit_lookback":     int(_rng.randint(10, 60)),
+
+        "use_macd_filter": bool(_rng.choice([True, False])),
+        "macd_fast":   int(_rng.randint(8, 16)),
+        "macd_slow":   int(_rng.randint(18, 30)),
+        "macd_signal": int(_rng.randint(8, 14)),
+
+        "use_bb_filter": bool(_rng.choice([True, False])),
+        "bb_window": int(_rng.randint(15, 30)),
+        "bb_nstd":   ur(1.6, 2.4),
+        "bb_min":    ur(0.0, 0.8),
+
+        "use_stop_loss": bool(_rng.choice([True, False])),
+        "stop_mode": _rng.choice(["pct", "atr"]),
+        "stop_loss_pct": ur(0.03, 0.20),
+
+        "atr_window": int(_rng.randint(10, 20)),
+        "atr_mult":   ur(1.2, 3.2),
+
+        "use_atr_trailing": bool(_rng.choice([True, False])),
+        "atr_trail_mult":   ur(1.2, 3.5),
+    }
+
+def __dt_score(_m):
+    # higher is better; mild penalties for drawdown, reward Sharpe
+    tr  = float(_m.get("TotalReturn") or 0.0)
+    dd  = abs(float(_m.get("MaxDD") or 0.0))
+    shp = float(_m.get("SharpeD") or 0.0)
+    return tr - 0.30*dd + 0.30*shp
+
+def __dt_labelled(best3):
+    # Return list of (label, params, metrics) for conservative/balanced/aggressive
+    if not best3:
+        return []
+    # sort by score desc already; we derive 3 styles:
+    # conservative: best Sharpe / low DD among top
+    cons = sorted(best3, key=lambda x: (-float(x[2].get("SharpeD") or 0.0), abs(float(x[2].get("MaxDD") or 1.0))))[0]
+    # aggressive: highest TotalReturn
+    aggr = sorted(best3, key=lambda x: -(float(x[2].get("TotalReturn") or 0.0)))[0]
+    # balanced: top score (first)
+    bal  = best3[0]
+    # de-duplicate while preserving order conservative, balanced, aggressive
+    seen = set()
+    out = []
+    for name, item in [("conservative", cons), ("balanced", bal), ("aggressive", aggr)]:
+        key = _json.dumps(item[1], sort_keys=True)
+        if key in seen:  # if duplicate, pick next best unique
+            for alt in best3:
+                k2 = _json.dumps(alt[1], sort_keys=True)
+                if k2 not in seen:
+                    out.append((name, alt[1], alt[2]))
+                    seen.add(k2)
+                    break
+        else:
+            out.append((name, item[1], item[2]))
+            seen.add(key)
+    return out
+
+try:
+    _st.markdown("---")
+    _st.subheader("⚙️ Failsafe-optimering (minimal)")
+
+    # Always prefer existing session ticker; fallback to input only if missing.
+    _sess = _st.session_state
+    _tick = (_sess.get("ticker") or "").strip()
+    if not _tick:
+        _tick = _st.text_input("Ticker", key="__fs_ticker__", placeholder="t.ex. GETI B").strip()
+
+    _fd = (_sess.get("from_date") or "").strip()
+    _td = (_sess.get("to_date")   or "").strip()
+    # simple inputs (names are unique → no key collisions)
+    _fd = _st.text_input("Från (YYYY-MM-DD)", value=_fd, key="__fs_from__").strip()
+    _td = _st.text_input("Till (YYYY-MM-DD)", value=_td, key="__fs_to__").strip()
+
+    _sims = _st.number_input("Antal simuleringar", min_value=50, max_value=20000, value=1000, step=50, key="__fs_sims__")
+    _seed = _st.number_input("Slumpfrö (seed)",   min_value=0,  max_value=10_000_000, value=42, step=1, key="__fs_seed__")
+
+    if _st.button("Kör optimering (failsafe)", key="__fs_run_btn__", width='stretch'):
+        if not _tick:
+            _st.error("Ange en ticker först.")
+        elif _RUNBT is None:
+            _st.error("Backtest-funktion saknas (_RUNBT is None).")
+        else:
+            _rng = _random.Random(int(_seed))
+            _best = []  # list of (score, params, metrics)
+            for i in range(int(_sims)):
+                p = __dt_draw_params(_rng)
+                if _fd: p["from_date"] = _fd
+                if _td: p["to_date"]   = _td
+                try:
+                    res = _RUNBT(p={"ticker": _tick, "params": p})
+                    m = res.get("summary", {}) or {}
+                    sc = __dt_score(m)
+                    _best.append((sc, p, m))
+                except Exception as e:
+                    # skip bad draws
+                    continue
+            if not _best:
+                _st.error("Inga giltiga körningar. Justera intervall eller minska begränsningar.")
+            else:
+                _best.sort(key=lambda x: x[0], reverse=True)
+                _top3 = _best[:15]  # candidate pool
+                labelled = __dt_labelled(_top3)  # [(name, params, metrics), ...]
+                _st.success(f"Klar. Bästa score: { _best[0][0]:.3f }")
+                # Save as three profiles
+                _os.makedirs("profiles", exist_ok=True)
+                outp = f"profiles/{_tick}.json"
+                profs = []
+                for lbl, p, m in labelled:
+                    p = dict(p)  # ensure dates included
+                    if _fd: p["from_date"] = _fd
+                    if _td: p["to_date"]   = _td
+                    profs.append({
+                        "name": f"{_tick} – {lbl}",
+                        "ticker": _tick,
+                        "params": p,
+                        "metrics": m,
+                    })
+                with open(outp, "w", encoding="utf-8") as f:
+                    _json.dump({"profiles": profs}, f, ensure_ascii=False, indent=2)
+                _st.write("Sparad profilfil:", outp)
+                # show quick peek
+                if profs:
+                    _st.json(profs[0]["metrics"])
+except Exception as _e:
+    # Do not crash page if something is off
+    try:
+        _st.warning(f"Failsafe-optimering: {_e.__class__.__name__}: {_e}")
+    except Exception:
+        pass
+# === DalaTrader: FAILSAFE OPT (end) ===
+

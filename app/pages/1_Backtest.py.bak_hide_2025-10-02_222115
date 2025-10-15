@@ -1,0 +1,332 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+
+from pathlib import Path
+from typing import Dict, Any, List
+
+import pandas as pd
+import streamlit as st
+st.set_page_config(layout="wide")  # dalatrader: forced wide layout
+from app.btwrap import run_backtest as RUN_BT
+
+
+# --- helper: build current payload for backtest ---
+def _current_params_payload():
+    ticker = (st.session_state.get("ticker") or "").strip()
+    params = _collect_params_from_state()
+    return {"ticker": ticker, "params": params}
+
+
+
+# === Minimal profile loader (runs BEFORE widgets) ===
+from pathlib import Path as _Path
+import json as _json
+
+def _apply_profile_to_session(_prof: dict):
+    # Ticker
+    t = (_prof.get("ticker") or "").strip()
+    if t:
+        st.session_state["ticker"] = t
+    # Params
+    params = _prof.get("params") or {}
+    keymap = {
+        "use_rsi_filter":"use_rsi_filter","rsi_window":"rsi_window","rsi_min":"rsi_min","rsi_max":"rsi_max",
+        "use_trend_filter":"use_trend_filter","trend_ma_type":"trend_ma_type","trend_ma_window":"trend_ma_window",
+        "breakout_lookback":"breakout_lookback","exit_lookback":"exit_lookback",
+        "use_macd_filter":"use_macd_filter","macd_fast":"macd_fast","macd_slow":"macd_slow","macd_signal":"macd_signal",
+        "use_bb_filter":"use_bb_filter","bb_window":"bb_window","bb_nstd":"bb_nstd","bb_min":"bb_min",
+        "use_stop_loss":"use_stop_loss","stop_mode":"stop_mode","stop_loss_pct":"stop_loss_pct",
+        "atr_window":"atr_window","atr_mult":"atr_mult",
+        "use_atr_trailing":"use_atr_trailing","atr_trail_mult":"atr_trail_mult",
+        # datum kan ligga både i rot och i params i dina filer – kolla båda
+    }
+    for s_key, d_key in keymap.items():
+        if s_key in params:
+            st.session_state[d_key] = params[s_key]
+
+    # Datum (fallbacks)
+    fd = params.get("from_date") or _prof.get("from_date") or _prof.get("start") or ""
+    td = params.get("to_date")   or _prof.get("to_date")   or _prof.get("end")   or ""
+    if fd: st.session_state["from_date"] = str(fd)
+    if td: st.session_state["to_date"]   = str(td)
+
+# UI: välj fil & profil (vänsterspalt)
+with st.sidebar.expander("Ladda profil", expanded=True):
+    base_dir = _Path("/srv/trader/app/profiles") if _Path("/srv/trader/app/profiles").exists() else _Path.cwd() / "profiles"
+    files = sorted([fp for fp in base_dir.glob("*.json") if fp.is_file()], key=lambda x: x.name.lower())
+    file_names = [f.name for f in files]
+    file_idx = st.selectbox("Profilfil", options=range(len(file_names)) if file_names else [], format_func=lambda i: file_names[i], key="__prof_file_idx__")
+
+    profiles = []
+    if files:
+        try:
+            with open(files[file_idx], "r", encoding="utf-8") as _f:
+                data = _json.load(_f)
+            profiles = data.get("profiles", [])
+        except Exception as _e:
+            st.warning(f"Kunde inte läsa {files[file_idx].name}: {type(_e).__name__}: {_e}")
+
+    def _label(i: int) -> str:
+        p = profiles[i]
+        t = (p.get("ticker") or "").strip()
+        n = p.get("name") or p.get("profile") or f"Profil {i+1}"
+        return f"{t} – {n}" if t else n
+
+    prof_idx = st.selectbox("Välj profil", options=range(len(profiles)) if profiles else [], format_func=_label, key="__prof_idx__")
+
+    if st.button("✅ Använd i Backtest", width='stretch'):
+        if profiles:
+            _apply_profile_to_session(profiles[prof_idx])
+            st.rerun()
+# --- helper: collect params from session (dict for backtest) ---
+def _collect_params_from_state():
+    s = st.session_state
+    keys = [
+        "from_date","to_date",
+        "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+        "use_trend_filter","trend_ma_type","trend_ma_window",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal",
+        "use_bb_filter","bb_window","bb_nstd","bb_min",
+        "use_stop_loss","stop_mode","stop_loss_pct",
+        "atr_window","atr_mult",
+        "use_atr_trailing","atr_trail_mult",
+    ]
+    params = {}
+    for k in keys:
+        if k in s:
+            params[k] = s[k]
+    # datum-fallbacks om UI använder andra nycklar
+    if not params.get("from_date") and "start" in s:
+        params["from_date"] = s["start"]
+    if not params.get("to_date") and "end" in s:
+        params["to_date"] = s["end"]
+    return params
+
+# --- DEBUG START ---
+
+
+with st.sidebar.expander("DEBUG payload", expanded=False):
+    try:
+        payload = _current_params_payload()
+        st.json(payload)
+    except Exception as e:
+        import traceback
+        st.write("DEBUG payload misslyckades:", type(e).__name__, str(e))
+        st.code(traceback.format_exc())
+
+
+# --- MINIMAL RUN (auto/backtest+render) ---
+# Bygger och visar resultat – samt fel – i högerkolumnen.
+# Kör antingen när du trycker 'Kör backtest' eller auto om ticker+params finns.
+
+def _nice(x):
+    try:
+        return float(x)
+    except Exception:
+        return x
+
+# layout
+col_left, col_right = st.columns([1, 2], gap="large")
+
+with col_left:
+    payload = _current_params_payload()
+    tkr = (payload.get("ticker") or "").strip()
+    st.text_input("Ticker", key="ticker", value=tkr)  # visar vad som ligger i state
+    do_run = st.button("Kör backtest", width='stretch')
+
+with col_right:
+    try:
+        payload = _current_params_payload()
+        tkr = (payload.get("ticker") or '').strip()
+        params = payload.get("params") or {}
+
+        # krav för körning
+        ready = bool(tkr) and bool(params)
+        if not ready and do_run:
+            st.warning("Ange ticker och parametrar först (ex via profil-laddaren).")
+
+        if ready and (do_run or st.session_state.get("__autorun__", True)):
+            res = RUN_BT(payload)   # <-- KÖR BACKTESTEN
+            # Visa sammanfattning
+            summ = res.get("summary", {})
+            st.subheader("Resultat")
+            st.write({
+                "TotalReturn": _nice(summ.get("TotalReturn")),
+                "SharpeD":     _nice(summ.get("SharpeD")),
+                "MaxDD":       _nice(summ.get("MaxDD")),
+                "BuyHold":     _nice(summ.get("BuyHold")),
+                "FinalEquity": _nice(summ.get("FinalEquity")),
+                "Trades":      _nice(summ.get("Trades")),
+                "Bars":        _nice(summ.get("Bars")),
+            })
+
+            # Equity-kurva (visa de sista raderna)
+            eq = res.get("equity")
+            if hasattr(eq, "tail"):
+                st.caption("Equity (sista 10 rader)")
+                st.dataframe(eq.tail(10), width='stretch', hide_index=True)
+
+            # Trades (visa de sista raderna)
+            tr = res.get("trades")
+            if hasattr(tr, "tail"):
+                st.caption("Trades (sista 10)")
+                try:
+                    st.dataframe(tr.tail(10), width='stretch', hide_index=True)
+                except Exception:
+                    st.write(tr.tail(10))
+        else:
+            st.info("Klar för körning. Välj profil → 'Använd i Backtest' i vänstern, sedan 'Kör backtest'.")
+    except Exception as _e:
+        import traceback
+        st.error(f"Backtest felade: {type(_e).__name__}: {_e}")
+        st.code(traceback.format_exc())
+# --- /MINIMAL RUN ---
+
+# --- DALATRADER_PARAM_PANEL_V1 ---
+# Minimal parameterpanel + Kör/Spara utan grafer.
+try:
+    import json as _json
+    from pathlib import Path as _Path
+    import streamlit as _st
+    from app.btwrap import run_backtest as _RUNBT
+except Exception as _e_param_panel:
+    print("[param-panel] import fail:", type(_e_param_panel).__name__, _e_param_panel)
+
+def _dt_collect_params_for_bt():
+    s = _st.session_state
+    keys = [
+        "from_date","to_date",
+        "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+        "use_trend_filter","trend_ma_type","trend_ma_window",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal",
+        "use_bb_filter","bb_window","bb_nstd","bb_min",
+        "use_stop_loss","stop_mode","stop_loss_pct",
+        "atr_window","atr_mult","use_atr_trailing","atr_trail_mult",
+    ]
+    return {k: s.get(k) for k in keys if k in s}
+
+def _dt_param_form():
+    s = _st.session_state
+    _st.subheader("Parametrar (ändringsbara)")
+
+    col1, col2 = _st.columns(2)
+    # ---- vänster
+    with col1:
+        _st.text_input("Ticker", value=str(_st.session_state.get("ticker","")), key="__bt_ticker__")
+        _st.text_input("Från (YYYY-MM-DD)", key="from_date")
+        _st.text_input("Till (YYYY-MM-DD)", key="to_date")
+
+        _st.checkbox("RSI-filter", key="use_rsi_filter", value=bool(s.get("use_rsi_filter", False)))
+        _st.number_input("RSI-fönster", min_value=1, value=int(s.get("rsi_window", 14)), step=1, key="rsi_window")
+        _st.number_input("RSI min", value=float(s.get("rsi_min", 30.0)), key="rsi_min")
+        _st.number_input("RSI max", value=float(s.get("rsi_max", 70.0)), key="rsi_max")
+
+        _st.checkbox("Trendfilter", key="use_trend_filter", value=bool(s.get("use_trend_filter", False)))
+        _st.selectbox("MA-typ", options=["SMA","EMA"],
+                      index=(0 if s.get("trend_ma_type","SMA")=="SMA" else 1),
+                      key="trend_ma_type")
+        _st.number_input("Trend MA-fönster", min_value=1, value=int(s.get("trend_ma_window",200)), step=1, key="trend_ma_window")
+
+        _st.checkbox("Bollinger-filter", key="use_bb_filter", value=bool(s.get("use_bb_filter", False)))
+        _st.number_input("BB window", min_value=1, value=int(s.get("bb_window",20)), step=1, key="bb_window")
+        _st.number_input("BB n std", value=float(s.get("bb_nstd",2.0)), key="bb_nstd")
+        _st.number_input("BB min", value=float(s.get("bb_min",0.0)), key="bb_min")
+
+    # ---- höger
+    with col2:
+        _st.number_input("Breakout lookback", min_value=1, value=int(s.get("breakout_lookback",55)), step=1, key="breakout_lookback")
+        _st.number_input("Exit lookback", min_value=1, value=int(s.get("exit_lookback",20)), step=1, key="exit_lookback")
+
+        _st.checkbox("MACD-filter", key="use_macd_filter", value=bool(s.get("use_macd_filter", False)))
+        _st.number_input("MACD fast", min_value=1, value=int(s.get("macd_fast",12)), step=1, key="macd_fast")
+        _st.number_input("MACD slow", min_value=1, value=int(s.get("macd_slow",26)), step=1, key="macd_slow")
+        _st.number_input("MACD signal", min_value=1, value=int(s.get("macd_signal",9)), step=1, key="macd_signal")
+
+        _st.checkbox("Stop-loss", key="use_stop_loss", value=bool(s.get("use_stop_loss", False)))
+        _st.selectbox("Stop mode", options=["pct","atr"],
+                      index=(0 if s.get("stop_mode","pct")=="pct" else 1),
+                      key="stop_mode")
+        _st.number_input("Stop loss % (0–1)", min_value=0.0, max_value=1.0, value=float(s.get("stop_loss_pct",0.1)), key="stop_loss_pct")
+
+        _st.number_input("ATR window", min_value=1, value=int(s.get("atr_window",14)), step=1, key="atr_window")
+        _st.number_input("ATR mult", value=float(s.get("atr_mult",2.0)), key="atr_mult")
+        _st.checkbox("ATR trailing", key="use_atr_trailing", value=bool(s.get("use_atr_trailing", False)))
+        _st.number_input("ATR trail mult", value=float(s.get("atr_trail_mult",2.0)), key="atr_trail_mult")
+
+def _dt_actions():
+    # synca ev. panel-ticker till global "ticker"
+    try:
+        if "__bt_ticker__" in _st.session_state:
+            _st.session_state["ticker"] = (
+                (_st.session_state.get("__bt_ticker__") or _st.session_state.get("ticker") or "")
+            ).strip()
+    except Exception:
+        pass
+
+    s = _st.session_state
+    colA, colB = _st.columns(2)
+
+    # Kör backtest
+    if colA.button("▶ Kör backtest", width='stretch'):
+        ticker = (s.get("ticker") or "").strip()
+        params = _dt_collect_params_for_bt()
+        payload = {"ticker": ticker, "params": params}
+        try:
+            res = _RUNBT(payload)
+            s["__bt_last_res__"] = res
+            summ = res.get("summary", {})
+            _st.success("Backtest klart.")
+            c1, c2, c3, c4, c5 = _st.columns(5)
+            c1.metric("TotalReturn", f"{summ.get('TotalReturn', 0):.2f}x")
+            c2.metric("CAGR", f"{summ.get('CAGR', 0):.2%}")
+            c3.metric("SharpeD", f"{summ.get('SharpeD', 0):.2f}")
+            c4.metric("MaxDD", f"{summ.get('MaxDD', 0):.2%}")
+            c5.metric("Trades", f"{summ.get('Trades', 0)}")
+        except Exception as _e_run:
+            _st.error(f"Backtest misslyckades: {type(_e_run).__name__}: {_e_run}")
+
+    # Spara profil
+    save_name_default = (s.get("loaded_profile_name") or s.get("ticker") or "Profil")
+    save_name = colB.text_input("Profilnamn att spara", value=f"{save_name_default}".strip(), key="__save_name__")
+    if colB.button("💾 Spara profil", width='stretch'):
+        try:
+            base = _Path("profiles"); base.mkdir(exist_ok=True)
+            ticker = (s.get("ticker") or "TICKER").strip()
+            out = base / f"{ticker}.json"
+            data = {"profiles": []}
+            if out.exists():
+                try:
+                    data = _json.loads(out.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {"profiles": []}
+            prof = {
+                "name": save_name,
+                "ticker": ticker,
+                "params": _dt_collect_params_for_bt(),
+                "metrics": (s.get("__bt_last_res__", {}) or {}).get("summary", {})
+            }
+            # ersätt profil med samma namn+ticker, annars append
+            replaced = False
+            for i, p in enumerate(data["profiles"]):
+                if p.get("name") == save_name and p.get("ticker") == ticker:
+                    data["profiles"][i] = prof
+                    replaced = True
+                    break
+            if not replaced:
+                data["profiles"].append(prof)
+            out.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            _st.success(f"Sparad: {out}")
+        except Exception as _e_save:
+            _st.error(f"Kunde inte spara: {type(_e_save).__name__}: {_e_save}")
+
+# Kör panelen (en gång per körning av sidan)
+try:
+    _dt_param_form()
+    _dt_actions()
+except Exception as _e_render:
+    _st.warning(f"Parameterpanel fel: {type(_e_render).__name__}: {_e_render}")
+# --- /DALATRADER_PARAM_PANEL_V1 ---

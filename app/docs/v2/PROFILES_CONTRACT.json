@@ -1,0 +1,31 @@
+{
+  "profiles": [
+    {
+      "name": "TICKER – conservative",
+      "ticker": "TICKER",
+      "params": {},
+      "metrics": {
+        "TotalReturn": 0.0,
+        "BuyHold": 0.0,
+        "FinalEquity": 100000.0
+      }
+    },
+    {
+      "name": "TICKER – balanced",
+      "ticker": "TICKER",
+      "params": {},
+      "metrics": {}
+    },
+    {
+      "name": "TICKER – aggressive",
+      "ticker": "TICKER",
+      "params": {},
+      "metrics": {}
+    }
+  ],
+  "meta": {
+    "engine": "v2",
+    "seed": 0,
+    "created_at": "YYYY-MM-DDTHH:MM:SSZ"
+  }
+}

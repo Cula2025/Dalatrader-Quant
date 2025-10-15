@@ -1,0 +1,258 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import datetime as dt
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from app.data_providers import get_ohlcv as GET_OHLCV
+from app.portfolio_signals import (
+    to_price_matrix,
+    build_portfolio_with_caps,
+    buyhold_equity_from_price,
+    index_equity,
+    _import_backtest,
+    _maybe_build_params,
+)
+
+# -------- Helpers --------
+PROFILES_DIR = Path("outputs/opt_results").resolve()
+
+def _normalize_ticker(t: str) -> str:
+    t2 = (t or "").strip().upper().replace(" ", "-")
+    return t2 if t2.endswith(".ST") else (t2 + ".ST")
+
+def _read_profiles(fp: Path) -> list[dict]:
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    profs = data.get("profiles") or []
+    # Säkerställ "name","params","metrics","ticker"
+    out = []
+    for p in profs:
+        name = p.get("name") or p.get("profile") or fp.stem
+        params = p.get("params") or {}
+        metrics = p.get("metrics") or {}
+        ticker = _normalize_ticker(p.get("ticker") or "")
+        out.append({"name": name, "params": params, "metrics": metrics, "ticker": ticker})
+    return out
+
+def _discover_profile_files(pdir: Path) -> list[Path]:
+    return sorted(p for p in pdir.glob("*.json") if p.is_file())
+
+def _best_profile(profiles: list[dict]) -> dict | None:
+    if not profiles:
+        return None
+    # välj högst TotalReturn om finns, annars första
+    try:
+        return max(profiles, key=lambda p: float(p.get("metrics", {}).get("TotalReturn", 0.0)))
+    except Exception:
+        return profiles[0]
+
+# -------- UI --------
+st.set_page_config(page_title="Dala Trader – Optimizer", page_icon="🧠", layout="wide")
+st.title("🧠 Optimizer (serverprofiler)")
+
+with st.sidebar:
+    st.subheader("Inställningar")
+    st.caption(f"Profilkatalog: `{PROFILES_DIR}`")
+
+    files = _discover_profile_files(PROFILES_DIR)
+    if not files:
+        st.error("Hittar inga profiler i outputs/opt_results/. Lägg dit JSON-filerna (…_best_backtrack.json).")
+        st.stop()
+
+    file_labels = [f"{fp.name}" for fp in files]
+    file_idx = st.selectbox("Välj optimeringsfil", options=list(range(len(files))),
+                            format_func=lambda i: file_labels[i], index=0, key="opt_file_select")
+    chosen_fp = files[file_idx]
+
+    # Läs profiler i vald fil
+    try:
+        profiles = _read_profiles(chosen_fp)
+    except Exception as e:
+        st.error(f"Kunde inte läsa {chosen_fp.name}: {e}")
+        st.stop()
+
+    if not profiles:
+        st.error(f"Inga profiler i {chosen_fp.name}.")
+        st.stop()
+
+    prof_names = [p["name"] for p in profiles]
+    # default till "bästa"
+    default_prof = _best_profile(profiles)
+    def_idx = prof_names.index(default_prof["name"]) if default_prof else 0
+
+    prof_idx = st.selectbox("Välj profil i filen", options=list(range(len(profiles))),
+                            index=def_idx, format_func=lambda i: prof_names[i], key="opt_profile_select")
+
+    sel = profiles[prof_idx]
+    ticker = sel["ticker"] or _normalize_ticker(chosen_fp.stem.split("_best")[0])
+    start = st.date_input("Startdatum", value=dt.date(2020,1,1))
+    end = st.date_input("Slutdatum", value=dt.date.today())
+    index_ticker = st.text_input("Index-ticker (för jämförelse)", value="OMXS30")
+    run = st.button("Kör backtest", type="primary")
+
+# -------- Körning --------
+st.markdown(f"**Vald fil:** `{chosen_fp.name}`  |  **Profil:** `{sel['name']}`  |  **Ticker:** `{ticker}`")
+
+# Visa profilens nyckelmetrik
+m = sel.get("metrics", {})
+colm1, colm2, colm3, colm4, colm5 = st.columns(5)
+colm1.metric("TotalReturn", f"{m.get('TotalReturn', 0):.3f}")
+colm2.metric("CAGR", f"{m.get('CAGR', 0):.3f}")
+colm3.metric("SharpeD", f"{m.get('SharpeD', 0):.3f}")
+colm4.metric("MaxDD", f"{m.get('MaxDD', 0):.3f}")
+colm5.metric("Buy&Hold", f"{m.get('BuyHold', 0):.3f}")
+
+if run:
+    # 1) Priser
+    try:
+        dfp = GET_OHLCV(ticker, start=start, source="borsdata")
+        dfp = dfp[(dfp.index.date >= start) & (dfp.index.date <= end)]
+        if dfp.empty:
+            st.error("Inga prisdata i vald period.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Kunde inte hämta priser för {ticker}: {e}")
+        st.stop()
+
+    # 2) Backtest (för att få trades), och positions via equity-bygg
+    try:
+        RUN_BT, Params = _import_backtest()
+        built_params = _maybe_build_params(Params, sel["params"])
+        res = RUN_BT(dfp, built_params)  # ska returnera dict m. 'trades' och 'equity' eller liknande
+        trades = res.get("trades")
+    except Exception as e:
+        st.error(f"Kunde inte köra backtest: {e}")
+        st.stop()
+
+    # 3) Portfölj-equity från positioner: antag hel exponering när inne (vi använder build_portfolio_with_caps)
+    try:
+        P = to_price_matrix({ticker: dfp})
+        # Enkel positionsserie från trades (om equity saknas): vi bygger 1/0 perioder
+        pos = pd.Series(0.0, index=dfp.index)
+        if isinstance(trades, pd.DataFrame) and len(trades) > 0:
+            # tolka EntryTime/ExitTime
+            cols = {c.lower(): c for c in trades.columns}
+            ed = next((cols.get(n) for n in ("entrytime","entry_time","entry","in","in_date")), None)
+            xd = next((cols.get(n) for n in ("exittime","exit_time","exit","out","out_date")), None)
+            ent = pd.to_datetime(trades[ed]).dt.normalize() if ed else pd.Series([], dtype="datetime64[ns]")
+            exi = pd.to_datetime(trades[xd]).dt.normalize() if xd else pd.Series(pd.NaT, index=trades.index)
+            for a,b in zip(ent, exi):
+                if pd.isna(b) or b <= a:
+                    pos.loc[pos.index.normalize() >= a] = 1.0
+                else:
+                    mask = (pos.index.normalize() >= a) & (pos.index.normalize() < b)
+                    pos.loc[mask] = 1.0
+
+        equity, _W = build_portfolio_with_caps({ticker: pos}, P, max_per_asset=1.0, max_total_equity=1.0, lag_days=1)
+        port = equity["value"].rename("Portfölj")
+    except Exception as e:
+        st.error(f"Kunde inte bygga portfölj-kurva: {e}")
+        st.stop()
+
+    # 4) Buy&Hold + Index
+    bh = buyhold_equity_from_price(P.iloc[:,0]).rename("Buy&Hold")
+    idx = index_equity(index_ticker, start).rename(f"{index_ticker} (index)")
+    bh = bh.reindex(port.index).ffill()
+    idx = idx.reindex(port.index).ffill()
+
+    def _norm(s: pd.Series) -> pd.Series:
+        s = s.dropna()
+        return s / float(s.iloc[0]) if len(s) else s
+
+    chart = pd.concat([_norm(port), _norm(bh), _norm(idx)], axis=1).dropna(how="all")
+
+    st.subheader("Kapitalutveckling (normaliserad till 1.0)")
+    st.line_chart(chart, height=420)
+
+    # 5) Trades
+    st.subheader("Transaktioner")
+    if isinstance(trades, pd.DataFrame) and len(trades):
+        st.dataframe(trades, width='stretch')
+        st.download_button(
+            "Ladda ned trades (CSV)",
+            trades.to_csv(index=False).encode("utf-8"),
+            file_name=f"{ticker.replace(':','-')}_trades.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("Inga affärer i perioden.")
+# === PARAM UI (auto) ===
+import streamlit as st
+from datetime import date as _date
+
+try:
+    _defaults = default_ui_params()
+except Exception:
+    _defaults = {
+        "use_trend_filter": False,
+        "trend_ma_window": 100,
+        "rsi_window": 8,
+        "rsi_min": 30.0,
+        "rsi_max": 70.0,
+        "breakout_lookback": 55,
+        "exit_lookback": 20,
+        "use_macd_filter": False,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+        "use_bb_filter": False,
+        "bb_window": 20,
+        "bb_nstd": 2.0,
+        "bb_min": 0.5,
+        "use_stop_loss": True,
+        "stop_mode": "pct",
+        "stop_loss_pct": 0.08,
+        "atr_window": 14,
+        "atr_mult": 2.0,
+        "use_atr_trailing": False,
+        "atr_trail_mult": 1.5,
+    }
+
+for k, v in _defaults.items():
+    st.session_state.setdefault(k, v)
+
+st.session_state.setdefault("ticker", st.session_state.get("ticker", "VOLV B"))
+st.session_state.setdefault("from_date", st.session_state.get("from_date", "2020-01-01"))
+st.session_state.setdefault("to_date", st.session_state.get("to_date", _date.today().isoformat()))
+
+with st.expander("⚙️ Parametrar", expanded=True):
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.text_input("Ticker", key="ticker")
+        st.text_input("Från (YYYY-MM-DD)", key="from_date")
+        st.text_input("Till (YYYY-MM-DD)", key="to_date")
+
+        st.checkbox("EMA trend-gate", key="use_trend_filter")
+        st.number_input("EMA-fönster", min_value=5, max_value=300, step=1, key="trend_ma_window")
+        st.number_input("RSI-fönster", min_value=5, max_value=50, step=1, key="rsi_window")
+        st.number_input("RSI min (köp-kors upp)", min_value=5.0, max_value=50.0, step=0.5, key="rsi_min")
+        st.number_input("RSI max (sälj-kors ned)", min_value=50.0, max_value=95.0, step=0.5, key="rsi_max")
+        st.number_input("Breakout lookback (0=av)", min_value=0, max_value=200, step=1, key="breakout_lookback")
+
+    with c2:
+        st.number_input("Exit lookback (0=av)", min_value=0, max_value=200, step=1, key="exit_lookback")
+        st.checkbox("MACD-filter (histogram > 0)", key="use_macd_filter")
+        st.number_input("MACD fast", min_value=3, max_value=30, step=1, key="macd_fast")
+        st.number_input("MACD slow", min_value=5, max_value=60, step=1, key="macd_slow")
+        st.number_input("MACD signal", min_value=2, max_value=30, step=1, key="macd_signal")
+
+        st.checkbox("Bollinger %B-filter", key="use_bb_filter")
+        st.number_input("BB fönster", min_value=5, max_value=60, step=1, key="bb_window")
+        st.number_input("BB std", min_value=1.0, max_value=5.0, step=0.1, key="bb_nstd")
+        st.number_input("%B ≤ (entry-tak)", min_value=0.0, max_value=1.0, step=0.05, key="bb_min")
+
+        st.checkbox("Aktivera stop-loss", key="use_stop_loss")
+        st.selectbox("Stop-mod", options=["pct","atr"],
+                     index=0 if st.session_state.get("stop_mode","pct")=="pct" else 1,
+                     key="stop_mode")
+        st.number_input("Stop % (vid pct)", min_value=0.01, max_value=0.50, step=0.01, key="stop_loss_pct")
+        st.number_input("ATR fönster", min_value=5, max_value=100, step=1, key="atr_window")
+        st.number_input("ATR multipel", min_value=0.5, max_value=5.0, step=0.1, key="atr_mult")
+        st.checkbox("ATR trailing", key="use_atr_trailing")
+        st.number_input("ATR trailing multipel", min_value=0.5, max_value=5.0, step=0.1, key="atr_trail_mult")
+# === END PARAM UI (auto) ===

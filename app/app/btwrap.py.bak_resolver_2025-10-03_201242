@@ -1,0 +1,85 @@
+# -*- coding: utf-8 -*-
+import inspect
+
+def _pick_run_fn(obj):
+    # obj kan vara modul, tuple, eller callable
+    if callable(obj):
+        return obj
+    # om tuple: leta namngivna först
+    if isinstance(obj, tuple):
+        for it in obj:
+            if not hasattr(it, "__name__"):  # kan vara modul/klass
+                continue
+            nm = getattr(it, "__name__", "").lower()
+            if nm in ("run_backtest","backtest","simulate","run"):
+                if callable(it):
+                    return it
+        for it in obj:
+            if callable(it):
+                try:
+                    sig = inspect.signature(it)
+                    if len(sig.parameters) in (1,2):
+                        return it
+                except Exception:
+                    pass
+        # leta på ett ev. modulobjekt i tuplen
+        for it in obj:
+            fn = _pick_run_fn(getattr(it, "run_backtest", None) or
+                              getattr(it, "backtest", None) or
+                              getattr(it, "simulate", None) or
+                              getattr(it, "run", None))
+            if fn: return fn
+        return None
+    # modul?
+    for name in ("run_backtest","backtest","simulate","run"):
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+def _pick_params(obj):
+    # Returnera Params-klassen om vi hittar den (annars None)
+    cand = None
+    if isinstance(obj, tuple):
+        for it in obj:
+            if inspect.isclass(it) and getattr(it, "__name__", "").lower() == "params":
+                return it
+        for it in obj:
+            if hasattr(it, "Params") and inspect.isclass(getattr(it, "Params")):
+                return getattr(it, "Params")
+        return None
+    cand = getattr(obj, "Params", None)
+    return cand if inspect.isclass(cand) else None
+
+def run_backtest(df=None, p=None):
+    """Hämtar backtest-modulen via _import_backtest() och kör det bästa vi hittar."""
+    from app.portfolio_signals import _import_backtest
+    mod = _import_backtest()
+    fn = _pick_run_fn(mod)
+    if fn is None:
+        # om tuple och första elementet är callable
+        if isinstance(mod, tuple) and len(mod) > 0 and callable(mod[0]):
+            fn = mod[0]
+    if fn is None:
+        raise TypeError("Ingen körbar backtest-funktion hittades.")
+
+    # Försök skapa Params() om p saknas
+    if p is None:
+        P = _pick_params(mod)
+        if P is not None:
+            try:
+                p = P()
+            except Exception:
+                p = None
+
+    # Kör med (df, p) om möjligt, annars bara (df)
+    if p is not None:
+        try:
+            return fn(df, p)
+        except TypeError:
+            pass
+    try:
+        return fn(df)
+    except TypeError:
+        # sista försök om funktionen tvärtom kräver 2 args
+        return fn(df, p)

@@ -1,0 +1,304 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+
+# --- DEBUG: visa payload i sidopanelen ---
+try:
+    _dbg_payload = _current_params_payload()
+    with st.sidebar.expander('DEBUG payload', expanded=False):
+        st.code(json.dumps(_dbg_payload, ensure_ascii=False, indent=2), language='json')
+except Exception as _e:
+    st.sidebar.caption(f'DEBUG payload misslyckades: {type(_e).__name__}: {_e}')
+# --- /DEBUG ---
+from pathlib import Path
+from typing import Dict, Any, List
+
+import pandas as pd
+import streamlit as st
+
+
+# --- helper: build payload with clean dates ---
+def _current_params_payload():
+    s = st.session_state
+    # samla parametrar (om du redan har _collect_params_from_state så används den)
+    if '_collect_params_from_state' in globals():
+        params = _collect_params_from_state()  # type: ignore[name-defined]
+    else:
+        keys = [
+            "from_date","to_date",
+            "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+            "use_trend_filter","trend_ma_type","trend_ma_window",
+            "breakout_lookback","exit_lookback",
+            "use_macd_filter","macd_fast","macd_slow","macd_signal",
+            "use_bb_filter","bb_window","bb_nstd","bb_min",
+            "use_stop_loss","stop_mode","stop_loss_pct",
+            "atr_window","atr_mult","use_atr_trailing","atr_trail_mult",
+        ]
+        params = {k: s[k] for k in keys if k in s}
+
+    # coercion: date/datetime -> "YYYY-MM-DD"
+    def _to_datestr(v):
+        try:
+            from datetime import date, datetime
+            if isinstance(v, (date, datetime)):
+                return v.date().isoformat() if isinstance(v, datetime) else v.isoformat()
+        except Exception:
+            pass
+        # redan sträng? trimma
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+    # plocka även ev. alias
+    if not params.get("from_date") and "start" in s: params["from_date"] = s["start"]
+    if not params.get("to_date")   and "end"   in s: params["to_date"]   = s["end"]
+
+    for k in ("from_date","to_date"):
+        if k in params:
+            params[k] = _to_datestr(params[k])
+
+    t = (s.get("ticker") or "").strip() if "ticker" in s else ""
+    return {"ticker": t, "params": params}
+
+# Körmotor
+from app.btwrap import run_backtest as RUN_BT
+
+# --------- Konfig ---------
+PROFILES_DIRS: List[Path] = [
+    Path("/srv/trader/app/profiles"),
+    Path("/srv/trader/app/outputs/opt_results"),
+]
+PROFILES_DIRS = [p for p in PROFILES_DIRS if p.exists()]
+
+# --------- Hjälpare ---------
+def _read_profiles_file(fp: Path) -> List[Dict[str, Any]]:
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "profiles" in data and isinstance(data["profiles"], list):
+            return data["profiles"]
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        st.sidebar.error(f"Kunde inte läsa {fp.name}: {type(e).__name__}: {e}")
+        return []
+
+def _apply_profile_to_state(prof: Dict[str, Any]) -> None:
+    """Mata in profil i session_state (ticker + params + ev from/to)."""
+    s = st.session_state
+    t = (prof.get("ticker") or "").strip()
+    if t:
+        s["ticker"] = t
+    params = prof.get("params") or {}
+    # tillåt from/to även längst upp i profilen (som i optimerarens output)
+    fd = prof.get("from_date") or prof.get("start")
+    td = prof.get("to_date")   or prof.get("end")
+    if fd: s["from_date"] = str(fd)
+    if td: s["to_date"]   = str(td)
+    # kopiera alla parameternycklar rakt av
+    for k, v in params.items():
+        s[k] = v
+
+def _collect_params_from_state() -> Dict[str, Any]:
+    s = st.session_state
+    keys = [
+        "from_date","to_date",
+        "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+        "use_trend_filter","trend_ma_type","trend_ma_window",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal",
+        "use_bb_filter","bb_window","bb_nstd","bb_min",
+        "use_stop_loss","stop_mode","stop_loss_pct",
+        "atr_window","atr_mult","use_atr_trailing","atr_trail_mult",
+    ]
+    out = {}
+    for k in keys:
+        if k in s:
+            out[k] = s[k]
+    return out
+
+def _profiles_files() -> List[Path]:
+    files: List[Path] = []
+    for base in PROFILES_DIRS:
+        try:
+            files.extend(sorted(p for p in base.glob("*.json") if p.is_file()))
+        except Exception:
+            pass
+    # dedupe by name, prefer /profiles över /outputs/opt_results om båda finns
+    seen = set()
+    dedup = []
+    for fp in files:
+        if fp.name in seen:
+            continue
+        seen.add(fp.name)
+        dedup.append(fp)
+    return dedup
+
+# --------- PRE-APPLY (måste ske FÖRE widgets) ---------
+if "_pending_profile" in st.session_state:
+    prof = st.session_state.pop("_pending_profile") or {}
+    try:
+        _apply_profile_to_state(prof)
+    finally:
+        # Säkerställ att widgets får nya default
+        st.rerun()
+
+# --------- SIDEBAR: Ladda profil (enda UI-delen i sidopanelen) ---------
+st.sidebar.header("Ladda profil")
+files = _profiles_files()
+if files:
+    file_idx = st.sidebar.selectbox(
+        "Profilfil",
+        options=list(range(len(files))),
+        format_func=lambda i: files[i].name,
+        key="bf_file_idx",
+    )
+    chosen_file = files[file_idx]
+    profiles = _read_profiles_file(chosen_file)
+    if profiles:
+        def _label(i: int) -> str:
+            p = profiles[i]
+            t = (p.get("ticker") or "").strip()
+            n = p.get("name") or p.get("profile") or f"Profil {i+1}"
+            return f"{t} – {n}" if t else n
+        prof_idx = st.sidebar.selectbox(
+            "Välj profil",
+            options=list(range(len(profiles))),
+            format_func=_label,
+            key="bf_profile_idx",
+        )
+        # Sätt pending och kör om: prof appliceras i PRE-APPLY ovan
+        if st.sidebar.button("✅ Använd i Backtest", width='stretch'):
+            st.session_state["_pending_profile"] = profiles[prof_idx]
+            st.rerun()
+else:
+    st.sidebar.info("Inga profilfiler hittades i:\n" + "\n".join(f"- {p}" for p in PROFILES_DIRS))
+
+# --------- HUVUD: Parametrar + Körning ---------
+st.title("Backtest")
+
+# Defaults (om inget är satt)
+st.session_state.setdefault("ticker", "VOLV B")
+st.session_state.setdefault("from_date", "2020-09-30")
+st.session_state.setdefault("to_date",   "2025-10-01")
+st.session_state.setdefault("use_rsi_filter", True)
+st.session_state.setdefault("rsi_window", 8)
+st.session_state.setdefault("rsi_min", 30.0)
+st.session_state.setdefault("rsi_max", 70.0)
+st.session_state.setdefault("use_trend_filter", False)
+st.session_state.setdefault("trend_ma_type", "EMA")
+st.session_state.setdefault("trend_ma_window", 100)
+st.session_state.setdefault("breakout_lookback", 55)
+st.session_state.setdefault("exit_lookback", 20)
+st.session_state.setdefault("use_macd_filter", False)
+st.session_state.setdefault("macd_fast", 12)
+st.session_state.setdefault("macd_slow", 26)
+st.session_state.setdefault("macd_signal", 9)
+st.session_state.setdefault("use_bb_filter", False)
+st.session_state.setdefault("bb_window", 20)
+st.session_state.setdefault("bb_nstd", 2.0)
+st.session_state.setdefault("bb_min", 0.0)
+st.session_state.setdefault("use_stop_loss", False)
+st.session_state.setdefault("stop_mode", "pct")
+st.session_state.setdefault("stop_loss_pct", 0.08)
+st.session_state.setdefault("atr_window", 14)
+st.session_state.setdefault("atr_mult", 2.0)
+st.session_state.setdefault("use_atr_trailing", False)
+st.session_state.setdefault("atr_trail_mult", 1.5)
+
+with st.expander("Parametrar", expanded=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.text_input("Ticker", key="ticker")
+        st.text_input("Från (YYYY-MM-DD)", key="from_date")
+        st.text_input("Till (YYYY-MM-DD)", key="to_date")
+
+        st.checkbox("RSI-filter", key="use_rsi_filter")
+        st.number_input("RSI-fönster", min_value=1, step=1, key="rsi_window")
+        st.number_input("RSI min (köp-kors upp)", step=0.01, key="rsi_min")
+        st.number_input("RSI max (sälj-kors ned)", step=0.01, key="rsi_max")
+
+        st.checkbox("EMA trend-gate", key="use_trend_filter")
+        st.selectbox("MA-typ", ["EMA","SMA"], key="trend_ma_type")
+        st.number_input("MA-fönster", min_value=1, step=1, key="trend_ma_window")
+
+        st.number_input("Breakout lookback", min_value=0, step=1, key="breakout_lookback")
+        st.number_input("Exit lookback", min_value=0, step=1, key="exit_lookback")
+
+    with c2:
+        st.checkbox("MACD-filter (histogram > 0)", key="use_macd_filter")
+        st.number_input("MACD fast", min_value=1, step=1, key="macd_fast")
+        st.number_input("MACD slow", min_value=1, step=1, key="macd_slow")
+        st.number_input("MACD signal", min_value=1, step=1, key="macd_signal")
+
+        st.checkbox("Bollinger %B-filter", key="use_bb_filter")
+        st.number_input("BB fönster", min_value=1, step=1, key="bb_window")
+        st.number_input("BB std", step=0.01, key="bb_nstd")
+        st.number_input("BB min (köp-kors upp)", step=0.01, key="bb_min")
+
+        st.checkbox("Stop-loss", key="use_stop_loss")
+        st.selectbox("Stop-typ", ["pct","atr"], key="stop_mode")
+        st.number_input("Stop-loss % (om pct)", step=0.01, key="stop_loss_pct")
+
+        st.number_input("ATR fönster", min_value=1, step=1, key="atr_window")
+        st.number_input("ATR multipel", step=0.01, key="atr_mult")
+
+        st.checkbox("ATR trailing", key="use_atr_trailing")
+        st.number_input("ATR trailing multipel", step=0.01, key="atr_trail_mult")
+
+# Kör backtest
+left, right = st.columns([1,1])
+with left:
+    run_bt = st.button("🚀 Kör backtest", width='stretch')
+with right:
+    pname = st.text_input("Profilnamn att spara", value="TMP från UI")
+    save_btn = st.button("💾 Spara som TMP", width='stretch')
+
+if run_bt or save_btn:
+    ticker = (st.session_state.get("ticker") or "").strip()
+    if not ticker:
+        st.error("Ange en ticker först.")
+    else:
+        params = _collect_params_from_state()
+        payload = {"ticker": ticker, "params": params}
+        try:
+            res = RUN_BT(payload)
+        except Exception as e:
+            st.error(f"Backtest felade: {type(e).__name__}: {e}")
+            res = None
+
+        if res and isinstance(res, dict):
+            summ = res.get("summary", {})
+            equity = res.get("equity")
+            trades = res.get("trades")
+
+            mcols = st.columns(5)
+            mcols[0].metric("TotalReturn", f"{summ.get('TotalReturn'):.3f}×" if summ.get("TotalReturn") is not None else "—")
+            mcols[1].metric("CAGR", f"{summ.get('CAGR'):.3f}" if summ.get("CAGR") is not None else "—")
+            mcols[2].metric("SharpeD", f"{summ.get('SharpeD'):.3f}" if summ.get("SharpeD") is not None else "—")
+            mcols[3].metric("MaxDD", f"{summ.get('MaxDD'):.3f}" if summ.get("MaxDD") is not None else "—")
+            mcols[4].metric("Buy&Hold", f"{summ.get('BuyHold'):.3f}" if summ.get("BuyHold") is not None else "—")
+
+            if isinstance(trades, pd.DataFrame):
+                st.subheader("Trades")
+                st.dataframe(trades)
+
+            if save_btn:
+                out = {
+                    "profiles": [{
+                        "name": pname,
+                        "ticker": ticker,
+                        "params": params,
+                        "metrics": {k: summ.get(k) for k in ("TotalReturn","SharpeD","MaxDD","BuyHold","CAGR","FinalEquity","Trades","Bars")},
+                        "from_date": params.get("from_date"),
+                        "to_date": params.get("to_date"),
+                    }]
+                }
+                outdir = Path("/srv/trader/app/profiles")
+                outdir.mkdir(parents=True, exist_ok=True)
+                out_fp = outdir / f"{ticker}_tmp.json"
+                out_fp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+                st.success(f"Sparat → {out_fp}")
+        else:
+            st.info("Inget resultat.")

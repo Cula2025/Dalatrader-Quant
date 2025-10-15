@@ -1,0 +1,127 @@
+from __future__ import annotations
+import sys, json, time
+from pathlib import Path
+from typing import Iterable, Any
+import pandas as pd
+
+from app import btwrap as W
+from app.data_providers import get_ohlcv
+from app.equity_extract import extract_equity
+
+TOL = 1e-6
+
+def iter_inputs(argv: list[str]) -> Iterable[Path]:
+    if not argv:
+        yield from sorted(Path("profiles").glob("*.json"))
+        return
+    for a in argv:
+        p = Path(a)
+        if p.is_dir():
+            yield from sorted(p.glob("*.json"))
+        elif p.is_file():
+            yield p
+
+def roughly_equal(a: float, b: float, tol=TOL) -> bool:
+    if pd.isna(a) or pd.isna(b):
+        return False
+    return abs(a - b) <= max(tol, (abs(a) + abs(b)) * 1e-9)
+
+def first_not_none(*vals: Any):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+def main() -> int:
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    fix  = any(a in ("--fix","--write") for a in sys.argv[1:])
+    files = list(iter_inputs(args))
+    if not files:
+        print("Inga profiler hittades.")
+        return 1
+
+    total = pass_cnt = fail_cnt = 0
+
+    for f in files:
+        try:
+            raw = Path(f).read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except Exception as e:
+            print(f"[{f}] KUNDE INTE LÄSA: {e}")
+            continue
+
+        profs = data.get("profiles") or []
+        print(f"\n== {f} :: {len(profs)} profiler ==")
+        any_change = False
+
+        for i, prof in enumerate(profs, 1):
+            total += 1
+            name   = prof.get("name","?")
+            met    = prof.get("metrics") or {}
+            t      = prof.get("ticker") or prof.get("params",{}).get("ticker")
+            P      = dict(prof.get("params", {}))
+
+            if not t:
+                print(f"  [{i}/3] {name}  SKIP (saknar ticker)")
+                continue
+
+            # Kör backtest via wrappen
+            res = W.run_backtest(p={"ticker": t, "params": P})
+            x   = first_not_none(res.get("equity", None),
+                                 res.get("summary", None),
+                                 res)
+            eq  = extract_equity(x)
+            if eq.empty:
+                print(f"  [{i}/3] {name}  SKIP (tom equity)")
+                continue
+
+            tr_calc = float(eq.iloc[-1]) - 1.0
+            tr_fac  = float(met.get("TotalReturn", float("nan")))
+
+            # Räkna BH på samma fönster som equity
+            df = get_ohlcv(ticker=t, start=P.get("from_date"), end=P.get("to_date"))
+            s  = pd.to_numeric(df["Close"], errors="coerce").dropna()
+            # Om eq har datumindex: klipp s till eq:s index-intervall
+            if hasattr(eq, "index") and len(eq.index) >= 2:
+                try:
+                    s = s.loc[s.index.intersection(eq.index)]
+                except Exception:
+                    pass
+            if len(s) < 2:
+                print(f"  [{i}/3] {name}  SKIP (för kort BH-fönster)")
+                continue
+            bh_calc = float(s.iloc[-1] / s.iloc[0] - 1.0)
+            bh_fac  = float(met.get("BuyHold", float("nan")))
+
+            ok_tr = roughly_equal(tr_calc, tr_fac)
+            ok_bh = roughly_equal(bh_calc, bh_fac)
+            status = "PASS" if (ok_tr and ok_bh) else ("BH-FIX" if ok_tr and not ok_bh else "FAIL")
+
+            if ok_tr and not ok_bh and fix:
+                prof.setdefault("metrics", {})["BuyHold"] = bh_calc
+                prof["metrics"]["BuyHoldMethod"] = "equity_window"
+                any_change = True
+
+            if status == "PASS":
+                pass_cnt += 1
+            elif status == "FAIL":
+                fail_cnt += 1
+
+            print(f"  [{i}/3] {name}  TR(calc)={tr_calc:.6f} facit={tr_fac:.6f} | "
+                  f"BH(calc)={bh_calc:.6f} facit={bh_fac:.6f}  -> {status}")
+
+        if any_change:
+            ts = time.strftime("%F_%H%M%S")
+            bak = f"{f}.bak_bh_{ts}"
+            Path(bak).write_text(raw, encoding="utf-8")
+            Path(f).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[{f}] Uppdaterad (backup: {bak})")
+
+    print("\n=== SAMMANFATTNING ===")
+    print(f"Profiler totalt: {total}")
+    print(f"PASS: {pass_cnt}")
+    print(f"FAIL: {fail_cnt}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,139 @@
+from __future__ import annotations
+from typing import Iterable, Any
+import pandas as pd
+
+__all__ = [
+    "pick_first",
+    "equal_weight_rebalanced",
+    "equal_weight_buyhold",
+    "equal_weight_bh",  # alias
+]
+
+def pick_first(*vals: Any):
+    """Returnerar första icke-None-värdet (ingen 'truthiness' på DataFrame/Series)."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+def _to_float_series(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce").astype("float64")
+    return s.dropna()
+
+def equal_weight_rebalanced(equities: Iterable[pd.Series]) -> pd.Series:
+    """
+    EW rebalanced av strategikurvor (nivåserier). Vi normaliserar till 1.0,
+    inner-join:ar på gemensam period och rebalanserar dagligen på avkastningar.
+    """
+    series = []
+    for s in equities:
+        s = _to_float_series(pd.Series(s))
+        if s.empty:
+            continue
+        s = s / float(s.iloc[0])
+        series.append(s)
+    if not series:
+        return pd.Series(dtype="float64", name="Portfolio")
+    E = pd.concat(series, axis=1, join="inner")
+    rets = E.pct_change().dropna()
+    port = (1.0 + rets.mean(axis=1)).cumprod()
+    port.name = "Portfolio"
+    return port
+
+def equal_weight_buyhold(prices: pd.DataFrame) -> pd.Series:
+    """
+    EW buy&hold av prisserier:
+    - strikt gemensam period (dropna any)
+    - normalisera varje kolumn till start=1.0
+    - ingen rebalansering: lika vikt hålls konstant -> medel av nivåerna
+    """
+    if prices is None or prices.empty:
+        return pd.Series(dtype="float64", name="Buy&Hold")
+    P = prices.copy()
+    for c in P.columns:
+        P[c] = _to_float_series(P[c])
+    P = P.dropna(how="any")
+    if P.empty:
+        return pd.Series(dtype="float64", name="Buy&Hold")
+    norm = P / P.iloc[0]
+    out = norm.mean(axis=1)
+    out.name = "Buy&Hold"
+    return out
+
+# Alias om sidan råkar importera annat namn
+equal_weight_bh = equal_weight_buyhold
+
+# === AUTO-APPEND ===
+import pandas as pd
+
+def _align_and_normalize(equities):
+    """Normalisera varje equity till 1.0 och aligna strikt gemensam period."""
+    series = []
+    for s in equities:
+        # tolerera Series/DataFrame['Close']
+        if hasattr(s, "to_frame"):  # Series
+            pass
+        if hasattr(s, "__getitem__") and not hasattr(s, "iloc"):
+            # dict-liknande, hoppa
+            continue
+        try:
+            # till Series
+            if hasattr(s, "columns"):
+                # DataFrame -> ta första kolumn
+                s = s.iloc[:,0]
+        except Exception:
+            pass
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            continue
+        s = s / float(s.iloc[0])
+        series.append(s)
+    if not series:
+        return pd.DataFrame()
+    return pd.concat(series, axis=1, join="inner").dropna()
+
+def equal_weight_buyhold(equities):
+    """
+    Statisk lika-vikt buy&hold: köp alla på start, behåll till slut (ingen rebalans).
+    Accepterar:
+      - lista/iterable av pd.Series eller pd.DataFrame (tar 'Close' eller första kolumn)
+      - pd.DataFrame med en kolumn per instrument
+    Returnerar nivåserie (start=1.0) döpt till "BH".
+    """
+    import pandas as pd
+
+    series = []
+
+    # Fall 1: DataFrame skickas in direkt
+    if hasattr(equities, "columns"):
+        Edf = equities
+        for c in Edf.columns:
+            s = pd.to_numeric(Edf[c], errors="coerce").dropna()
+            if s.empty:
+                continue
+            s = s / float(s.iloc[0])
+            series.append(s)
+    else:
+        # Fall 2: Iterable/lista av Series/DataFrames
+        for s in equities:
+            # Om DataFrame: välj 'Close' om finns annars första kolumn
+            if hasattr(s, "columns"):
+                if "Close" in getattr(s, "columns", []):
+                    s = s["Close"]
+                else:
+                    s = s.iloc[:, 0]
+            # Till Series av floats
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            if s.empty:
+                continue
+            s = s / float(s.iloc[0])
+            series.append(s)
+
+    if not series:
+        return pd.Series(dtype="float64", name="BH")
+
+    E = pd.concat(series, axis=1, join="inner").dropna(how="any")
+    bh = E.mean(axis=1)
+    bh.name = "BH"
+    return bh
+

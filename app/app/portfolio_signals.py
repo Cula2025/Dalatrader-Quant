@@ -1,0 +1,262 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import json, re, inspect
+from pathlib import Path
+from typing import Dict, List
+import pandas as pd
+from app.data_providers import get_ohlcv as GET_OHLCV
+
+# --- backtest loader ---
+def _import_backtest():
+    tried = []
+    for mod in ("app.backtest", "backtest", "app.app.backtest", "app.portfolio_backtest"):
+        try:
+            m = __import__(mod, fromlist=["run_backtest","Params","PortfolioParams"])
+            Params = getattr(m, "Params", getattr(m, "PortfolioParams", None))
+            return m.run_backtest, Params
+        except Exception as e:
+            tried.append((mod, repr(e)))
+    raise RuntimeError("Hittar ingen backtest-motor. Provade: " + ", ".join([f"{m} -> {e}" for m,e in tried]))
+
+# --- profilval ---
+def _best_profile_from_json(fp: Path):
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    profiles = data.get("profiles", [])
+    if not profiles:
+        raise ValueError(f"Inga profiler i {fp.name}")
+    def score(p):
+        m = p.get("metrics", {})
+        return (
+            float(m.get("SharpeD", float("-inf"))),
+            float(m.get("CAGR", float("-inf"))),
+            float(m.get("TotalReturn", float("-inf"))),
+        )
+    best = sorted(profiles, key=score, reverse=True)[0]
+    return best.get("params", {}), best.get("metrics", {}), best.get("name", fp.stem)
+
+def _norm(s: str) -> str:
+    return re.sub(r'[^A-Z0-9]', '', (s or '').upper())
+
+def _variants(t: str) -> List[str]:
+    base = t.strip()
+    cand = {
+        base, base.upper(), base.lower(), base.title(),
+        base.replace(" ", ""), base.replace(" ", "-"), base.replace(" ", "_"),
+        base.replace(".ST","").replace(".st",""),
+        base.replace("-",""), base.replace(".",""),
+        base.split(".")[0],
+        (base.split()[0] if " " in base else base),
+    }
+    return [x for x in cand if x]
+
+def load_best_params_for_ticker(ticker: str, profiles_dir: Path):
+    tnorm = _norm(ticker.replace(".ST",""))
+    # 1) matcha i filinnehåll
+    for p in sorted(profiles_dir.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            for prof in data.get("profiles", []):
+                it = prof.get("ticker") or data.get("ticker")
+                if it and _norm(it.replace(".ST","")) == tnorm:
+                    params, metrics, pname = _best_profile_from_json(p)
+                    return params, metrics, pname, p
+        except Exception:
+            continue
+    # 2) matcha på filnamn
+    for v in _variants(ticker):
+        for patt in (f"{v}_best*.json", f"{v}*backtrack*.json", f"{v}*.json"):
+            for p in sorted(profiles_dir.glob(patt)):
+                try:
+                    params, metrics, pname = _best_profile_from_json(p)
+                    return params, metrics, pname, p
+                except Exception:
+                    continue
+    raise FileNotFoundError(f"Hittar ingen profilfil för {ticker} i {profiles_dir}")
+
+# --- helpers ---
+def _maybe_build_params(Params, raw: dict):
+    if Params is None: return raw
+    try:
+        try: sig = inspect.signature(Params)
+        except (TypeError, ValueError): sig = inspect.signature(Params.__init__)
+        allowed = {k for k in sig.parameters.keys() if k != "self"}
+        return Params(**{k:v for k,v in raw.items() if k in allowed})
+    except Exception:
+        return raw
+
+def _normalize_index(x):
+    if isinstance(x, (pd.Series, pd.DataFrame)):
+        idx = pd.to_datetime(x.index).tz_localize(None, nonexistent='shift_forward', ambiguous='NaT')
+        return x.rename_axis(None).set_axis(idx)
+    return x
+
+def _ensure_close_col(df: pd.DataFrame) -> pd.Series:
+    for c in ("Adj Close","adj_close","adjclose","AdjClose","Close","close","c"):
+        if c in df.columns: return df[c].astype(float)
+    if isinstance(df, pd.Series): return df.astype(float)
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if num_cols: return df[num_cols[0]].astype(float)
+    raise ValueError("No price column found")
+
+def to_price_matrix(ohlcv: Dict[str,pd.DataFrame]) -> pd.DataFrame:
+    close = {t: _ensure_close_col(df).rename(t) for t, df in ohlcv.items()}
+    return pd.concat(close.values(), axis=1).sort_index().ffill().dropna(how="all")
+
+# --- trades -> positions (0/1) ---
+def _find_entry_exit(cols):
+    # robust mot EntryTime/ExitTime, Entry Date osv.
+    norm = {c: c.lower().replace(" ", "").replace("_","") for c in cols}
+    ed = next((c for c,n in norm.items() if n.startswith("entry") or n == "in"), None)
+    xd = next((c for c,n in norm.items() if n.startswith("exit")  or n == "out"), None)
+    return ed, xd
+
+def _pos_from_trades_df(dftr: pd.DataFrame, index: pd.DatetimeIndex) -> pd.Series:
+    pos = pd.Series(0.0, index=index)
+    if dftr is None or len(dftr)==0:
+        return pos
+    ed, xd = _find_entry_exit(dftr.columns)
+    if ed is None:
+        return pos
+    ent = pd.to_datetime(dftr[ed]).dt.normalize()
+    exi = pd.to_datetime(dftr[xd]).dt.normalize() if xd is not None else pd.Series(pd.NaT, index=dftr.index)
+    for a,b in zip(ent, exi):
+        if pd.isna(b) or b <= a:
+            pos.loc[index >= a] = 1.0
+        else:
+            pos.loc[(index >= a) & (index < b)] = 1.0
+    return pos
+
+# --- huvud: kör profil -> position ---
+def run_profile_positions(ticker: str, params: dict, start) -> pd.Series:
+    RUN_BT, Params = _import_backtest()
+    df = GET_OHLCV(ticker=ticker, start=start, source="borsdata")
+    df = _normalize_index(df)
+    idx = df.index
+    built = _maybe_build_params(Params, params)
+    res = RUN_BT(df, built)  # motor-signatur: (df, Params) -> dict
+    if isinstance(res, dict) and isinstance(res.get("trades"), pd.DataFrame):
+        return _pos_from_trades_df(res["trades"], idx).reindex(idx).fillna(0.0).clip(0,1)
+    return pd.Series(0.0, index=idx)
+
+# --- portföljbygge ---
+def build_portfolio_with_caps(positions: Dict[str, pd.Series], prices: pd.DataFrame,
+                              max_per_asset: float, max_total_equity: float,
+                              lag_days: int = 1, max_positions: int | None = None):
+    prices = prices.sort_index().ffill()
+    idx = prices.index
+    tickers = list(prices.columns)
+    pos_df = pd.DataFrame({t: positions[t].reindex(idx).fillna(0.0) for t in tickers})
+    weights = pd.DataFrame(0.0, index=idx, columns=tickers)
+    for d in idx:
+        active = [t for t in tickers if pos_df.at[d, t] > 0.5]
+        if max_positions:
+            active = active[:max_positions]
+        if active:
+            base = min(1.0/len(active), max_per_asset)
+            sum_raw = base * len(active)
+            invested = min(sum_raw, max_total_equity)
+            scale = invested / sum_raw if sum_raw > 0 else 0.0
+            for t in active:
+                weights.at[d, t] = base * scale
+    returns = prices.pct_change().fillna(0.0)
+    w_eff = weights.shift(lag_days).fillna(0.0) if lag_days > 0 else weights
+    port_ret = (w_eff * returns).sum(axis=1)
+    equity = (1.0 + port_ret).cumprod()
+    out = pd.DataFrame({"value": equity, "ret": port_ret})
+    out["cash_weight"] = 1.0 - weights.sum(axis=1).clip(0, 1)
+    return out, weights
+
+from typing import Dict
+import pandas as pd
+
+def run_profile_trades(ticker: str, params: dict, start) -> pd.DataFrame:
+    """
+    Kör backtest och returnerar trades-DataFrame (EntryTime/ExitTime/...)
+    """
+    RUN_BT, Params = _import_backtest()
+    df = GET_OHLCV(ticker=ticker, start=start, source="borsdata")
+    built = _maybe_build_params(Params, params)
+    res = RUN_BT(df, built)
+    tr = res.get("trades")
+    if isinstance(tr, pd.DataFrame):
+        return tr.copy()
+    return pd.DataFrame(columns=["EntryTime","EntryPrice","ExitTime","ExitPrice","PnL","reason"])
+
+def buyhold_equity_from_price(s: pd.Series) -> pd.Series:
+    """Buy&hold (100% investerat hela tiden) från en prisserie."""
+    s = s.astype(float)
+    ret = s.pct_change().fillna(0.0)
+    return (1.0 + ret).cumprod()
+
+def equal_weight_buyhold_equity(prices: pd.DataFrame) -> pd.Series:
+    """
+    Lika-vikt buy&hold över ett universum (ingen rebalanslogik – konstant 1/N i varje).
+    """
+    prices = prices.astype(float)
+    returns = prices.pct_change().fillna(0.0)
+    n = returns.shape[1]
+    if n == 0:
+        return pd.Series(dtype=float)
+    w = 1.0 / n
+    port_ret = (returns * w).sum(axis=1)
+    return (1.0 + port_ret).cumprod()
+
+def index_equity(index_ticker: str, start) -> pd.Series:
+    """
+    Buy&hold för ett index (ange t.ex. OMXS30-ticker om din Börsdata-klient stödjer den).
+    Returnerar tom serie om det inte går att hämta.
+    """
+    try:
+        df = GET_OHLCV(index_ticker, start=start, source="borsdata")
+        if df is None or len(df) == 0:
+            return pd.Series(dtype=float)
+        s = _ensure_close_col(df)
+        return buyhold_equity_from_price(s)
+    except Exception:
+        return pd.Series(dtype=float)
+
+# === compat wrapper for _import_backtest (safe idempotent) ===
+try:
+    # Undvik dubbelinjektion
+    __already_wrapped = getattr(globals().get("_import_backtest", None), "__wrapped__", False)
+except Exception:
+    __already_wrapped = False
+
+if "_import_backtest" in globals() and not __already_wrapped:
+    __orig_import_backtest = _import_backtest
+    def _import_backtest(*args, **kwargs):  # pylint: disable=function-redefined
+        """
+        Kompatibel wrapper:
+          - Utan args/kwargs: bete dig exakt som originalet (returnera vad originalet returnerar).
+          - Med args/kwargs: kör själva backtestet via första lämpliga funktion
+            (backtest/run_backtest/simulate/run) i modulen eller i det som originalet returnerar.
+        """
+        res = __orig_import_backtest()
+        # Utan args: bevara ursprungsbeteende (t.ex. (RUN_BT, Params) eller modul)
+        if not args and not kwargs:
+            return res
+
+        # Om originalet returnerar en tuple (RUN_FN, Params) -> kör RUN_FN
+        try:
+            if isinstance(res, tuple) and callable(res[0]):
+                return res[0](*args, **kwargs)
+        except Exception:
+            pass
+
+        # Om originalet returnerar en modul/objekt: försök hitta körbar funktion där
+        mod = res
+        for name in ("backtest", "run_backtest", "simulate", "run"):
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                return fn(*args, **kwargs)
+
+        # Om modulen själv är anropbar
+        if callable(mod):
+            return mod(*args, **kwargs)
+
+        raise TypeError("Hittar ingen backtest-funktion i modulen/returen från _import_backtest()")
+
+    # Markera som wrappad så vi inte lägger på flera gånger
+    try: _import_backtest.__wrapped__ = True
+    except Exception: pass
+# === end compat wrapper ===

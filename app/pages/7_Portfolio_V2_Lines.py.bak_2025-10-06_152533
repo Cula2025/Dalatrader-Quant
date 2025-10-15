@@ -1,0 +1,151 @@
+import json, os
+from pathlib import Path
+import pandas as pd
+import streamlit as st
+
+# Motor-val (backtracker om finns, annars wrappern)
+try:
+    from app.backtracker import run_backtest as RUN
+    motor = "backtracker"
+except Exception:
+    from app import btwrap as W
+    RUN = W.run_backtest
+    motor = "btwrap"
+
+from app.data_providers import get_ohlcv
+from app.equity_extract import extract_equity
+from app.portfolio_math import pick_first, equal_weight_rebalanced, equal_weight_buyhold_from_closes
+
+INDEX_TICKER = "OMXS30GI"  # fungerar enligt dina tester
+
+st.title("📈 Portfolio V2 – linjegraf (Strategi, Buy&Hold, Index)")
+
+# --- Hjälpare ---
+def load_profiles():
+    out = []
+    for p in sorted(Path("profiles").glob("*.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            for pr in d.get("profiles", []):
+                out.append((p, pr))
+        except Exception:
+            pass
+    return out
+
+def best_profile_for_ticker(tkr: str):
+    # välj högst TotalReturn bland alla profiler där 'ticker' matchar
+    candidates = []
+    for p, pr in load_profiles():
+        t = pr.get("ticker") or (pr.get("params") or {}).get("ticker")
+        if (t or "").lower() == tkr.lower():
+            tr = (pr.get("metrics") or {}).get("TotalReturn")
+            candidates.append((float(tr) if tr is not None else float("-inf"), pr))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+def safe_equity_from_profile(pr: dict) -> pd.Series:
+    """Kör backtest och plocka ut equity som Serie (ingen 'or' på DF!)."""
+    t = pr.get("ticker") or (pr.get("params") or {}).get("ticker")
+    params = dict(pr.get("params") or {})
+    res = RUN(p={"ticker": t, "params": params})
+    # välj första icke-None nyckeln, undvik truthiness på DF
+    x = None
+    for k in ("equity", "summary"):
+        v = res.get(k)
+        if v is not None:
+            x = v
+            break
+    if x is None:
+        x = res
+    s = extract_equity(x)
+    return s
+
+def closes_for_tickers(tickers, start: str) -> dict[str, pd.Series]:
+    out = {}
+    for t in tickers:
+        df = get_ohlcv(ticker=t, start=start, end=None)
+        if df is None or df.empty or "Close" not in df.columns:
+            continue
+        out[t] = df["Close"].dropna()
+    return out
+
+# --- UI: välj tickers (default: de tre senaste filnamnen) ---
+all_profiles = load_profiles()
+all_tickers = sorted({ (pr.get("ticker") or (pr.get("params") or {}).get("ticker")) for _,pr in all_profiles if pr })
+all_tickers = [t for t in all_tickers if t]
+
+default_sel = []
+for p in sorted(Path("profiles").glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        for pr in d.get("profiles", []):
+            t = pr.get("ticker") or (pr.get("params") or {}).get("ticker")
+            if t and t not in default_sel:
+                default_sel.append(t)
+            if len(default_sel) >= 3:
+                break
+        if len(default_sel) >= 3:
+            break
+    except Exception:
+        pass
+if not default_sel:
+    default_sel = all_tickers[:3]
+
+sel_tickers = st.multiselect("Välj tickers (max 10)", options=all_tickers, default=default_sel, max_selections=10)
+
+# --- Hämta bästa profil per ticker och bygg strategi-portfölj ---
+equities = []
+from_dates = []
+picked = []
+for t in sel_tickers:
+    bp = best_profile_for_ticker(t)
+    if not bp:
+        st.warning(f"Hittar ingen profil för {t}")
+        continue
+    picked.append((t, bp))
+    eq = safe_equity_from_profile(bp)
+    if not eq.empty:
+        equities.append(eq)
+    fd = (bp.get("params") or {}).get("from_date")
+    if fd:
+        from_dates.append(str(fd))
+
+if not equities:
+    st.error("Inga equity-serier kunde skapas – kontrollera profilerna.")
+    st.stop()
+
+# Gemensam start (använd minsta from_date i profilerna)
+common_start = min(from_dates) if from_dates else str(equities[0].index[0].date())
+
+# Strategiportfölj (EW rebalanced)
+port_reb = equal_weight_rebalanced(equities)
+
+# Buy&Hold (EW, ingen rebal) från Close – strikt datum-intersection
+closes = closes_for_tickers([t for t,_ in picked], start=common_start)
+bh = equal_weight_buyhold_from_closes(closes)
+# Align BH till portföljens index (gemensam plott)
+bh = bh.reindex(port_reb.index).dropna()
+
+# Indexkurva (OMXS30GI), normaliserad till samma start
+idx = get_ohlcv(INDEX_TICKER, start=common_start, end=None)
+if idx is not None and not idx.empty and "Close" in idx.columns:
+    idx = (idx["Close"].dropna())
+    idx = idx / float(idx.iloc[0])
+    idx = idx.reindex(port_reb.index).dropna()
+    idx.name = INDEX_TICKER
+else:
+    idx = pd.Series(dtype="float64", name=INDEX_TICKER)
+
+# Sammanställ och plott
+df_plot = pd.concat([port_reb.rename("Portfolio"), bh.rename("Buy&Hold"), idx.rename(INDEX_TICKER)], axis=1)
+st.line_chart(df_plot)
+
+# Små nyckeltal
+st.caption(f"Motor: {motor} | Start: {df_plot.index[0].date()}  Slut: {df_plot.index[-1].date()}")
+st.write({
+    "Portfolio_final": None if df_plot['Portfolio'].dropna().empty else float(df_plot['Portfolio'].iloc[-1]),
+    "BuyHold_final":   None if df_plot['Buy&Hold'].dropna().empty   else float(df_plot['Buy&Hold'].iloc[-1]),
+    f"{INDEX_TICKER}_final": None if df_plot[INDEX_TICKER].dropna().empty else float(df_plot[INDEX_TICKER].iloc[-1]),
+})

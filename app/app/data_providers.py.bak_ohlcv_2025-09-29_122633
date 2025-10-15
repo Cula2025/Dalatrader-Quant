@@ -1,0 +1,37 @@
+﻿from __future__ import annotations
+import os
+from typing import Optional
+import pandas as pd
+from app.bd_modern_client import (
+    get_ohlcv as _bd_get_ohlcv,
+    get_client as _get_client_key,
+    BDModernAdapter,
+    using_hardcoded_key,
+)
+__all__ = ["BDModernAdapter", "get_client", "get_ohlcv", "using_hardcoded_key"]
+
+# --- Börsdata API-nyckel via miljövariabel ---
+_BD_API_KEY = os.getenv('BORSDATA_API_KEY')
+if not _BD_API_KEY:
+    raise RuntimeError('Saknar BORSDATA_API_KEY i miljön. Sätt i /etc/dalatrader.env')
+# ------------------------------------------------
+
+
+def get_client() -> str:
+    return _get_client_key()
+
+def get_ohlcv(
+    ticker: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    period: Optional[str] = None,
+    interval: str = "1d",
+    source: str = "borsdata",
+    auto_adjust: bool = False,
+) -> pd.DataFrame:
+    if (source or "borsdata").lower() != "borsdata":
+        raise ValueError("Only source='borsdata' is supported in this build.")
+    return _bd_get_ohlcv(
+        ticker=ticker, start=start, end=end, period=period,
+        interval=interval, source="borsdata", auto_adjust=auto_adjust,
+    )

@@ -1,0 +1,60 @@
+import streamlit as st
+import json
+from pathlib import Path
+import pandas as pd
+
+from app import btwrap as W
+from app.trades_extract import extract_trades
+
+st.title("🧾 Trades – Portfolio V2 (läs-endast)")
+
+# Välj profilfiler
+prof_dir = Path("profiles")
+files_all = sorted(p.name for p in prof_dir.glob("*.json"))
+sel = st.multiselect("Profilfiler (bästa profilen per fil)", files_all[:10], default=files_all[:3])
+
+all_trades = []
+errors = []
+
+for fname in sel:
+    try:
+        d = json.loads((prof_dir/fname).read_text(encoding="utf-8"))
+        # plocka bästa profilen (eller första)
+        profs = d.get("profiles") or []
+        if not profs:
+            continue
+        best = profs[0]
+        ticker = best.get("ticker") or (best.get("params") or {}).get("ticker")
+        params = dict(best.get("params") or {})
+        res = W.run_backtest(p={"ticker": ticker, "params": params})
+        tdf = extract_trades(res, default_ticker=ticker, default_profile=best.get("name"))
+        if not tdf.empty:
+            all_trades.append(tdf)
+    except Exception as e:
+        errors.append((fname, repr(e)))
+
+if errors:
+    for f, msg in errors:
+        st.error(f"{f}: {msg}")
+
+if not all_trades:
+    st.info("Inga trades att visa – välj en eller flera profilfiler ovan.")
+    st.stop()
+
+df = pd.concat(all_trades).sort_index()
+# Visa minimalt nödvändigt: Datum (index), Ticker, Side, Qty, Price, CashFlow, Amount, Profile
+show_cols = [c for c in ["Ticker","Side","Qty","Price","CashFlow","Amount","Profile"] if c in df.columns]
+st.dataframe(df[show_cols], use_container_width=True)
+
+# Små sammanfattningar
+buys  = int((df["Side"]=="BUY").sum()) if "Side" in df else 0
+sells = int((df["Side"]=="SELL").sum()) if "Side" in df else 0
+tot   = len(df)
+sum_cf = float(df["CashFlow"].sum()) if "CashFlow" in df else 0.0
+
+c1,c2,c3,c4 = st.columns(4)
+c1.metric("Antal trades", f"{tot}")
+c2.metric("Köp", f"{buys}")
+c3.metric("Sälj", f"{sells}")
+c4.metric("Netto cash-flow", f"{sum_cf:,.0f}")
+

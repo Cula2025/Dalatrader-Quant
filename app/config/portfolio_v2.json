@@ -1,0 +1,10 @@
+{
+  "engine": "equal_weight_rebalance",
+  "initial_capital": 100000,
+  "per_trade_fraction": 0.3333,
+  "fees_bps": 0,
+  "slippage_bps": 0,
+  "include_dividends": false,
+  "index_ticker": "OMXS30GI",
+  "default_profiles": []
+}

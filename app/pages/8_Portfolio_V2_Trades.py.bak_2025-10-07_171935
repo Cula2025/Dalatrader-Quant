@@ -1,0 +1,146 @@
+from __future__ import annotations
+import json
+from pathlib import Path
+import pandas as pd
+import streamlit as st
+
+# Stabil motor via wrapper
+from app import btwrap as W
+from app.trade_extract import to_trades_df
+
+st.set_page_config(page_title="Portfolio V2 – Trades", layout="wide")
+st.title("📒 Portfolio V2 – Trades")
+
+# --- Filval (default: alla profiler) ---
+all_files = sorted([str(p) for p in Path("profiles").glob("*.json")])
+sel_files = st.multiselect("Profilfiler (profiles/*.json)", all_files, default=all_files)
+if not sel_files:
+    st.info("Välj minst en profilfil.")
+    st.stop()
+
+def _best_profile(d: dict) -> dict | None:
+    profs = d.get("profiles") or []
+    if not profs:
+        return None
+    def tr(p):
+        m = p.get("metrics") or {}
+        try:
+            return float(m.get("TotalReturn"))
+        except Exception:
+            return float("nan")
+    profs_sorted = sorted(profs, key=lambda p: (pd.notna(tr(p)), tr(p)), reverse=True)
+    return profs_sorted[0]
+
+def _load_trades(file: str) -> pd.DataFrame:
+    # Läs profil → backtest → normalisera trades-DataFrame
+    try:
+        d = json.loads(Path(file).read_text(encoding="utf-8"))
+    except Exception as e:
+        st.warning(f"Kan inte läsa {file}: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+
+    prof = _best_profile(d)
+    if prof is None:
+        st.warning(f"Inga profiler i {file}")
+        return pd.DataFrame()
+
+    t = prof.get("ticker") or (prof.get("params") or {}).get("ticker")
+    params = dict(prof.get("params") or {})
+
+    try:
+        res = W.run_backtest(p={"ticker": t, "params": params})
+    except Exception as e:
+        st.error(f"Backtest misslyckades för {t} ({file}): {type(e).__name__}: {e}")
+        return pd.DataFrame()
+
+    # Konvertera till ledger-format (BUY/SELL med datumindex)
+    try:
+        trades = to_trades_df(res.get("trades") if isinstance(res, dict) else res)
+    except Exception as e:
+        st.error(f"to_trades_df-fel för {t} ({file}): {type(e).__name__}: {e}")
+        return pd.DataFrame()
+
+    # Säkerställ DatetimeIndex
+    if "date" in trades.columns:
+        trades = trades.set_index("date", drop=True)
+    trades.index = pd.to_datetime(trades.index, errors="coerce")
+    trades = trades[~trades.index.isna()]
+
+    # Typa numeriska kolumner
+    for col in ("price","qty","value","pnl"):
+        if col in trades.columns:
+            trades[col] = pd.to_numeric(trades[col], errors="coerce")
+
+    # Identifierare
+    if "ticker" not in trades.columns:
+        trades["ticker"] = t
+    if "profile" not in trades.columns:
+        trades["profile"] = prof.get("name") or t
+
+    # Notional = qty*price
+    if {"price","qty"}.issubset(trades.columns):
+        trades["notional"] = trades["price"] * trades["qty"]
+
+    # Kolumnordning
+    cols = [c for c in ["side","price","qty","notional","value","pnl","ticker","profile"] if c in trades.columns]
+    trades = trades[cols]
+    trades.index.name = "date"
+    return trades.sort_index()
+
+# --- Ladda alla valda profiler ---
+frames = []
+for f in sel_files:
+    df = _load_trades(f)
+    if df is not None and not df.empty:
+        frames.append(df)
+
+if not frames:
+    st.info("Inga trades att visa ännu.")
+    st.stop()
+
+df_all = pd.concat(frames, axis=0, ignore_index=False, sort=False).sort_index()
+
+# --- Filter i sidopanelen ---
+tickers = sorted(df_all["ticker"].dropna().unique()) if "ticker" in df_all.columns else []
+sel_tickers = st.sidebar.multiselect("Tickerfilter", tickers, default=tickers)
+if sel_tickers and "ticker" in df_all.columns:
+    df_all = df_all[df_all["ticker"].isin(sel_tickers)]
+
+sides = sorted(df_all["side"].dropna().unique()) if "side" in df_all.columns else []
+sel_sides = st.sidebar.multiselect("Side", sides, default=sides)
+if sel_sides and "side" in df_all.columns:
+    df_all = df_all[df_all["side"].isin(sel_sides)]
+
+# Datumintervall
+dmin = df_all.index.min()
+dmax = df_all.index.max()
+date_range = st.sidebar.date_input("Datumintervall", value=(None, None))
+if isinstance(date_range, tuple):
+    start, end = date_range
+    if start:
+        df_all = df_all[df_all.index >= pd.Timestamp(start)]
+    if end:
+        df_all = df_all[df_all.index <= pd.Timestamp(end)]
+
+# --- Aggregerade nyckeltal ---
+def _safe_sum(s): 
+    return float(pd.to_numeric(s, errors="coerce").fillna(0).sum())
+
+n_buys  = int((df_all["side"] == "BUY").sum()) if "side" in df_all.columns else 0
+n_sells = int((df_all["side"] == "SELL").sum()) if "side" in df_all.columns else 0
+turnover = _safe_sum(df_all.get("notional", pd.Series(dtype="float64")))
+realized = _safe_sum(df_all.get("pnl", pd.Series(dtype="float64")))
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("BUY", n_buys)
+c2.metric("SELL", n_sells)
+c3.metric("Omsättning (sum notional)", f"{turnover:,.0f} kr")
+c4.metric("Realiserad PnL (SELL-rader)", f"{realized:,.0f} kr")
+
+st.divider()
+st.caption(f"Rader: {len(df_all)} | Period: {dmin.date()} → {dmax.date()}")
+st.dataframe(df_all.reset_index(), use_container_width=True, hide_index=True)
+
+# Export
+csv = df_all.reset_index().to_csv(index=False)
+st.download_button("Ladda ner CSV", data=csv, file_name="portfolio_trades_ledger.csv", mime="text/csv")

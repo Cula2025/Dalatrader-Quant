@@ -1,0 +1,267 @@
+﻿# C:\trader\app\backtest.py
+from __future__ import annotations
+from typing import Dict, Any, List, Tuple
+import math
+import numpy as np
+import pandas as pd
+
+# ----------------- Helpers (indikatorer) -----------------
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    n = max(1, int(n))
+    return s.ewm(span=n, adjust=False).mean()
+
+def _sma(s: pd.Series, n: int) -> pd.Series:
+    n = max(1, int(n))
+    return s.rolling(n, min_periods=n).mean()
+
+def _rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    window = max(2, int(window))
+    delta = series.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    roll_up = up.ewm(alpha=1.0/window, adjust=False).mean()
+    roll_down = down.ewm(alpha=1.0/window, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+# ----------------- Datastäd -----------------
+NEEDED = ["Date", "Open", "High", "Low", "Close", "Volume"]
+
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df)
+    if "Date" not in df.columns:
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index().rename(columns={"index": "Date"})
+        else:
+            for a in ("date", "time", "timestamp", "DateTime", "datetime"):
+                if a in df.columns:
+                    df = df.rename(columns={a: "Date"})
+                    break
+    miss = [c for c in NEEDED if c not in df.columns]
+    if miss:
+        raise ValueError(f"CSV/DF saknar kolumner. Måste ha: {NEEDED}. Har: {list(df.columns)}")
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_localize(None)
+    for c in ("Open", "High", "Low", "Close", "Volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
+
+# ----------------- Signalbyggare (vektoriserad) -----------------
+def _build_signal_frame(
+    df: pd.DataFrame,
+    *,
+    use_rsi_filter: bool,
+    rsi_window: int,
+    rsi_min: float,
+    rsi_max: float,
+    fast: int,
+    slow: int,
+    use_trend_filter: bool,
+    exit_lookback: int,
+    trail_buffer_pct: float,
+) -> pd.DataFrame:
+    px = df.copy()
+    px["RSI"] = _rsi(px["Close"], rsi_window)
+    px["fastMA"] = _ema(px["Close"], fast)
+    px["slowMA"] = _sma(px["Close"], slow)
+
+    # Trendfilter: kräver fast >= slow vid ENTRY (inte för exist, den hanteras separat)
+    if use_trend_filter:
+        px["TrendOK"] = (px["fastMA"] >= px["slowMA"])
+    else:
+        px["TrendOK"] = True
+
+    # Entryvillkor (RSI-gate valfri)
+    if use_rsi_filter:
+        px["enter"] = (px["RSI"] <= rsi_min) & px["TrendOK"]
+    else:
+        px["enter"] = px["TrendOK"]
+
+    # Exitvillkor (RSI över max, MA-bryt, och ev. trail)
+    exit_cond = (use_rsi_filter & (px["RSI"] >= rsi_max)) | (px["fastMA"] < px["slowMA"])
+
+    if exit_lookback and exit_lookback > 0:
+        roll_hi = px["Close"].rolling(int(exit_lookback), min_periods=1).max()
+        if trail_buffer_pct and trail_buffer_pct > 0:
+            trail_line = roll_hi * (1.0 - float(trail_buffer_pct))
+        else:
+            trail_line = roll_hi
+        exit_cond = exit_cond | (px["Close"] < trail_line)
+
+    px["exit"] = exit_cond
+    return px
+
+# ----------------- Snabb handelsmotor (skanna bara signalpunkter) -----------------
+def _simulate_trades(
+    px: pd.DataFrame,
+    cost_bps: float,
+    slip_bps: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returnerar (equity_df, trades_df).
+    Handelslogik: all-in på entry, all-out på exit. Heltalsandelar.
+    """
+    dates = px["Date"].to_numpy()
+    close = px["Close"].to_numpy(dtype=float)
+    enter = px["enter"].to_numpy(dtype=bool)
+    exitf = px["exit"].to_numpy(dtype=bool)
+
+    n = len(px)
+    if n == 0:
+        return pd.DataFrame(columns=["Date", "Equity"]), pd.DataFrame(columns=["EntryTime","EntryPrice","ExitTime","ExitPrice","PnL","reason"])
+
+    # Index för kandidater (snabbare än att iterera alla barer)
+    entry_idx = np.flatnonzero(enter)
+    exit_idx = np.flatnonzero(exitf)
+
+    # vi traverserar ändå i en enkel loop, men hoppar snabbt till nästa signal
+    i = 1  # starta på 1 så vi kan referera i-1
+    cash = 100000.0
+    pos_shares = 0.0
+    in_price = math.nan
+    in_time = None
+
+    # För equity-beräkning line-by-line utan dyr Pandas:
+    equity = np.empty(n, dtype=float)
+    equity[:] = np.nan
+    equity[0] = cash
+
+    t_records: List[Dict[str, Any]] = []
+
+    # Kostnader
+    tc = (cost_bps + slip_bps) / 10000.0
+
+    while i < n:
+        # Exit först om vi har position
+        if pos_shares > 0.0 and exitf[i]:
+            out_price = close[i] * (1.0 - tc)
+            cash += out_price * pos_shares
+            pnl = (out_price - in_price) * pos_shares
+            t_records.append({
+                "EntryTime": dates[in_time],
+                "EntryPrice": round(in_price, 6),
+                "ExitTime": dates[i],
+                "ExitPrice": round(out_price, 6),
+                "PnL": round(pnl, 2),
+                "reason": "Exit"
+            })
+            pos_shares = 0.0
+            in_price = math.nan
+            in_time = None
+
+        # Entry om flat
+        if pos_shares == 0.0 and enter[i]:
+            buy_price = close[i] * (1.0 + tc)
+            if buy_price > 0:
+                sh = math.floor(cash / buy_price)
+                if sh > 0:
+                    cash -= buy_price * sh
+                    pos_shares = float(sh)
+                    in_price = buy_price
+                    in_time = i
+
+        # Mark-to-market equity
+        equity[i] = cash + (pos_shares * close[i] if pos_shares > 0.0 else 0.0)
+        i += 1
+
+    # Stäng eventuell öppen på sista baren
+    if pos_shares > 0.0:
+        out_price = close[-1] * (1.0 - tc)
+        cash += out_price * pos_shares
+        pnl = (out_price - in_price) * pos_shares
+        t_records.append({
+            "EntryTime": dates[in_time],
+            "EntryPrice": round(in_price, 6),
+            "ExitTime": dates[-1],
+            "ExitPrice": round(out_price, 6),
+            "PnL": round(pnl, 2),
+            "reason": "Close Last"
+        })
+        pos_shares = 0.0
+        in_price = math.nan
+        in_time = None
+        equity[-1] = cash
+
+    # Fyll ev. saknade equity-punkter (bör inte hända ofta)
+    mask = np.isnan(equity)
+    if mask.any():
+        equity[mask] = np.interp(np.flatnonzero(mask), np.flatnonzero(~mask), equity[~mask])
+
+    eq_df = pd.DataFrame({"Date": px["Date"], "Equity": equity})
+    trades_df = pd.DataFrame.from_records(t_records)
+    return eq_df, trades_df
+
+# ----------------- Publik API -----------------
+def run_backtest(df: pd.DataFrame, **kwargs) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    """
+    Returnerar (summary, equity_df, trades_df).
+    Accepterar dina vanliga kwargs. Okända ignoreras tyst.
+    """
+    df = _normalize_df(df)
+
+    use_rsi_filter = bool(kwargs.get("use_rsi_filter", True))
+    rsi_window = int(kwargs.get("rsi_window", 14))
+    rsi_min = float(kwargs.get("rsi_min", 25.0))
+    rsi_max = float(kwargs.get("rsi_max", 60.0))
+
+    fast = int(kwargs.get("fast", 15))
+    slow = int(kwargs.get("slow", 100))
+
+    use_trend_filter = bool(kwargs.get("use_trend_filter", False))
+
+    # trailing är AV som default (många aktier mår bättre utan)
+    exit_lookback = int(kwargs.get("exit_lookback", 0))
+    trail_buffer_pct = float(kwargs.get("trail_buffer_pct", 0.0))
+
+    cost_bps = float(kwargs.get("cost_bps", 0.0))
+    slip_bps = float(kwargs.get("slip_bps", 0.0))
+
+    px = _build_signal_frame(
+        df,
+        use_rsi_filter=use_rsi_filter,
+        rsi_window=rsi_window,
+        rsi_min=rsi_min,
+        rsi_max=rsi_max,
+        fast=fast,
+        slow=slow,
+        use_trend_filter=use_trend_filter,
+        exit_lookback=exit_lookback,
+        trail_buffer_pct=trail_buffer_pct,
+    )
+
+    eq_buy, trades = _simulate_trades(px, cost_bps=cost_bps, slip_bps=slip_bps)
+
+    # Buy & hold:
+    init_cash = 100000.0
+    start_price = float(df["Close"].iloc[0])
+    sh = math.floor(init_cash / start_price)
+    rem = init_cash - sh * start_price
+    eq_keep = rem + sh * df["Close"].astype(float)
+    buyhold_ret = float(eq_keep.iloc[-1] / init_cash - 1.0)
+
+    final_equity = float(eq_buy["Equity"].iloc[-1]) if len(eq_buy) else init_cash
+    total_return = (final_equity / init_cash) - 1.0
+
+    # MaxDD & SharpeD (enkel)
+    if len(eq_buy) > 2:
+        x = eq_buy["Equity"].to_numpy(dtype=float)
+        roll_max = np.maximum.accumulate(x)
+        dd = (x - roll_max) / roll_max
+        maxdd = float(dd.min())
+        rets = pd.Series(x).pct_change().dropna()
+        sharpe_d = float(rets.mean() / (rets.std() + 1e-12))
+    else:
+        maxdd = 0.0
+        sharpe_d = 0.0
+
+    summary: Dict[str, Any] = {
+        "Bars": int(len(df)),
+        "Trades": int(len(trades)),
+        "TotalReturn": float(total_return),
+        "MaxDD": float(maxdd),
+        "SharpeD": float(sharpe_d),
+        "BuyHold": float(buyhold_ret),
+        "FinalEquity": float(final_equity),
+    }
+    return summary, eq_buy, trades

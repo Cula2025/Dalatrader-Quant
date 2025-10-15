@@ -1,0 +1,74 @@
+﻿from __future__ import annotations
+import os
+from typing import Optional
+import pandas as pd
+from app.bd_modern_client import (
+    get_ohlcv as _bd_get_ohlcv,
+    get_client as _get_client_key,
+    BDModernAdapter,
+    using_hardcoded_key,
+)
+__all__ = ["BDModernAdapter", "get_client", "get_ohlcv", "using_hardcoded_key"]
+
+# --- Börsdata API-nyckel via miljövariabel ---
+_BD_API_KEY = os.getenv('BORSDATA_API_KEY')
+if not _BD_API_KEY:
+    raise RuntimeError('Saknar BORSDATA_API_KEY i miljön. Sätt i /etc/dalatrader.env')
+# ------------------------------------------------
+
+
+def get_client() -> str:
+    return _get_client_key()
+
+def get_ohlcv(
+    ticker: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    period: Optional[str] = None,
+    interval: str = "1d",
+    source: str = "borsdata",
+    auto_adjust: bool = False,
+) -> pd.DataFrame:
+    if (source or "borsdata").lower() != "borsdata":
+        raise ValueError("Only source='borsdata' is supported in this build.")
+    return _bd_get_ohlcv(
+        ticker=ticker, start=start, end=end, period=period,
+        interval=interval, source="borsdata", auto_adjust=auto_adjust,
+    )
+# --- ensure OHLCV variants (lowercase + TitleCase) ---
+def _ensure_ohlcv_variants(df):
+    import pandas as pd
+    if df is None:
+        return df
+    cols = set(getattr(df, "columns", []))
+    pairs = [("open","Open"), ("high","High"), ("low","Low"), ("close","Close"), ("volume","Volume")]
+    # skapa TitleCase från lowercase
+    for low, cap in pairs:
+        if low in cols and cap not in cols:
+            df[cap] = df[low]
+    cols = set(getattr(df, "columns", []))
+    # skapa lowercase från TitleCase
+    for low, cap in pairs:
+        if cap in cols and low not in cols:
+            df[low] = df[cap]
+    # försök numeriska typer
+    for low, cap in pairs:
+        for c in (low, cap):
+            if c in df.columns:
+                try:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                except Exception:
+                    pass
+    return df
+
+# wrap original get_ohlcv för att alltid leverera kompletta kolumner
+try:
+    _orig_get_ohlcv = get_ohlcv  # noqa: F811
+except NameError:
+    _orig_get_ohlcv = None
+
+if _orig_get_ohlcv is not None:
+    def get_ohlcv(*args, **kwargs):  # noqa: F811
+        df = _orig_get_ohlcv(*args, **kwargs)
+        return _ensure_ohlcv_variants(df)
+# --- end ensure OHLCV variants ---

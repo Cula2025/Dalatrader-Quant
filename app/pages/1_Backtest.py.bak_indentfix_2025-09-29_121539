@@ -1,0 +1,286 @@
+# -*- coding: utf-8 -*-
+import datetime as dt
+from pathlib import Path
+import inspect
+import pandas as pd
+import streamlit as st
+
+from app.data_providers import get_ohlcv as GET_OHLCV
+from app.portfolio_signals import _import_backtest  # OBS: hämtar (RUN_BT, Params) i ert upplägg
+
+st.set_page_config(page_title="Dala Trader – Backtest (ren)", page_icon="🧪", layout="wide")
+st.title("🧪 Backtest (ren)")
+
+# -------- Debug UI --------
+st.sidebar.subheader("🛠️ Debug")
+DEBUG_KEY = "debug_enabled"
+st.session_state.setdefault(DEBUG_KEY, True)
+def d(msg: str):
+    if st.session_state.get(DEBUG_KEY, False):
+        st.sidebar.markdown(
+            "<small style='color:#2f7df6'>" + str(msg).replace("<","&lt;").replace(">","&gt;") + "</small>",
+            unsafe_allow_html=True
+        )
+st.sidebar.checkbox("Debug 0.5", value=st.session_state[DEBUG_KEY], key=DEBUG_KEY)
+
+# -------- Inputs --------
+today = dt.date.today()
+default_start = today.replace(year=max(2000, today.year - 5))
+with st.sidebar:
+    _BASE = Path(__file__).resolve().parents[1]
+    _LOGO = _BASE / "assets" / "logodaladrader.png"
+    if _LOGO.exists():
+        st.image(str(_LOGO), width='stretch')
+        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+ticker = st.text_input("Ticker", value=st.session_state.get("ticker", "HM-B.ST"), key="bt_ticker")
+start  = st.date_input("Startdatum", value=st.session_state.get("from_date", default_start), key="bt_start")
+end    = st.date_input("Slutdatum",  value=st.session_state.get("to_date", today), key="bt_end")
+run_bt = st.button("Kör backtest", type="primary")
+
+# -------- Data-prep --------
+def coerce_ohlcv(obj):
+    """Försök alltid få ett korrekt OHLCV-DataFrame med DatetimeIndex och 'close'."""
+    if obj is None:
+        return None, "Ingen data (None) från datakälla."
+    if isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+    else:
+        try:
+            df = pd.DataFrame(obj)
+        except Exception as e:
+            return None, f"Data -> DataFrame misslyckades: {e}"
+
+    # Datumindex
+    if not isinstance(df.index, pd.DatetimeIndex):
+        for cand in ("date","Date","timestamp","time","Time"):
+            if cand in df.columns:
+                df[cand] = pd.to_datetime(df[cand], errors="coerce", utc=True)
+                df = df.set_index(cand)
+                break
+        if not isinstance(df.index, pd.DatetimeIndex):
+            try:
+                df.index = pd.to_datetime(df.index, errors="coerce", utc=True)
+            except Exception as e:
+                return None, f"Kan inte tolka datumindex: {e}"
+
+    df = df.sort_index()
+
+    # Kolumnalias
+    col_alias = {
+        "open":   ("open","o","open_price"),
+        "high":   ("high","h","high_price"),
+        "low":    ("low","l","low_price"),
+        "close":  ("close","c","close_price","adjclose","adj_close","price","last"),
+        "volume": ("volume","v","vol","turnover"),
+    }
+    lower = {c.lower(): c for c in df.columns}
+    for target, aliases in col_alias.items():
+        if target not in df.columns:
+            for a in aliases:
+                if a in lower:
+                    df = df.rename(columns={lower[a]: target})
+                    break
+
+    if "close" not in df.columns:
+        return None, "Saknar 'close'-kolumn i data efter normalisering."
+
+    return df, None
+
+# -------- Params-builder --------
+def _guess_default(name: str):
+    n = name.lower()
+    if "ticker" in n: return ticker
+    if "from" in n and "date" in n: return start
+    if "to" in n and "date" in n:   return end
+    if n.endswith("_window") or "window" in n: return 14
+    if n in ("rsi_window","atr_window"): return 14
+    if n in ("rsi_min",): return 30.0
+    if n in ("rsi_max",): return 70.0
+    if "lookback" in n: return 50
+    if n.startswith("use_"): return False
+    if "stop" in n and "pct" in n: return 0.10
+    if n == "sims": return 100
+    if n == "seed": return 42
+    if "mult" in n: return 2.0
+    return 0
+
+def build_params_safely(ParamsCls):
+    """Försök skapa en Params-instans. 1) Params(), 2) Params.default()/defaults(),
+       3) bygg kwargs från signaturen med rimliga standardvärden."""
+    # 1) raka spåret
+    try:
+        p = ParamsCls()
+        d("Params(): OK")
+        return p
+    except Exception as e:
+        d(f"Params() misslyckades: {e}")
+
+    # 2) ev. fabrik
+    for factory in ("default","defaults","from_defaults"):
+        f = getattr(ParamsCls, factory, None)
+        if callable(f):
+            try:
+                p = f()
+                d(f"Params.{factory}(): OK")
+                return p
+            except Exception as e:
+                d(f"Params.{factory}() misslyckades: {e}")
+
+    # 3) bygg kwargs utifrån signaturen
+    try:
+        sig = inspect.signature(ParamsCls)
+        kwargs = {}
+        for n, prm in sig.parameters.items():
+            if prm.default is not inspect._empty:
+                # har default – låt konstruktorn hantera det (mata inte in)
+                continue
+            # saknar default – gissa rimligt
+            kwargs[n] = _guess_default(n)
+        p = ParamsCls(**kwargs)
+        d(f"Params(**kwargs) med {list(kwargs.keys())}: OK")
+        return p
+    except Exception as e:
+        d(f"Params(**kwargs) misslyckades: {e}")
+        return None
+
+
+def _ensure_titlecase_ohlcv(df):
+    import pandas as pd
+    if df is None:
+        return df
+    cols = set(getattr(df, "columns", []))
+    pairs = [
+        ("open","Open"),
+        ("high","High"),
+        ("low","Low"),
+        ("close","Close"),
+        ("volume","Volume"),
+    ]
+    # Skapa TitleCase från lowercase
+    for low, cap in pairs:
+        if low in cols and cap not in cols:
+            df[cap] = df[low]
+    # Uppdatera cols och skapa lowercase från TitleCase (omvänt)
+    cols = set(df.columns)
+    for low, cap in pairs:
+        if cap in cols and low not in cols:
+            df[low] = df[cap]
+    # Försök numeriska typer där det går
+    for c in {c for pair in pairs for c in pair}:
+        if c in df.columns:
+            try:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            except Exception:
+                pass
+    return df
+
+# -------- Körning --------
+if run_bt:
+    st.info(f"Kör backtest för **{ticker}**: {start} → {end}")
+
+    # 1) Hämta data
+    try:
+        raw = GET_OHLCV(ticker, start, end)
+        d("GET_OHLCV(): OK")
+    except Exception as e:
+        st.error(f"Datainläsning misslyckades: {e}")
+        d(f"GET_OHLCV error: {type(e).__name__}: {e}")
+        st.stop()
+
+    df, err = coerce_ohlcv(raw)
+df = _ensure_titlecase_ohlcv(df)
+    if err:
+        st.error(f"Förbehandling av data misslyckades: {err}")
+        d(f"coerce_ohlcv: {err}")
+        st.stop()
+
+    d(f"Data klar: rader={len(df)}, datum {df.index.min().date()} → {df.index.max().date()}.")
+
+try:
+    d(f"Kolumner: {list(df.columns)[:12]}")
+except Exception:
+    pass
+    # 2) Hämta backtest och identifiera run-funktion + Params
+    try:
+        res = _import_backtest()
+    except Exception as e:
+        st.error(f"Kunde inte importera backtest: {e}")
+        d(f"_import_backtest(): {e}")
+        st.stop()
+
+    run_fn = None
+    ParamsCls = None
+
+    if isinstance(res, tuple):
+        d("Backtest: tuple")
+        for x in res:
+            if callable(x) and run_fn is None:
+                run_fn = x
+            elif isinstance(x, type) and ParamsCls is None:
+                ParamsCls = x
+    else:
+        btmod = res
+        d(f"Backtest: modul {getattr(btmod,'__name__', type(btmod).__name__)}")
+        for name in ("run_backtest","backtest","simulate","run"):
+            f = getattr(btmod, name, None)
+            if callable(f):
+                run_fn = f
+                break
+        ParamsCls = getattr(btmod, "Params", None)
+
+    if run_fn is None:
+        st.error("Hittar ingen backtest-funktion (run_backtest/backtest/simulate/run).")
+        st.stop()
+
+    # 3) Bygg Params om funktionen kräver det
+    needs_two = False
+    try:
+        sig = inspect.signature(run_fn)
+        d(f"Funktion: {run_fn.__name__}{sig}")
+        # heuristik: kräver 2 pos-args (df, p)?
+        pos = [p for p in sig.parameters.values()
+               if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        # exkludera self
+        if pos and pos[0].name == "self":
+            pos = pos[1:]
+        needs_two = len(pos) >= 2
+    except Exception:
+        d("Signatur okänd – antar (df, p).")
+        needs_two = True
+
+    params = None
+    if needs_two:
+        if ParamsCls is None:
+            d("ParamsCls saknas, men funktionen verkar kräva p → försöker ändå med tom dict (kan krascha).")
+        else:
+            params = build_params_safely(ParamsCls)
+
+    # 4) Kör
+    try:
+        if needs_two:
+            result = run_fn(df, params if params is not None else {})
+        else:
+            result = run_fn(df)
+    except Exception as e:
+        st.error(f"Backtest misslyckades: {e}")
+        d(f"Körfel: {type(e).__name__}: {e}")
+        st.stop()
+
+    # 5) Visa resultat
+    if isinstance(result, tuple) and len(result) >= 2:
+        eq, summ = result[0], result[1]
+        st.subheader("Resultat (tuple)")
+        if isinstance(eq, pd.DataFrame):
+            st.line_chart(eq)
+        st.json(summ)
+    elif isinstance(result, dict):
+        st.subheader("Resultat (dict)")
+        st.json(result)
+    elif isinstance(result, pd.DataFrame):
+        st.subheader("Resultat (DataFrame)")
+        st.dataframe(result.tail(50))
+    else:
+        st.subheader("Resultat (okänd typ)")
+        st.write(type(result).__name__)
+        st.write(result)

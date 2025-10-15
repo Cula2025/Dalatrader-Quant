@@ -1,0 +1,77 @@
+from __future__ import annotations
+from typing import Any, Mapping, Sequence
+import pandas as pd
+
+CANON = ["date","side","price","qty","value","ticker","profile","cash","equity","pnl"]
+
+def _to_df(obj: Any) -> pd.DataFrame:
+    if obj is None:
+        return pd.DataFrame(columns=CANON)
+
+    if isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+    elif isinstance(obj, (list, tuple)):
+        df = pd.DataFrame(obj)
+    elif isinstance(obj, Mapping):
+        if "trades" in obj:
+            return _to_df(obj["trades"])
+        df = pd.DataFrame(obj)
+    else:
+        return pd.DataFrame(columns=CANON)
+
+    # lower-case columns for easier matching
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # prefer explicit date column
+    if "date" not in df.columns:
+        for c in ("timestamp","datetime","time","day"):
+            if c in df.columns:
+                df["date"] = df.pop(c)
+                break
+
+    # ensure DatetimeIndex
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).set_index("date")
+    elif not isinstance(df.index, pd.DatetimeIndex):
+        idx = pd.to_datetime(df.index, errors="coerce")
+        df.index = idx
+        df = df.dropna()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            # still no, fallback minimal
+            df["date"] = pd.Timestamp("1970-01-01")
+            df = df.set_index("date")
+
+    # normalize column names/aliases → canon
+    colmap = {
+        "action":"side","signal":"side","type":"side",
+        "quantity":"qty","shares":"qty","amount":"value","value":"value",
+        "symbol":"ticker","instrument":"ticker",
+    }
+    for src, dst in colmap.items():
+        if src in df.columns and dst not in df.columns:
+            df[dst] = df.pop(src)
+
+    # make sure all columns exist
+    for c in CANON:
+        if c != "date" and c not in df.columns:
+            df[c] = None
+
+    # compute value if possible
+    if df["value"].isna().all():
+        try:
+            price = pd.to_numeric(df["price"], errors="coerce")
+            qty   = pd.to_numeric(df["qty"], errors="coerce")
+            df["value"] = price * qty
+        except Exception:
+            pass
+
+    df = df.sort_index()
+    # make index tz-naive for Streamlit/Altair
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    return df[CANON]
+
+def to_trades_df(x: Any) -> pd.DataFrame:
+    """Public helper: normalize any trades payload to a clean DataFrame with DatetimeIndex."""
+    return _to_df(x)

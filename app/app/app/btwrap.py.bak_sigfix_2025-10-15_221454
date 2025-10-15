@@ -1,0 +1,97 @@
+from __future__ import annotations
+from typing import Dict, Any, Callable
+import pandas as pd, inspect
+
+from app.data_providers import get_ohlcv
+from app.safebt import run as ENGINE_RUN  # den ENDA motorn
+
+def _to_series(x) -> pd.Series:
+    s = pd.to_numeric(pd.Series(x), errors="coerce").dropna()
+    try:
+        if not isinstance(s.index, pd.DatetimeIndex):
+            s.index = pd.to_datetime(s.index)
+        s = s.sort_index()
+    except Exception:
+        pass
+    return s
+
+def _metrics(ticker: str, eq: pd.Series) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if len(eq) == 0:
+        return out
+    total = float(eq.iloc[-1] / eq.iloc[0])
+    final = float(eq.iloc[-1])
+    rets  = eq.pct_change().dropna()
+    sharpe = float((rets.mean() / (rets.std() or 1e-12)) * (252 ** 0.5)) if len(rets) else 0.0
+    maxdd = float((eq / eq.cummax() - 1.0).min())
+    bhx = 0.0
+    try:
+        px = get_ohlcv(ticker, start=str(eq.index[0].date()))
+        close = pd.to_numeric(pd.Series(px.get("Close")), errors="coerce").dropna()
+        close = close[close.index >= eq.index[0]]
+        if len(close):
+            bhx = float(close.iloc[-1] / close.iloc[0])
+    except Exception:
+        pass
+    out.update(dict(TotalReturn=total, SharpeD=sharpe, MaxDD=maxdd, FinalEquity=final, BuyHold=bhx))
+    return out
+
+def _call_engine(run_fn: Callable, ticker: str, params: Dict[str, Any], df):
+    """
+    Prova vanliga signaturer i ordning:
+      1) kwargs: (ticker=..., params=..., df_in/df=...)
+      2) två-args: (ticker, params) eller (params, df)
+      3) tre-args: (ticker, params, df)
+    """
+    sig = inspect.signature(run_fn)
+    names = [p.name for p in sig.parameters.values()]
+    # 1) kwargs med rätt df-namn om det finns
+    kw = {}
+    if "ticker" in names: kw["ticker"] = ticker
+    if "symbol" in names and "ticker" not in kw: kw["symbol"] = ticker
+    if "params" in names: kw["params"] = params
+    for dname in ("df_in","df","data"):
+        if dname in names:
+            kw[dname] = df
+            break
+    if kw and set(kw.keys()).issubset(set(names)):
+        try:
+            return run_fn(**kw)
+        except TypeError:
+            pass
+
+    # 2) två-args varianter
+    try:  # (ticker, params)
+        return run_fn(ticker, params)
+    except TypeError:
+        pass
+    try:  # (params, df)
+        return run_fn(params, df)
+    except TypeError:
+        pass
+
+    # 3) tre-args (ticker, params, df)
+    try:
+        return run_fn(ticker, params, df)
+    except TypeError as e:
+        raise TypeError(f"Kan inte anropa motor med känd signatur: {e}")
+
+def run_backtest(p: Dict[str, Any], df=None) -> Dict[str, Any]:
+    ticker = (p or {}).get("ticker") or (p or {}).get("symbol") or ""
+    params = (p or {}).get("params") or {}
+    start  = params.get("start")
+    end    = params.get("end")
+
+    if df is None:
+        df = get_ohlcv(ticker, start=str(start) if start else None, end=end)
+
+    out = _call_engine(ENGINE_RUN, ticker, params, df)
+
+    eq = _to_series(out.get("equity"))
+    out["equity"] = eq
+    m = dict(out.get("metrics") or {})
+    m.setdefault("Trades", len(out.get("trades", [])))
+    for k,v in _metrics(ticker, eq).items():
+        m.setdefault(k, v)
+    out["metrics"] = m
+    return out

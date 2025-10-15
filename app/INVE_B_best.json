@@ -1,0 +1,46 @@
+{
+  "profiles": [
+    {
+      "name": "INVE B – auto_best_1000",
+      "ticker": "INVE B",
+      "params": {
+        "strategy": "rsi",
+        "trend_ma_type": "EMA",
+        "use_trend_filter": false,
+        "trend_ma_window": 0,
+        "fast": 15,
+        "slow": 100,
+        "use_rsi_filter": true,
+        "rsi_window": 7,
+        "rsi_min": 25.0,
+        "rsi_max": 75.0,
+        "breakout_lookback": 55,
+        "exit_lookback": 20,
+        "use_macd_filter": false,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+        "macd_mode": "above_zero",
+        "use_bb_filter": false,
+        "bb_window": 20,
+        "bb_nstd": 2.0,
+        "bb_mode": "exit_below_mid",
+        "bb_percent_b_min": 0.8,
+        "atr_window": 14,
+        "atr_stop_mult": 0.0,
+        "atr_trail_mult": 0.0,
+        "cost_bps": 0.0,
+        "cash_rate_apy": 0.0,
+        "max_positions": 1,
+        "per_trade_pct": 100.0,
+        "max_exposure_pct": 100.0
+      },
+      "metrics": {
+        "TotalReturn": 2.499694107703308,
+        "MaxDD": -0.25822302796110674,
+        "SharpeD": 1.1606823192991103,
+        "BuyHold": 1.191204588910134
+      }
+    }
+  ]
+}

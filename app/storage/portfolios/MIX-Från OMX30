@@ -1,0 +1,20 @@
+{
+  "name": "MinPortfölj",
+  "source": "borsdata",
+  "universe": [
+    "ABB",
+    "VOLV B",
+    "ERIC B"
+  ],
+  "start": "2019-01-01",
+  "end": "2025-09-11",
+  "rules": {
+    "capital": 100000.0,
+    "per_trade_pct": 5.0,
+    "max_exposure_pct": 25.0,
+    "max_positions": 5
+  },
+  "profiles_file": "VOLV_B_best.json",
+  "profiles_mode": "Matcha profiler PER ticker",
+  "chosen_profile_index": 0
+}

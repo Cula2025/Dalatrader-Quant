@@ -1,0 +1,151 @@
+# -*- coding: utf-8 -*-
+import inspect
+
+def _pick_run_fn(obj):
+    # obj kan vara modul, tuple, eller callable
+    if callable(obj):
+        return obj
+    # om tuple: leta namngivna först
+    if isinstance(obj, tuple):
+        for it in obj:
+            if not hasattr(it, "__name__"):  # kan vara modul/klass
+                continue
+            nm = getattr(it, "__name__", "").lower()
+            if nm in ("run_backtest","backtest","simulate","run"):
+                if callable(it):
+                    return it
+        for it in obj:
+            if callable(it):
+                try:
+                    sig = inspect.signature(it)
+                    if len(sig.parameters) in (1,2):
+                        return it
+                except Exception:
+                    pass
+        # leta på ett ev. modulobjekt i tuplen
+        for it in obj:
+            fn = _pick_run_fn(getattr(it, "run_backtest", None) or
+                              getattr(it, "backtest", None) or
+                              getattr(it, "simulate", None) or
+                              getattr(it, "run", None))
+            if fn: return fn
+        return None
+    # modul?
+    for name in ("run_backtest","backtest","simulate","run"):
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+def _pick_params(obj):
+    # Returnera Params-klassen om vi hittar den (annars None)
+    cand = None
+    if isinstance(obj, tuple):
+        for it in obj:
+            if inspect.isclass(it) and getattr(it, "__name__", "").lower() == "params":
+                return it
+        for it in obj:
+            if hasattr(it, "Params") and inspect.isclass(getattr(it, "Params")):
+                return getattr(it, "Params")
+        return None
+    cand = getattr(obj, "Params", None)
+    return cand if inspect.isclass(cand) else None
+
+def run_backtest(df=None, p=None):
+    # dalatrader: se till att df finns via loader
+    try:
+        _p = locals().get('p') if 'p' in locals() else globals().get('p')
+        _ticker=_fd=_td=None
+        if isinstance(_p, dict):
+            _ticker = (_p.get('ticker') or '').strip()
+            _params = _p.get('params') or {}
+            _fd = _params.get('from_date') or _p.get('from_date')
+            _td = _params.get('to_date') or _p.get('to_date')
+        if df is None and _ticker:
+            _df_try = _load_df_any_alias(_ticker, _fd, _td)
+            if _df_try is not None:
+                df = _df_try
+    except Exception as _e:
+        print('[btwrap] pre-data hook error:', type(_e).__name__, _e)
+    """Hämtar backtest-modulen via _import_backtest() och kör det bästa vi hittar."""
+    from app.portfolio_signals import _import_backtest
+
+# --- dalatrader: robust data loader injected ---
+def _resolve_ohlcv_loader():
+    """Försök hitta en get_ohlcv-funktion i projektet."""
+    import importlib
+    candidates = [
+        ("app.data", "get_ohlcv"),
+        ("app.data_provider", "get_ohlcv"),
+        ("app.providers", "get_ohlcv"),
+        ("data_provider", "get_ohlcv"),
+    ]
+    for mod, fn in candidates:
+        try:
+            m = importlib.import_module(mod)
+            if hasattr(m, fn):
+                return getattr(m, fn), f"{mod}.{fn}"
+        except Exception:
+            pass
+    return None, None
+
+def _aliases_for_ticker(t: str):
+    t = (t or "").strip()
+    if not t:
+        return []
+    base = t.replace("/", "-").replace("_", "-").strip()
+    uniq = []
+    for v in [base, base.replace(" ", "-"), f"{base}.ST", f"{base.replace(' ', '-')}.ST"]:
+        if v not in uniq:
+            uniq.append(v)
+    return uniq
+
+def _load_df_any_alias(ticker: str, from_date: str, to_date: str):
+    loader, name = _resolve_ohlcv_loader()
+    if loader is None:
+        print("[btwrap] Ingen dataladdare hittad (app.data|get_ohlcv m.fl.).")
+        return None
+    errs = []
+    for alias in _aliases_for_ticker(ticker):
+        try:
+            df = loader(alias, from_date, to_date)
+            n = (len(df) if df is not None and hasattr(df, "__len__") else 0)
+            if df is not None and n > 0:
+                print(f"[btwrap] get_ohlcv via {name} OK: alias='{alias}' rows={n}")
+                return df
+            else:
+                errs.append(f"alias {alias}: tom/None")
+        except Exception as e:
+            errs.append(f"alias {alias}: {type(e).__name__}: {e}")
+    print("[btwrap] get_ohlcv misslyckades för alla alias:", "; ".join(errs))
+    return None
+# --- /robust data loader ---
+    mod = _import_backtest()
+    fn = _pick_run_fn(mod)
+    if fn is None:
+        # om tuple och första elementet är callable
+        if isinstance(mod, tuple) and len(mod) > 0 and callable(mod[0]):
+            fn = mod[0]
+    if fn is None:
+        raise TypeError("Ingen körbar backtest-funktion hittades.")
+
+    # Försök skapa Params() om p saknas
+    if p is None:
+        P = _pick_params(mod)
+        if P is not None:
+            try:
+                p = P()
+            except Exception:
+                p = None
+
+    # Kör med (df, p) om möjligt, annars bara (df)
+    if p is not None:
+        try:
+            return fn(df, p)
+        except TypeError:
+            pass
+    try:
+        return fn(df)
+    except TypeError:
+        # sista försök om funktionen tvärtom kräver 2 args
+        return fn(df, p)

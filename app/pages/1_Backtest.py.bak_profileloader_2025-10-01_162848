@@ -1,0 +1,55 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+
+from pathlib import Path
+from typing import Dict, Any, List
+
+import pandas as pd
+import streamlit as st
+
+
+# --- helper: build current payload for backtest ---
+def _current_params_payload():
+    ticker = (st.session_state.get("ticker") or "").strip()
+    params = _collect_params_from_state()
+    return {"ticker": ticker, "params": params}
+
+# --- helper: collect params from session (dict for backtest) ---
+def _collect_params_from_state():
+    s = st.session_state
+    keys = [
+        "from_date","to_date",
+        "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+        "use_trend_filter","trend_ma_type","trend_ma_window",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal",
+        "use_bb_filter","bb_window","bb_nstd","bb_min",
+        "use_stop_loss","stop_mode","stop_loss_pct",
+        "atr_window","atr_mult",
+        "use_atr_trailing","atr_trail_mult",
+    ]
+    params = {}
+    for k in keys:
+        if k in s:
+            params[k] = s[k]
+    # datum-fallbacks om UI använder andra nycklar
+    if not params.get("from_date") and "start" in s:
+        params["from_date"] = s["start"]
+    if not params.get("to_date") and "end" in s:
+        params["to_date"] = s["end"]
+    return params
+
+# --- DEBUG START ---
+
+
+with st.sidebar.expander("DEBUG payload", expanded=False):
+    try:
+        payload = _current_params_payload()
+        st.json(payload)
+    except Exception as e:
+        import traceback
+        st.write("DEBUG payload misslyckades:", type(e).__name__, str(e))
+        st.code(traceback.format_exc())
+

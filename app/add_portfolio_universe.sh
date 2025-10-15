@@ -1,0 +1,302 @@
+set -euo pipefail
+cd /srv/trader/app
+ts=$(date +%F_%H%M%S)
+mkdir -p backups
+
+TARGET="pages/2_Portfolio_MIN.py"
+[ -f "$TARGET" ] && cp -v "$TARGET" "backups/2_Portfolio_MIN.py.${ts}"
+
+cat >"$TARGET" <<'PY'
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import date, timedelta
+from pathlib import Path
+import json
+
+# --- Branding (om du har den) ---
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title="Dala Trader – Portfolio (Profiler-universum)", page_icon="🧺")
+st.title("🧺 Portfolio – Profiler-universum")
+st.caption("Bygger portfölj ENDAST från tickers som har profiler i profiles/. Varje ticker kör sin profilmall (params) via btwrap.run_backtest. Fallback = buy&hold om strategi-equity saknas.")
+
+# ---- Dataprovider
+try:
+    from app.data_providers import get_ohlcv as GET_OHLCV
+except Exception as e:
+    GET_OHLCV = None
+    st.error(f"Kunde inte importera dataprovider: {type(e).__name__}: {e}")
+
+# ---- Hjälp: ladda profiler -> universum
+def _profiles_dir() -> Path:
+    # föredra absolut sökväg i servern
+    p1 = Path("/srv/trader/app/profiles")
+    p2 = Path("profiles")
+    return p1 if p1.exists() else p2
+
+def _read_json(p: Path) -> dict:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _pick_profile(entry_list: list[dict]) -> dict|None:
+    """Välj 'bästa' profil i filen. Regler:
+       1) Har metrics.TotalReturn? välj högst.
+       2) Annars första i listan.
+    """
+    if not entry_list:
+        return None
+    # försök sortera på TotalReturn
+    try:
+        arr = sorted(entry_list, key=lambda d: (d.get("metrics",{}) or {}).get("TotalReturn", float("-inf")), reverse=True)
+        return arr[0]
+    except Exception:
+        return entry_list[0]
+
+def load_universe() -> tuple[list[str], dict]:
+    """Returnerar (tickers, params_map) där params_map[ticker] = params-dict."""
+    base = _profiles_dir()
+    files = sorted(base.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    params_map: dict[str, dict] = {}
+    seen = set()
+    for f in files:
+        data = _read_json(f)
+        profs = data.get("profiles") or []
+        best = _pick_profile(profs)
+        if not best: 
+            continue
+        t = (best.get("ticker") or "").strip()
+        if not t or t in seen: 
+            continue
+        p = (best.get("params") or {}).copy()
+        params_map[t] = p
+        seen.add(t)
+    tickers = sorted(params_map.keys())
+    return tickers, params_map
+
+# ---- Strategi-equity via btwrap
+def _run_strategy_equity(ticker:str, start:str, end:str, params:dict|None=None) -> pd.Series:
+    try:
+        from app.btwrap import run_backtest as RUNBT
+    except Exception:
+        return pd.Series(dtype="float64")
+
+    p = {"ticker": ticker, "params": dict(params or {})}
+    p["params"]["from_date"] = start
+    p["params"]["to_date"]   = end
+
+    try:
+        out = RUNBT(p=p)                 # ny signatur
+    except TypeError:
+        try:
+            out = RUNBT(ticker, p["params"])  # äldre signatur
+        except Exception:
+            return pd.Series(dtype="float64")
+    except Exception:
+        return pd.Series(dtype="float64")
+
+    # plocka equity
+    if isinstance(out, dict):
+        eq = out.get("equity") or out.get("Equity")
+        if isinstance(eq, pd.DataFrame):
+            df = eq.copy()
+            low = {c:str(c).strip().lower() for c in df.columns}
+            df = df.rename(columns=low)
+            # equity-kolumn
+            for c in ("equity","Equity"):
+                if c.lower() in df.columns:
+                    s = pd.Series(pd.to_numeric(df[c.lower()], errors="coerce"), index=pd.to_datetime(df.index)).dropna().sort_index()
+                    return s
+        # Fallback list/serie
+        try:
+            s = pd.Series(eq).astype(float)
+            s.index = pd.to_datetime(s.index)
+            return s.sort_index()
+        except Exception:
+            return pd.Series(dtype="float64")
+    if isinstance(out, tuple) and len(out)>=2 and hasattr(out[1], "iloc"):
+        df = out[1]
+        low = {c:str(c).strip().lower() for c in df.columns}
+        df = df.rename(columns=low)
+        if "equity" in df.columns:
+            s = pd.Series(pd.to_numeric(df["equity"], errors="coerce"), index=pd.to_datetime(df.index)).dropna().sort_index()
+            return s
+    return pd.Series(dtype="float64")
+
+def _buyhold_equity_from_close(df: pd.DataFrame) -> pd.Series:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series(dtype="float64")
+    cols = {c:str(c).strip().lower() for c in df.columns}
+    df = df.rename(columns=cols)
+    for c in ("close","adj close","adjclose","price","last"):
+        if c in df.columns:
+            s = pd.Series(pd.to_numeric(df[c], errors="coerce"), index=pd.to_datetime(df.index)).dropna().sort_index()
+            if not s.empty and float(s.iloc[0]) != 0.0:
+                return (s / s.iloc[0]).rename("BH")
+    # 1-kolumns fallback
+    if df.shape[1] == 1:
+        s = pd.Series(pd.to_numeric(df.iloc[:,0], errors="coerce"), index=pd.to_datetime(df.index)).dropna().sort_index()
+        if not s.empty and float(s.iloc[0]) != 0.0:
+            return (s / s.iloc[0]).rename("BH")
+    return pd.Series(dtype="float64")
+
+# ---- UI: universum från profiler
+tickers_all, params_map = load_universe()
+if not tickers_all:
+    st.error("Hittade inga profiler i profiles/. Lägg dit minst en profilfil (JSON).")
+    st.stop()
+
+st.success(f"Hittade {len(tickers_all)} profiler: {', '.join(tickers_all)}")
+
+colA,colB,colC = st.columns([1.2,1,1])
+with colA:
+    # bara tillåt val från universum
+    chosen = st.multiselect("Välj universum (tickers med profiler)", options=tickers_all, default=tickers_all)
+with colB:
+    start = st.date_input("Från", value=date.today()-timedelta(days=365*5)).isoformat()
+with colC:
+    end   = st.date_input("Till", value=date.today()).isoformat()
+
+colw1,colw2 = st.columns([1,1])
+with colw1:
+    weights_raw = st.text_input("Vikter (komma-separerat, valfritt – annars likavikt)", value="")
+with colw2:
+    rebalance = st.selectbox("Ombalansera", options=["Ingen (buy&hold vikter)","Månadsvis","Kvartalsvis","Årsvis","Daglig"], index=1)
+
+use_bh_fallback = st.checkbox("Använd buy&hold om strategi-equity uteblir", value=True)
+
+st.markdown("---")
+go = st.button("🚀 Kör portfölj")
+
+def _rebalance_dates(idx: pd.DatetimeIndex, mode: str) -> pd.DatetimeIndex:
+    if mode == "Daglig":
+        return idx
+    if mode == "Ingen (buy&hold vikter)":
+        return pd.DatetimeIndex([idx[0]])
+    ser = pd.Series(idx)
+    if mode == "Månadsvis":
+        dts = ser.dt.to_period("M").drop_duplicates().dt.start_time
+    elif mode == "Kvartalsvis":
+        dts = ser.dt.to_period("Q").drop_duplicates().dt.start_time
+    elif mode == "Årsvis":
+        dts = ser.dt.to_period("Y").drop_duplicates().dt.start_time
+    else:
+        dts = pd.Index([])
+    return pd.to_datetime(dts).intersection(idx)
+
+if go:
+    if GET_OHLCV is None:
+        st.error("Dataprovider saknas.")
+        st.stop()
+    if not chosen:
+        st.warning("Välj minst en ticker från universum.")
+        st.stop()
+
+    # vikter
+    if weights_raw.strip():
+        w = [float(x.replace(",",".").strip()) for x in weights_raw.split(",") if x.strip()]
+        if len(w) != len(chosen):
+            st.error("Antalet vikter måste matcha antal valda tickers.")
+            st.stop()
+        w = np.array(w, dtype=float)
+        if not np.isclose(w.sum(), 1.0):
+            w = w / w.sum()
+    else:
+        w = np.ones(len(chosen), dtype=float) / len(chosen)
+
+    # bygg komponenter
+    series = {}
+    details = []
+    for t in chosen:
+        # params från profil (obligatoriskt enligt kravet)
+        base_params = dict(params_map.get(t, {}))
+        if not base_params:
+            # skydda – men tillåt fortfarande buy&hold om checkboxen är på
+            st.warning(f"{t}: Hittade inga params i profilfilen. {'Provar buy&hold.' if use_bh_fallback else 'Hoppar över.'}")
+            if not use_bh_fallback:
+                continue
+
+        # Strategi först
+        s = _run_strategy_equity(t, start, end, params=base_params)
+
+        # Fallback buy&hold vid behov
+        if s.empty and use_bh_fallback:
+            try:
+                px = GET_OHLCV(t, start=start, end=end)
+            except TypeError:
+                px = GET_OHLCV(t, start, end)
+            except Exception:
+                px = None
+            s = _buyhold_equity_from_close(px)
+
+        if s.empty:
+            details.append({"Ticker": t, "Rad": 0, "Källa": "NONE"})
+            continue
+
+        s = s / (s.iloc[0] if s.iloc[0] else 1.0)
+        s.name = t
+        series[t] = s
+        details.append({"Ticker": t, "Rad": int(s.shape[0]), "Källa": "Strategi" if t in params_map else "BH"})
+
+    if not series:
+        st.error("Ingen komponent gav equity.")
+        st.stop()
+
+    df = pd.concat(series.values(), axis=1).dropna(how="all").sort_index()
+    st.subheader("Komponent-equity (normaliserad)")
+    st.dataframe(df.tail(10))
+
+    rets = df.pct_change().fillna(0.0)
+
+    rb_dates = _rebalance_dates(rets.index, rebalance)
+    weights = pd.DataFrame(index=rets.index, columns=df.columns, data=0.0)
+
+    last_w = pd.Series(w, index=df.columns, dtype=float)
+    for dt in rets.index:
+        if dt in rb_dates:
+            last_w = pd.Series(w, index=df.columns, dtype=float)
+        weights.loc[dt] = last_w.values
+
+    port_ret = (weights * rets).sum(axis=1)
+    port_eq  = (1.0 + port_ret).cumprod().rename("Portfolio")
+
+    def _stats(s: pd.Series) -> dict:
+        if s.empty: return {}
+        r = s.pct_change().dropna()
+        mean = r.mean()
+        std  = r.std(ddof=0)
+        cagr = (s.iloc[-1]) ** (252.0/len(s)) - 1.0 if len(s)>0 else np.nan
+        sharpeD = (mean/std) * np.sqrt(252) if std and std==std and std>0 else np.nan
+        roll = s.cummax()
+        dd   = (s/roll - 1.0).min()
+        return {"CAGR": cagr, "SharpeD": sharpeD, "MaxDD": dd}
+    kp = _stats(port_eq)
+
+    st.subheader("Portfölj – equity & nyckeltal")
+    st.line_chart(port_eq)
+    st.write({
+        "CAGR": None if kp.get("CAGR") is None else round(float(kp["CAGR"]), 4),
+        "SharpeD": None if kp.get("SharpeD") is None else round(float(kp["SharpeD"]), 3),
+        "MaxDD": None if kp.get("MaxDD") is None else round(float(kp["MaxDD"]), 3),
+        "Period": f"{start} → {end}",
+        "Tickers": list(df.columns),
+        "Rebalance": rebalance,
+    })
+
+    st.markdown("### Komponentinfo")
+    st.dataframe(pd.DataFrame(details))
+else:
+    st.info("Välj tickers (från profiler), period och klicka **Kör portfölj**.")
+PY
+
+# kompileringscheck om venv finns
+if [ -x .venv/bin/python ]; then
+  .venv/bin/python -m py_compile "$TARGET" || true
+fi
+
+echo "[ok] Portfolio (Profiler-universum) skapad: $TARGET"

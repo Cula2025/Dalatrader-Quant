@@ -1,0 +1,263 @@
+def safe_bh_curve(ticker: str, start: str):
+    """Hämta Close och returnera normaliserad buy&hold-kurva (start=1.0).
+    Robust mot None/tomma serier och typfel.
+    """
+    import pandas as pd
+    from app.data_providers import get_ohlcv
+    try:
+        df = get_ohlcv(ticker=ticker, start=start, end=None)
+        if df is None or len(df) == 0:
+            return pd.Series(dtype="float64")
+        close = pd.to_numeric(df.get("Close"), errors="coerce").dropna()
+        if close.empty:
+            return pd.Series(dtype="float64")
+        bh = close / float(close.iloc[0])
+        bh.name = ticker
+        bh.index = pd.to_datetime(bh.index)  # säkerställ DatetimeIndex
+        return bh
+    except Exception:
+        # Som sista utväg: tom serie istället för krasch
+        import pandas as pd
+        return pd.Series(dtype="float64")
+
+import json
+from pathlib import Path
+from typing import List, Dict, Any
+import pandas as pd
+import streamlit as st
+
+from app import btwrap as W
+from app.equity_extract import extract_equity
+from app.portfolio_math import equal_weight_rebalanced
+from app.data_providers import get_ohlcv
+
+st.set_page_config(page_title="📈 Portfolio V2 – linjegraf", layout="wide")
+st.title("📈 Portfolio V2 – linjegraf (Strategi, Buy&Hold, Index)")
+
+INDEX_TICKER = "OMXS30GI"  # fungerande GI-index
+
+# --- Hjälpare ---
+def pick_first(*vals):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+def pick_best_profile(d: Dict[str, Any]) -> Dict[str, Any] | None:
+    profs = d.get("profiles") or []
+    if not profs:
+        return None
+    # välj högst TotalReturn, fallback första
+    def tr(p):
+        m = p.get("metrics") or {}
+        v = m.get("TotalReturn")
+        try:
+            return float(v) if v is not None else float("-inf")
+        except Exception:
+            return float("-inf")
+    profs_sorted = sorted(profs, key=tr, reverse=True)
+    return profs_sorted[0]
+
+def to_equity_series(ticker: str, params: Dict[str, Any]) -> pd.Series:
+    res = W.run_backtest(p={"ticker": ticker, "params": dict(params or {})})
+    x   = pick_first(res.get("equity", None), res.get("summary", None), res)
+    s   = extract_equity(x)
+    s   = pd.to_numeric(s, errors="coerce").dropna()
+    return s
+
+def buyhold_equal_weight(tickers: List[str], start: str) -> pd.Series:
+    """EW buy&hold över tickers: köp dag1, sälj sista; ingen rebal."""
+    if not tickers:
+        return pd.Series(dtype="float64")
+    prices = []
+    for t in tickers:
+        df = get_ohlcv(ticker=t, start=start, end=None)
+        if df is None or df.empty:
+            continue
+        s = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if s.empty:
+            continue
+        s = s / float(s.iloc[0])
+        prices.append(s)
+    if not prices:
+        return pd.Series(dtype="float64")
+    P = pd.concat(prices, axis=1, join="inner")
+    # EW utan rebal: medel på nivåer (inte på avkastningar)
+# --- Buy&Hold på pris (lika vikt, ingen rebalans) ---
+tickers = []
+
+# --- Säkerställ att 'files' finns (fallback till alla profiles/*.json) ---
+try:
+    files  # finns redan? gör inget
+except NameError:
+    try:
+        from pathlib import Path as _Path
+        files = [str(pp) for pp in _Path('profiles').glob('*.json')]
+    except Exception:
+        files = []
+# ------------------------------------------------------------------------
+
+for f in files:
+    try:
+        d = json.loads(Path(f).read_text(encoding="utf-8"))
+        p_ = (d.get("profiles") or [])[0]
+        t_ = p_.get("ticker") or (p_.get("params") or {}).get("ticker")
+        if t_:
+            tickers.append(str(t_))
+    except Exception:
+        pass
+bh = None
+if tickers:
+    dfs = []
+    # Robust start: försök använda portföljens start om tillgänglig
+    start0 = None
+    try:
+        import pandas as pd
+        if 'port_reb' in locals() and len(port_reb):
+            start0 = str(pd.Timestamp(port_reb.index[0]).date())
+    except Exception:
+        start0 = None
+
+    for t_ in tickers:
+        try:
+            df_ = get_ohlcv(ticker=t_, start=start0, end=None)
+            if df_ is None or 'Close' not in df_.columns:
+                continue
+            import pandas as pd
+            s_ = pd.to_numeric(df_['Close'], errors='coerce').dropna()
+            if s_.empty:
+                continue
+            s_ = s_ / float(s_.iloc[0])
+            dfs.append(s_)
+        except Exception:
+            continue
+
+    if dfs:
+        import pandas as pd
+        BH_price = pd.concat(dfs, axis=1, join='inner').mean(axis=1)
+        bh = BH_price
+        # Align till portföljens index om finns
+        if 'port_reb' in locals() and len(port_reb):
+            bh = bh.reindex(port_reb.index).dropna()
+        bh.name = "Buy&Hold"
+
+def index_curve(index_ticker: str, start: str) -> pd.Series:
+    df = get_ohlcv(index_ticker, start=start, end=None)
+    if df is None or df.empty:
+        return pd.Series(dtype="float64")
+    s = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if s.empty:
+        return pd.Series(dtype="float64")
+    s = s / float(s.iloc[0])
+    s.name = index_ticker
+    return s
+
+def lvl(s: pd.Series | None) -> float | None:
+    try:
+        return float(s.iloc[-1])
+    except Exception:
+        return None
+
+# --- Inläsning av profiler ---
+all_files = sorted([str(p) for p in Path("profiles").glob("*.json")])
+sel_files = st.multiselect("Profilfiler (profiles/*.json)", all_files, default=all_files[:5])
+if not sel_files:
+    st.info("Välj minst en profilfil.")
+    st.stop()
+
+records = []
+tickers: List[str] = []
+from_dates: List[str] = []
+
+for f in sel_files:
+    try:
+        d = json.loads(Path(f).read_text(encoding="utf-8"))
+        pr = pick_best_profile(d)
+        if not pr:
+            continue
+        t = pr.get("ticker") or (pr.get("params") or {}).get("ticker")
+        params = dict(pr.get("params") or {})
+        if not t:
+            continue
+        eq = to_equity_series(t, params)
+        if eq is None or eq.empty:
+            continue
+        # spara
+        records.append({"file": f, "ticker": t, "params": params, "equity": eq})
+        tickers.append(t)
+        fd = params.get("from_date")
+        if fd:
+            from_dates.append(str(fd))
+    except Exception as e:
+        st.warning(f"Misslyckades läsa {f}: {type(e).__name__}: {e}")
+
+if not records:
+    st.error("Inga equity-kurvor kunde läsas.")
+    st.stop()
+
+# --- Rebalanced (strategi) ---
+rb = equal_weight_rebalanced([r["equity"] for r in records])
+rb = pd.to_numeric(rb, errors="coerce").dropna()
+rb = rb / float(rb.iloc[0])  # säker normalisering
+
+# --- Buy&Hold + Index ---
+start = min(from_dates) if from_dates else None
+bh = buyhold_equal_weight(tickers, start) if start else pd.Series(dtype="float64")
+idx = index_curve(INDEX_TICKER, start)    if start else pd.Series(dtype="float64")
+
+# --- Align & gör plottbar DF (stege 0..N) ---
+def to_step(s: pd.Series, name: str) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if s.empty:
+        return s
+    s = s.reset_index(drop=True)
+    s.name = name
+    return s
+
+rb_s  = to_step(rb,  "Portfolio")
+bh_s  = to_step(bh,  "Buy&Hold")
+idx_s = to_step(idx, INDEX_TICKER)
+
+# kapa till gemensam längd
+n = min([len(x) for x in [rb_s, bh_s, idx_s] if x is not None and len(x) > 0] or [0])
+if n == 0:
+    st.error("Kunde inte aligna kurvorna (saknar data).")
+    st.stop()
+
+rb_s  = rb_s.iloc[:n]
+bh_s  = bh_s.iloc[:n]
+idx_s = idx_s.iloc[:n]
+
+df_plot = pd.DataFrame({
+    "step": range(n),
+    "Portfolio": rb_s.values,
+    "Buy&Hold":  bh_s.values,
+    INDEX_TICKER: idx_s.values,
+})
+
+# --- Grafik ---
+st.line_chart(df_plot.set_index("step"))
+
+# --- Nyckeltal ---
+m_port = lvl(rb_s)
+m_bh   = lvl(bh_s)
+m_idx  = lvl(idx_s)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Portfolio", f"{m_port:.4f}×" if m_port is not None else "—")
+c2.metric("Buy&Hold",  f"{m_bh:.4f}×"   if m_bh   is not None else "—")
+c3.metric(INDEX_TICKER, f"{m_idx:.4f}×" if m_idx  is not None else "—")
+
+# --- Tabell: BH per ticker (för sanity) ---
+if st.checkbox("Visa Buy&Hold per ticker (sanity)"):
+    rows = []
+    for t in tickers:
+        df = get_ohlcv(t, start=start, end=None)
+        if df is None or df.empty:
+            continue
+        s = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if s.empty:
+            continue
+        rows.append({"ticker": t, "BH_ratio": float(s.iloc[-1] / s.iloc[0])})
+    if rows:
+        st.dataframe(pd.DataFrame(rows).set_index("ticker"))

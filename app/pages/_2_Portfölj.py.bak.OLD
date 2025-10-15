@@ -1,0 +1,271 @@
+﻿from __future__ import annotations
+
+import json, importlib, os, requests
+from pathlib import Path
+from datetime import date
+from typing import Dict, Any, List, Optional
+
+import streamlit as st
+import matplotlib.pyplot as plt
+
+from app.env_bootstrap import load_env
+load_env()
+
+import app.portfolio_backtest as PB
+importlib.reload(PB)
+
+from app.portfolio_backtest import PortfolioParams
+
+ROOT = Path(__file__).resolve().parents[1]
+PRICES_DIR = ROOT / "outputs" / "prices"
+PROFILES_DIR = ROOT / "outputs" / "profiles"
+PORTFOLIOS_DIR = ROOT / "storage" / "portfolios"
+for d in (PRICES_DIR, PROFILES_DIR, PORTFOLIOS_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+st.set_page_config(page_title="Portfölj", layout="wide")
+st.title("📊 Portfölj (RSI-stöd)")
+
+# --- Diagnos + PB-version ---
+_key = os.getenv("BORS_API_KEY") or os.getenv("BORSDATA_KEY")
+try:
+    _status = requests.get("https://apiservice.borsdata.se/v1/instruments",
+                           params={"authKey": _key}, timeout=6).status_code if _key else "no-key"
+except Exception as _e:
+    _status = f"ERR: {_e.__class__.__name__}"
+_loaded_path = getattr(PB, "__file__", "?")
+_loaded_ver  = getattr(PB, "__version__", "?")
+st.caption(f"Börsdata-nyckel: {'✅' if _key else '❌'} | /instruments: {_status} | PB: {_loaded_path} (v{_loaded_ver})")
+
+# --- State init ---
+def _init_state_once() -> None:
+    if st.session_state.get("pf_init"): return
+    st.session_state["pf_init"] = True
+    st.session_state.setdefault("pf_name", "MinPortfölj")
+    st.session_state.setdefault("pf_source", "borsdata")
+    st.session_state.setdefault("pf_universe_text", "ABB\nVOLV B\nERIC B")
+    st.session_state.setdefault("pf_start", date(2019, 1, 1))
+    st.session_state.setdefault("pf_end", date.today())
+    st.session_state.setdefault("pf_capital", 100_000.0)
+    st.session_state.setdefault("pf_per_trade", 5.0)
+    st.session_state.setdefault("pf_max_exp", 25.0)
+    st.session_state.setdefault("pf_max_pos", 5)
+    st.session_state.setdefault("pf_profiles_file", "")
+    st.session_state.setdefault("pf_mode", "Välj EN profil (alla tickers)")
+    st.session_state.setdefault("pf_chosen_profile_idx", 0)
+    st.session_state.setdefault("pf_load_sel", "(ny)")
+_init_state_once()
+
+def _portfolio_files() -> List[Path]:
+    return sorted([p for p in PORTFOLIOS_DIR.glob("*.json") if p.is_file()])
+
+def _load_portfolio(fp: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_portfolio(payload: Dict[str, Any], fp: Path) -> None:
+    fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _find_local_profile_files() -> List[Path]:
+    return sorted([p for p in PROFILES_DIR.glob("*.json") if p.is_file()])
+
+def _load_profiles_from_path(fp: Path) -> List[Dict[str, Any]]:
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "profiles" in data: return data["profiles"]
+        if isinstance(data, list): return data
+    except Exception:
+        pass
+    return []
+
+def _profiles_index_by_ticker(profiles: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    idx: Dict[str, Dict[str, Any]] = {}
+    for p in profiles:
+        t = str(p.get("ticker", "")).strip()
+        if t: idx[t] = p
+    return idx
+
+# ======= Ladda portfölj innan widgets =======
+st.subheader("Ladda portfölj")
+names = ["(ny)"] + [p.name for p in _portfolio_files()]
+sel = st.selectbox("Välj portfölj (storage/portfolios)", names, key="pf_load_sel")
+if sel != "(ny)" and st.session_state.get("pf_loaded_name") != sel:
+    payload = _load_portfolio(PORTFOLIOS_DIR / sel)
+    if payload:
+        st.session_state.update({
+            "pf_loaded_name": sel,
+            "pf_name": payload.get("name", st.session_state["pf_name"]),
+            "pf_source": payload.get("source", st.session_state["pf_source"]),
+            "pf_universe_text": "\n".join(payload.get("universe", [])) or st.session_state["pf_universe_text"],
+            "pf_start": date.fromisoformat(payload.get("start", st.session_state["pf_start"].isoformat())),
+            "pf_end": date.fromisoformat(payload.get("end", st.session_state["pf_end"].isoformat())),
+            "pf_capital": float(payload.get("rules", {}).get("capital", st.session_state["pf_capital"])),
+            "pf_per_trade": float(payload.get("rules", {}).get("per_trade_pct", st.session_state["pf_per_trade"])),
+            "pf_max_exp": float(payload.get("rules", {}).get("max_exposure_pct", st.session_state["pf_max_exp"])),
+            "pf_max_pos": int(payload.get("rules", {}).get("max_positions", st.session_state["pf_max_pos"])),
+            "pf_profiles_file": payload.get("profiles_file", st.session_state["pf_profiles_file"]),
+            "pf_mode": payload.get("profiles_mode", st.session_state["pf_mode"]),
+            "pf_chosen_profile_index": int(payload.get("chosen_profile_index", st.session_state["pf_chosen_profile_idx"])),
+        })
+        st.experimental_rerun()
+
+left, right = st.columns([1,2], gap="large")
+
+with left:
+    st.subheader("Portfölj")
+    st.text_input("Namn", key="pf_name")
+
+    st.divider()
+    st.subheader("Datakälla & Universum")
+    st.radio("Datakälla", ["borsdata","csv"], key="pf_source", horizontal=True)
+    if st.session_state["pf_source"] == "borsdata":
+        st.caption("En ticker per rad")
+        st.text_area("Universum", key="pf_universe_text", height=140)
+        tickers: List[str] = [ln.strip() for ln in st.session_state["pf_universe_text"].splitlines() if ln.strip()]
+    else:
+        st.caption("CSV-sökvägar en per rad")
+        tickers = [ln.strip() for ln in st.text_area("Sökvägar").splitlines() if ln.strip()]
+
+    st.subheader("Tidsintervall")
+    c1, c2 = st.columns(2)
+    c1.date_input("Start", key="pf_start")
+    c2.date_input("Slut", key="pf_end")
+
+    st.subheader("Portföljregler")
+    st.number_input("Startkapital", 1000.0, 1e9, step=1000.0, key="pf_capital")
+    p1, p2 = st.columns(2)
+    p1.number_input("Max % per affär", 0.1, 100.0, step=0.5, key="pf_per_trade")
+    p2.number_input("Max total exponering %", 1.0, 100.0, step=1.0, key="pf_max_exp")
+    st.number_input("Max antal öppna positioner", 1, 50, step=1, key="pf_max_pos")
+
+    st.divider()
+    st.subheader("Profiler från Backtrack")
+    options = ["(välj)"] + [p.name for p in _find_local_profile_files()]
+    st.selectbox("Profiler-fil (outputs/profiles)", options, key="pf_profiles_file")
+
+    uploaded = st.file_uploader("…eller ladda upp profiler (JSON)", type=["json"])
+    profiles: List[Dict[str,Any]] = []
+    if st.session_state["pf_profiles_file"] and st.session_state["pf_profiles_file"] != "(välj)":
+        profiles.extend(_load_profiles_from_path(PROFILES_DIR / st.session_state["pf_profiles_file"]))
+    if uploaded is not None:
+        try:
+            data = json.loads(uploaded.getvalue().decode("utf-8", errors="ignore"))
+            if isinstance(data, dict) and "profiles" in data: profiles.extend(data["profiles"])
+            elif isinstance(data, list): profiles.extend(data)
+        except Exception:
+            st.error("Kunde inte läsa JSON.", icon="❌")
+
+    st.radio("Hur använda profilerna?", ["Välj EN profil (alla tickers)","Matcha profiler PER ticker"], key="pf_mode")
+    chosen_profile: Optional[Dict[str,Any]] = None
+    if profiles and st.session_state["pf_mode"].startswith("Välj EN"):
+        names = [p.get("name", f"Profil {i}") for i,p in enumerate(profiles)]
+        st.selectbox("Välj profil", list(range(len(names))),
+                     format_func=lambda i: names[i], key="pf_chosen_profile_idx")
+        if 0 <= st.session_state["pf_chosen_profile_idx"] < len(profiles):
+            chosen_profile = profiles[st.session_state["pf_chosen_profile_idx"]]
+
+    st.divider()
+    fname_default = f"{st.session_state['pf_name']}.json"
+    fname = st.text_input("Spara som (storage/portfolios/…)", value=fname_default, key="pf_save_name")
+    if st.button("💾 Spara portfölj", width='stretch'):
+        payload = {
+            "name": st.session_state["pf_name"],
+            "source": st.session_state["pf_source"],
+            "universe": tickers,
+            "start": st.session_state["pf_start"].isoformat(),
+            "end": st.session_state["pf_end"].isoformat(),
+            "rules": {
+                "capital": float(st.session_state["pf_capital"]),
+                "per_trade_pct": float(st.session_state["pf_per_trade"]),
+                "max_exposure_pct": float(st.session_state["pf_max_exp"]),
+                "max_positions": int(st.session_state["pf_max_pos"]),
+            },
+            "profiles_file": st.session_state["pf_profiles_file"],
+            "profiles_mode": st.session_state["pf_mode"],
+            "chosen_profile_index": int(st.session_state["pf_chosen_profile_idx"]),
+        }
+        (PORTFOLIOS_DIR / st.session_state["pf_save_name"]).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        st.success(f"Sparat → `storage/portfolios/{st.session_state['pf_save_name']}`")
+
+    run_btn = st.button("🚀 Kör portfölj", width='stretch')
+
+with right:
+    st.subheader("Resultat")
+    if run_btn:
+        if not tickers:
+            st.error("Universum är tomt.", icon="❌"); st.stop()
+        if not profiles:
+            st.error("Inga profiler inlästa. Välj/ladda en profiler-fil.", icon="❌"); st.stop()
+
+        start = st.session_state["pf_start"].isoformat()
+        end = st.session_state["pf_end"].isoformat()
+
+        with st.spinner("Laddar prisdata…"):
+            try:
+                data = PB.load_universe_data(
+                    tickers,
+                    "borsdata" if st.session_state["pf_source"]=="borsdata" else "csv",
+                    start, end,
+                )
+            except Exception as e:
+                st.error(f"Kunde inte ladda data: {e}", icon="❌"); st.stop()
+        if not data:
+            st.error("Ingen data kunde laddas – kontrollera datakälla, nyckel och tickers.", icon="❌"); st.stop()
+
+        # Bygg per-symbol-parametrar från profiler
+        per_symbol_params: Dict[str, Dict[str, Any]] = {}
+        if st.session_state["pf_mode"].startswith("Välj EN"):
+            if chosen_profile is None:
+                st.error("Välj en profil.", icon="❌"); st.stop()
+            base = chosen_profile
+            for tkr in data.keys():
+                par = dict(base.get("params", {}))
+                par["strategy"] = base.get("strategy", "breakout")
+                per_symbol_params[tkr] = par
+        else:
+            idx = _profiles_index_by_ticker(profiles)
+            missing = []
+            for tkr in data.keys():
+                p = idx.get(tkr)
+                if p:
+                    par = dict(p.get("params", {}))
+                    par["strategy"] = p.get("strategy", "breakout")
+                    per_symbol_params[tkr] = par
+                else:
+                    missing.append(tkr)
+            if missing:
+                st.warning(f"Saknar profil för: {', '.join(missing[:15])}{'…' if len(missing)>15 else ''}", icon="⚠️")
+
+        pp = PortfolioParams(
+            start_capital=float(st.session_state["pf_capital"]),
+            per_trade_pct=float(st.session_state["pf_per_trade"])/100.0,
+            max_positions=int(st.session_state["pf_max_pos"]),
+            max_exposure_pct=float(st.session_state["pf_max_exp"])/100.0,
+        )
+
+        equity, trades, stats = PB.run_portfolio_backtest(
+            data,
+            pp,
+            per_symbol_params,
+        )
+
+        a,b,c,d = st.columns(4)
+        a.metric("Total Return", f"{stats.get('TotalReturn',0.0)*100:0.2f}%")
+        b.metric("Max DD", f"{stats.get('MaxDD',0.0)*100:0.2f}%")
+        c.metric("Sharpe (daglig)", f"{stats.get('SharpeD',0.0):0.2f}")
+        d.metric("Antal trades", int(stats.get("Trades", 0)))
+
+        if not equity.empty:
+            fig = plt.figure()
+            (equity["Equity"]/equity["Equity"].iloc[0]).plot()
+            plt.title("Equity (normaliserad)"); plt.xlabel("Datum"); plt.ylabel("Index 1.0")
+            st.pyplot(fig, clear_figure=True)
+        if not trades.empty:
+            st.dataframe(trades, width='stretch', hide_index=True)
+
+
+

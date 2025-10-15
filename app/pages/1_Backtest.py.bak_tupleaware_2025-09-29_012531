@@ -1,0 +1,193 @@
+# -*- coding: utf-8 -*-
+import datetime as dt
+from pathlib import Path
+import pandas as pd
+import streamlit as st
+
+from app.data_providers import get_ohlcv as GET_OHLCV
+from app.portfolio_signals import _import_backtest, _maybe_build_params
+
+st.set_page_config(page_title="Dala Trader – Backtest (ren)", page_icon="🧪", layout="wide")
+st.title("🧪 Backtest (ren)")
+
+# --- Debug UI (syns alltid i sidopanelen) ---
+st.sidebar.subheader("🛠️ Debug")
+DEBUG_KEY = "debug_enabled"
+debug_enabled = st.sidebar.checkbox("Debug 0.3", value=True, key=DEBUG_KEY)
+def d(msg: str):
+    if st.session_state.get(DEBUG_KEY, False):
+        st.sidebar.markdown(f"<small style='color:#2f7df6'>{msg}</small>", unsafe_allow_html=True)
+
+# --- Inputs ---
+with st.sidebar:
+    _BASE = Path(__file__).resolve().parents[1]
+    _LOGO = _BASE / "assets" / "logodaladrader.png"
+    if _LOGO.exists():
+        st.image(str(_LOGO), width='stretch')
+        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+today = dt.date.today()
+default_start = today.replace(year=today.year-5)
+ticker = st.text_input("Ticker", value=st.session_state.get("ticker", "HM-B.ST"), key="bt_ticker")
+start  = st.date_input("Startdatum", value=st.session_state.get("from_date", default_start), key="bt_start")
+end    = st.date_input("Slutdatum",  value=st.session_state.get("to_date", today), key="bt_end")
+run_bt = st.button("Kör backtest", type="primary")
+
+# --- Hjälpare: städa/validera OHLCV ---
+def coerce_ohlcv(obj):
+    if obj is None:
+        return None, "Ingen data (None) från datakälla."
+    df = None
+    if isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+    elif isinstance(obj, dict):
+        try:
+            df = pd.DataFrame(obj)
+        except Exception as e:
+            return None, f"Dict -> DataFrame misslyckades: {e}"
+    else:
+        try:
+            df = pd.DataFrame(obj)
+        except Exception as e:
+            return None, f"Objekt -> DataFrame misslyckades: {e}"
+
+    # Säkerställ datumindex
+    if not isinstance(df.index, pd.DatetimeIndex):
+        for cand in ("date", "Date", "timestamp", "time", "Time"):
+            if cand in df.columns:
+                df[cand] = pd.to_datetime(df[cand], errors="coerce", utc=True)
+                df = df.set_index(cand)
+                break
+        if not isinstance(df.index, pd.DatetimeIndex):
+            try:
+                df.index = pd.to_datetime(df.index, errors="coerce", utc=True)
+            except Exception as e:
+                return None, f"Kan inte tolka datumindex: {e}"
+
+    df = df.sort_index()
+    # Normalisera kolumnnamn
+    col_alias = {
+        "open":   ("open","o","open_price"),
+        "high":   ("high","h","high_price"),
+        "low":    ("low","l","low_price"),
+        "close":  ("close","c","close_price","adjclose","adj_close","price","last"),
+        "volume": ("volume","v","vol","turnover"),
+    }
+    lower = {c.lower(): c for c in df.columns}
+    for target, aliases in col_alias.items():
+        if target not in df.columns:
+            for a in aliases:
+                if a in lower:
+                    df = df.rename(columns={lower[a]: target})
+                    break
+
+    if "close" not in df.columns:
+        return None, "Saknar 'close'-kolumn i data efter normalisering."
+    return df, None
+
+# --- Körning ---
+if run_bt:
+    st.info(f"Kör backtest för **{ticker}**: {start} → {end}")
+    try:
+        raw = GET_OHLCV(ticker, start, end)
+        d("Hämtade data från GET_OHLCV().")
+    except Exception as e:
+        st.error(f"Datainläsning misslyckades: {e}")
+        d(f"GET_OHLCV error: {type(e).__name__}: {e}")
+        st.stop()
+
+    df, err = coerce_ohlcv(raw)
+    if err:
+        st.error(f"Förbehandling av data misslyckades: {err}")
+        d("coerce_ohlcv fel.")
+        st.stop()
+
+    d(f"Data klar: rader={len(df)}, datum {df.index.min().date()} → {df.index.max().date()}.")
+
+    # Backtest-modul
+    try:
+        btmod = _import_backtest()  # OBS! utan argument — vi vill ha modulen
+        d(f"Hämtade backtestmodul: {getattr(btmod,'__name__', type(btmod).__name__)}")
+    except Exception as e:
+        st.error(f"Kunde inte importera backtest-modulen: {e}")
+        d(f"_import_backtest() fel: {e}")
+        st.stop()
+
+    # Params-objekt
+    params = None
+    P = getattr(btmod, "Params", None)
+    if P:
+        try:
+            params = P()  # default-konstruktor
+            d("Params() instansierad.")
+        except Exception as e:
+            d(f"Params() misslyckades: {e}")
+    if params is None:
+        try:
+            params = _maybe_build_params({})
+            d("_maybe_build_params({}) använd.")
+        except Exception as e:
+            d(f"_maybe_build_params misslyckades: {e}")
+
+    # Hitta körbar funktion och testa signaturer
+    import inspect
+    run_fn = None
+    for name in ("run_backtest", "backtest", "simulate", "run"):
+        f = getattr(btmod, name, None)
+        if callable(f):
+            run_fn = f
+            break
+
+    if run_fn is None:
+        st.error("Hittar ingen backtest-funktion i modulen (run_backtest/backtest/simulate/run).")
+        st.stop()
+
+    sig = None
+    try:
+        sig = inspect.signature(run_fn)
+        d(f"Funktion: {run_fn.__name__}{sig}")
+    except Exception:
+        d(f"Funktion: {run_fn.__name__} (okänd signatur)")
+
+    # Prova säkra kombinationer (INTE 4 args)
+    tried = []
+    result = None
+    last_err = None
+    combos = [
+        (df, params),
+        (df,),
+    ]
+    for args in combos:
+        try:
+            tried.append(f"{run_fn.__name__}{tuple(type(a).__name__ for a in args)}")
+            result = run_fn(*args)
+            break
+        except TypeError as e:
+            last_err = e
+            d(f"TypeError på anrop {args}: {e}")
+        except Exception as e:
+            last_err = e
+            d(f"Fel på anrop {args}: {e}")
+
+    if result is None:
+        st.error(f"Kunde inte anropa backtest-funktionen. Senaste fel: {last_err}")
+        st.write("Testade kombinationer:", tried)
+        st.stop()
+
+    # Visa resultat
+    if isinstance(result, tuple) and len(result) >= 2:
+        eq, summ = result[0], result[1]
+        st.subheader("Resultat (tuple)")
+        if isinstance(eq, pd.DataFrame):
+            st.line_chart(eq)
+        st.json(summ)
+    elif isinstance(result, dict):
+        st.subheader("Resultat (dict)")
+        st.json(result)
+    elif isinstance(result, pd.DataFrame):
+        st.subheader("Resultat (DataFrame)")
+        st.dataframe(result.tail(50))
+    else:
+        st.subheader("Resultat (okänd typ)")
+        st.write(type(result).__name__)
+        st.write(result)

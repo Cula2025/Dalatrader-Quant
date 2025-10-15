@@ -1,0 +1,130 @@
+from __future__ import annotations
+import os, traceback, datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+import pandas as pd
+import streamlit as st
+
+# ---------- Theme / page ----------
+st.set_page_config(page_title="Portfölj – MIN", page_icon="📦", layout="wide")
+PRIMARY = "#1f6feb"; ACCENT = "#d29922"
+st.markdown(f"""
+<style>
+:root {{ --primary:{PRIMARY}; --accent:{ACCENT}; }}
+.block-container {{ padding-top: .5rem; }}
+.stButton>button {{ background: var(--primary); color: white; border: 0; }}
+</style>
+""", unsafe_allow_html=True)
+
+DATA_DIR = "trader/outputs/opt_results"
+
+# ---------- Helpers ----------
+def _fix_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Ta bort BOM-tecken och whitespace i kolumnnamn
+    df.columns = [c.replace("\ufeff", "").strip() for c in df.columns]
+    # Normalisera "Ticker"
+    if "Ticker" not in df.columns:
+        for c in list(df.columns):
+            if c.lower() == "ticker":
+                df.rename(columns={c: "Ticker"}, inplace=True)
+                break
+    return df
+
+@st.cache_data(ttl=300, show_spinner=False)
+def list_csv_files(_data_dir_mtime: float) -> list[str]:
+    if not os.path.isdir(DATA_DIR):
+        return []
+    return sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")])
+
+def _data_dir_mtime() -> float:
+    try:
+        return max(os.path.getmtime(os.path.join(DATA_DIR, f)) for f in os.listdir(DATA_DIR))
+    except Exception:
+        return 0.0
+
+@st.cache_data(show_spinner=False)
+def load_opt_csv(path: str, _mtime: float) -> pd.DataFrame:
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    df = _fix_columns(df)
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for col in ("rsi_min","rsi_max","rsi_window"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+# ---- BYT UT denna mot din riktiga motor ----
+def run_backtest_for_row(row: pd.Series) -> dict:
+    # Exempel/dummy – byt till din riktiga backtestfunktion.
+    import random, time
+    time.sleep(min(0.2 + random.random()*0.4, 0.9))
+    return {
+        "Ticker": row.get("Ticker","?"),
+        "Trades": random.randint(0, 12),
+        "Ret%": round((random.random()-0.4)*30, 2),
+        "MaxDD%": round(-random.random()*20, 2),
+    }
+
+def run_parallel_backtests(df: pd.DataFrame, max_workers: int, timeout_per_job: int) -> pd.DataFrame:
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut_by_ticker = {ex.submit(run_backtest_for_row, r): r.get("Ticker","?") for _, r in df.iterrows()}
+        for fut in as_completed(fut_by_ticker):
+            tck = fut_by_ticker[fut]
+            try:
+                res = fut.result(timeout=timeout_per_job)
+                results.append(res)
+            except TimeoutError:
+                results.append({"Ticker": tck, "Trades": 0, "Ret%": float("nan"), "MaxDD%": float("nan"), "Error":"Timeout"})
+            except Exception:
+                results.append({"Ticker": tck, "Trades": 0, "Ret%": float("nan"), "MaxDD%": float("nan"), "Error":"Exception"})
+    return pd.DataFrame(results)
+
+# ---------- UI ----------
+st.title("📦 Portfölj – MIN")
+
+mtime_key = _data_dir_mtime()
+files = list_csv_files(_data_dir_mtime=mtime_key)
+
+colA, colB = st.columns([2,1])
+with colA:
+    if not files:
+        st.warning(f"Hittar inga CSV i `{DATA_DIR}`. Lägg optimeringsresultat där.")
+        st.stop()
+    picked = st.selectbox("Välj optimeringsfil (CSV)", files, index=len(files)-1)
+with colB:
+    st.caption("Prestanda")
+    workers = st.slider("Trådar", 1, 12, 4)
+    timeout_s = st.slider("Timeout/aktie (s)", 5, 120, 20)
+
+csv_path = os.path.join(DATA_DIR, picked)
+df = load_opt_csv(csv_path, _mtime=os.path.getmtime(csv_path) if os.path.exists(csv_path) else 0)
+
+if "Ticker" not in df.columns:
+    st.error("Filen saknar kolumnen **Ticker** (kan bero på BOM).")
+    st.dataframe(df.head(50), width="stretch")
+    st.stop()
+
+with st.expander("Förhandsgranska data", expanded=False):
+    st.dataframe(df.head(20), width="stretch")
+
+if st.button("Kör portfölj-backtest"):
+    with st.spinner("Kör backtest i batch…"):
+        out = run_parallel_backtests(df, workers, timeout_s)
+
+    if out.empty:
+        st.info("Inga resultat. Kontrollera att filen innehåller giltiga rader.")
+    else:
+        out_sorted = out.sort_values(by=["Ret%"], ascending=False)
+        st.subheader("Resultat")
+        st.dataframe(out_sorted, width="stretch")
+        top5 = out_sorted.head(5)[["Ticker","Trades","Ret%","MaxDD%"]]
+        st.markdown("**Topp 5 signaler**")
+        st.table(top5)
+
+        save_dir = "trader/outputs"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"portfolio_result_{dt.datetime.now():%Y%m%d_%H%M%S}.csv")
+        out_sorted.to_csv(save_path, index=False)
+        st.success(f"Sparat: `{save_path}`")
+
+st.caption(f"Källa: `{csv_path}`")

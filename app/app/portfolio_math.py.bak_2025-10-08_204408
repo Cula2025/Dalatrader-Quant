@@ -1,0 +1,108 @@
+from __future__ import annotations
+from typing import Iterable, Mapping, Any, Sequence
+import pandas as pd
+
+# --- Små hjälpare -------------------------------------------------------------
+def first_not_none(*vals: Any):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+def _to_series(obj: Any) -> pd.Series:
+    """Acceptera Series/DataFrame/dict/list/array och returnera en ren numerisk Series."""
+    if isinstance(obj, pd.Series):
+        s = obj
+    elif isinstance(obj, pd.DataFrame):
+        # Föredra 'Close' om den finns, annars första numeriska kolumnen
+        cols = [c for c in obj.columns if str(c).lower() == "close"]
+        if cols:
+            s = obj[cols[0]]
+        else:
+            num = obj.select_dtypes("number")
+            s = num.iloc[:, 0] if not num.empty else obj.iloc[:, 0]
+    elif isinstance(obj, Mapping):
+        # Ta första värdet i mappingen
+        try:
+            s = _to_series(next(iter(obj.values())))
+        except StopIteration:
+            return pd.Series(dtype="float64")
+    elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+        # Ta första elementet i list/tuple
+        if len(obj) == 0:
+            return pd.Series(dtype="float64")
+        s = _to_series(obj[0])
+    else:
+        # Fallback – gör en Series av objektet
+        s = pd.Series(obj)
+
+    # Rensa till numerik
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    return s
+
+def _normalize_align(series_list: Iterable[pd.Series]) -> pd.DataFrame:
+    """Normalisera varje serie till 1.0 vid start och aligna STRICT (inner join)."""
+    cols = []
+    data = []
+    i = 0
+    for s in series_list:
+        if s is None:
+            continue
+        s = _to_series(s)
+        if s.shape[0] < 2:
+            continue
+        s = s / float(s.iloc[0])
+        data.append(s)
+        i += 1
+        cols.append(f"a{i}")
+    if not data:
+        return pd.DataFrame()
+    E = pd.concat(data, axis=1, join="inner")
+    E.columns = cols
+    return E
+
+def final_level(s: pd.Series) -> float:
+    return float("nan") if not isinstance(s, pd.Series) or s.empty else float(s.iloc[-1])
+
+# --- Portföljfunktioner -------------------------------------------------------
+def equal_weight_rebalanced(equities: Iterable[Any]) -> pd.Series:
+    """
+    Lika-viktad, dagligt ombalanserad portfölj av strategi-Equity-kurvor.
+    Input: Iterable av kurvor (Series eller något som kan bli Series).
+    Returnerar en Series som börjar på 1.0 och slutar på portföljens slutnivå.
+    """
+    E = _normalize_align(equities)
+    if E.empty:
+        return pd.Series(dtype="float64", name="EW_Rebalanced")
+    rets = E.pct_change().fillna(0.0)
+    port = (1.0 + rets.mean(axis=1)).cumprod()
+    port.iloc[0] = 1.0  # säkra exakt start
+    port.name = "EW_Rebalanced"
+    return port
+
+def equal_weight_buyhold(prices: Any) -> pd.Series:
+    """
+    Lika-viktad Buy&Hold från gemensam start till slut.
+    Accepterar:
+      - DataFrame med prisserier (helst 'Close' i varje kolumn), eller
+      - dict {ticker: Series/DataFrame}, eller
+      - lista av Series/DataFrame.
+    Returnerar en kurva som börjar på 1.0. Slutvärdet = medel(last/first).
+    """
+    # Samla series
+    if isinstance(prices, pd.DataFrame):
+        series = [ _to_series(prices[c]) for c in prices.columns ]
+    elif isinstance(prices, Mapping):
+        series = [ _to_series(v) for v in prices.values() ]
+    elif isinstance(prices, Sequence) and not isinstance(prices, (str, bytes)):
+        series = [ _to_series(v) for v in prices ]
+    else:
+        series = [ _to_series(prices) ]
+
+    P = _normalize_align(series)
+    if P.empty:
+        return pd.Series(dtype="float64", name="EW_BuyHold")
+    bh_curve = P.mean(axis=1)
+    bh_curve.iloc[0] = 1.0
+    bh_curve.name = "EW_BuyHold"
+    return bh_curve

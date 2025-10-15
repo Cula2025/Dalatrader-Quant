@@ -1,0 +1,219 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import json, re, inspect
+from pathlib import Path
+from typing import Dict, List, Any
+import pandas as pd
+import numpy as np
+from app.data_providers import get_ohlcv as GET_OHLCV
+
+# -------- backtest loader --------
+def _import_backtest():
+    tried = []
+    for mod in ("app.backtest", "backtest", "app.app.backtest", "app.portfolio_backtest"):
+        try:
+            m = __import__(mod, fromlist=["run_backtest","Params","PortfolioParams"])
+            Params = getattr(m, "Params", getattr(m, "PortfolioParams", None))
+            return m.run_backtest, Params
+        except Exception as e:
+            tried.append((mod, repr(e)))
+    raise RuntimeError("Hittar ingen backtest-motor. Provade: " + ", ".join([f"{m} -> {e}" for m,e in tried]))
+
+# -------- profilval --------
+def _best_profile_from_json(fp: Path):
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    profiles = data.get("profiles", [])
+    if not profiles:
+        raise ValueError(f"Inga profiler i {fp.name}")
+    def score(p):
+        m = p.get("metrics", {})
+        return (
+            float(m.get("SharpeD", float("-inf"))),
+            float(m.get("CAGR", float("-inf"))),
+            float(m.get("TotalReturn", float("-inf"))),
+        )
+    best = sorted(profiles, key=score, reverse=True)[0]
+    return best.get("params", {}), best.get("metrics", {}), best.get("name", fp.stem)
+
+def _norm(s: str) -> str:
+    return re.sub(r'[^A-Z0-9]', '', (s or '').upper())
+
+def _variants(t: str) -> List[str]:
+    base = t.strip()
+    cand = {
+        base,
+        base.upper(), base.lower(), base.title(),
+        base.replace(" ", ""), base.replace(" ", "-"), base.replace(" ", "_"),
+        base.replace(".ST","").replace(".st",""),
+        base.replace("-",""), base.replace(".",""),
+        base.split(".")[0],
+        (base.split()[0] if " " in base else base),
+    }
+    return [x for x in cand if x]
+
+def load_best_params_for_ticker(ticker: str, profiles_dir: Path):
+    tnorm = _norm(ticker.replace(".ST",""))
+    # 1) matcha JSON-innehåll
+    for p in sorted(profiles_dir.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            profs = data.get("profiles", [])
+            for prof in profs:
+                it = prof.get("ticker") or data.get("ticker")
+                if it and _norm(it.replace(".ST","")) == tnorm:
+                    params, metrics, pname = _best_profile_from_json(p)
+                    return params, metrics, pname, p
+        except Exception:
+            continue
+    # 2) fallback: filnamnsvarianter
+    for v in _variants(ticker):
+        for patt in (f"{v}_best*.json", f"{v}*backtrack*.json", f"{v}*.json"):
+            for p in sorted(profiles_dir.glob(patt)):
+                try:
+                    params, metrics, pname = _best_profile_from_json(p)
+                    return params, metrics, pname, p
+                except Exception:
+                    continue
+    raise FileNotFoundError(f"Hittar ingen profilfil för {ticker} i {profiles_dir}")
+
+# -------- helpers --------
+def _normalize_index(x):
+    if isinstance(x, (pd.Series, pd.DataFrame)):
+        idx = pd.to_datetime(x.index).tz_localize(None, nonexistent='shift_forward', ambiguous='NaT')
+        return x.rename_axis(None).set_axis(idx)
+    return x
+
+def _ensure_close_col(df: pd.DataFrame) -> pd.Series:
+    for c in ("Adj Close","adj_close","adjclose","AdjClose","Close","close","c"):
+        if c in df.columns: return df[c].astype(float)
+    if isinstance(df, pd.Series): return df.astype(float)
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if num_cols: return df[num_cols[0]].astype(float)
+    raise ValueError("No price column found")
+
+def to_price_matrix(ohlcv: Dict[str,pd.DataFrame]) -> pd.DataFrame:
+    close = {}
+    for t, df in ohlcv.items():
+        s = _ensure_close_col(df).rename(t)
+        close[t] = s
+    P = pd.concat(close.values(), axis=1).sort_index().ffill().dropna(how="all")
+    return P
+
+# -------- positions av trades/signal/result --------
+def _pos_from_trades_df(dftr: pd.DataFrame, index: pd.DatetimeIndex) -> pd.Series:
+    # case-insensitiv kolumn-karta
+    cols = {c.lower(): c for c in dftr.columns}
+    ed = next((cols.get(n) for n in (
+        "entry_time","entrytime","entry_date","entry","in_date","in","timestamp_in"
+    )), None)
+    xd = next((cols.get(n) for n in (
+        "exit_time","exittime","exit_date","exit","out_date","out","timestamp_out"
+    )), None)
+    pos = pd.Series(0.0, index=index)
+    if ed is None:
+        return pos
+    ent = pd.to_datetime(dftr[ed]).dt.normalize()
+    if xd is None:
+        for a in ent:
+            pos.loc[pos.index >= a] = 1.0
+        return pos
+    exi = pd.to_datetime(dftr[xd]).dt.normalize()
+    for a,b in zip(ent, exi):
+        if pd.isna(b) or b <= a:
+            pos.loc[pos.index >= a] = 1.0
+        else:
+            mask = (pos.index >= a) & (pos.index < b)  # exit-dagen exkluderas
+            pos.loc[mask] = 1.0
+    return pos
+
+def _maybe_series_like(x, index: pd.DatetimeIndex):
+    if isinstance(x, pd.Series):
+        s = _normalize_index(x).reindex(index)
+        try: s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+        except Exception: s = s.fillna(0.0).astype(float)
+        return s.clip(0,1)
+    if isinstance(x, pd.DataFrame) and len(x.columns) > 0:
+        return _maybe_series_like(x.iloc[:,0], index)
+    if isinstance(x, (list, tuple, np.ndarray)) and len(x) == len(index):
+        s = pd.Series(x, index=index)
+        try: s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+        except Exception: s = s.fillna(0.0).astype(float)
+        return s.clip(0,1)
+    return None
+
+def _series_from_result_like(res: Any, index: pd.DatetimeIndex) -> pd.Series:
+    # a) trades först (det vet vi att din motor ger)
+    if isinstance(res, dict) and "trades" in res and isinstance(res["trades"], pd.DataFrame) and len(res["trades"]):
+        return _pos_from_trades_df(res["trades"], index).reindex(index).fillna(0.0).clip(0,1)
+
+    # b) vanliga serier/df
+    if isinstance(res, dict):
+        for k in ("position","positions","pos","in_position","weight","weights","signal","signals"):
+            if k in res:
+                s = _maybe_series_like(res[k], index)
+                if s is not None: return s
+        # rekursivt om något ligger inbäddat
+        for v in res.values():
+            s = _series_from_result_like(v, index)
+            if isinstance(s, pd.Series) and (s>0).any():
+                return s.reindex(index).fillna(0.0).clip(0,1)
+
+    # c) objekt-attribut
+    for k in ("position","positions","pos","in_position","weights","weight","signal","signals","trades"):
+        if hasattr(res, k):
+            v = getattr(res, k)
+            if k == "trades" and isinstance(v, pd.DataFrame) and len(v):
+                return _pos_from_trades_df(v, index).reindex(index).fillna(0.0).clip(0,1)
+            s = _maybe_series_like(v, index)
+            if s is not None: return s
+
+    # d) fallback
+    return pd.Series(0.0, index=index)
+
+# -------- Params-bygge --------
+def _maybe_build_params(Params, raw: dict):
+    if Params is None:
+        return raw
+    try:
+        try: sig = inspect.signature(Params)
+        except (TypeError, ValueError): sig = inspect.signature(Params.__init__)
+        allowed = {k for k in sig.parameters.keys() if k != "self"}
+        filt = {k: v for k, v in raw.items() if k in allowed}
+        return Params(**filt)
+    except Exception:
+        return raw
+
+# -------- huvud: kör profil -> position --------
+def run_profile_positions(ticker: str, params: dict, start) -> pd.Series:
+    RUN_BT, Params = _import_backtest()
+    df = GET_OHLCV(ticker=ticker, start=start, source="borsdata")
+    df = _normalize_index(df)
+    idx = df.index
+
+    built = _maybe_build_params(Params, params)
+    res = RUN_BT(df, built)  # din motor: (df, Params) -> dict
+    pos = _series_from_result_like(res, idx).reindex(idx).fillna(0.0).clip(0,1)
+    return pos
+
+# -------- portfölj --------
+def build_portfolio_with_caps(positions: Dict[str, pd.Series], prices: pd.DataFrame,
+                              max_per_asset: float, max_total_equity: float, lag_days:int=1):
+    prices = prices.sort_index().ffill()
+    idx = prices.index; tickers = list(prices.columns)
+    pos_df = pd.DataFrame({t: positions[t].reindex(idx).fillna(0.0) for t in tickers})
+    weights = pd.DataFrame(0.0, index=idx, columns=tickers)
+    for d in idx:
+        active = [t for t in tickers if pos_df.at[d, t] > 0.5]
+        if active:
+            base = min(1.0/len(active), max_per_asset)
+            sum_raw = base * len(active)
+            invested = min(sum_raw, max_total_equity)
+            scale = invested / sum_raw if sum_raw > 0 else 0.0
+            for t in active: weights.at[d, t] = base * scale
+    returns = prices.pct_change().fillna(0.0)
+    w_eff = weights.shift(lag_days).fillna(0.0) if lag_days>0 else weights
+    port_ret = (w_eff * returns).sum(axis=1)
+    equity = (1.0 + port_ret).cumprod()
+    out = pd.DataFrame({"value": equity, "ret": port_ret})
+    out["cash_weight"] = 1.0 - weights.sum(axis=1).clip(0,1)
+    return out, weights

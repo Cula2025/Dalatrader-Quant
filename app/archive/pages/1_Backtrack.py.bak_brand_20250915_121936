@@ -1,0 +1,404 @@
+from __future__ import annotations
+import json, traceback, sys
+from pathlib import Path
+import datetime as dt
+import streamlit as st
+import pandas as pd
+
+# Ensure project root on sys.path
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+st.set_page_config(page_title="Backtrack - JSON profiles (Borsdata)", layout="wide")
+
+# Minimal CSS (ASCII only)
+st.markdown("""
+<style>
+.block-container{padding-top:.25rem}
+.stButton>button { background:#1f6feb; color:#fff; border:0; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- helpers ----------
+def fail(msg: str, exc: Exception | None = None):
+    st.error(msg)
+    if exc:
+        with st.expander("Technical details"):
+            st.code(traceback.format_exc())
+    st.stop()
+
+def to_num(v):
+    try:
+        f = float(v)
+        return int(f) if f.is_integer() else f
+    except Exception:
+        return v
+
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    if "Date" not in df.columns:
+        idx = df.index.name or "Date"
+        df = df.reset_index().rename(columns={idx: "Date"})
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for c in ("Open","High","Low","Close","Volume"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna(subset=["Date","Close"]).sort_values("Date").reset_index(drop=True)
+
+# ---------- optional local profile autoload ----------
+PROFILE_FILE = Path(r"C:\trader\inveb_profile.json")
+PROFILE_PARAMS, PROFILE_METRICS, PROFILE_TICKER = {}, {}, None
+
+def load_local_profile():
+    global PROFILE_PARAMS, PROFILE_METRICS, PROFILE_TICKER
+    if not PROFILE_FILE.exists():
+        return
+    data = json.loads(PROFILE_FILE.read_text(encoding="utf-8", errors="replace"))
+    profs = data.get("profiles") or []
+    prof = None
+    for p in profs:
+        if str(p.get("ticker","")).strip().upper() == "INVE B":
+            prof = p; break
+    if prof is None and profs:
+        prof = profs[0]
+    if not prof:
+        return
+    PROFILE_TICKER = prof.get("ticker") or "INVE B"
+    supported = {
+        "strategy","trend_ma_type","use_trend_filter","trend_ma_window",
+        "fast","slow","use_rsi_filter","rsi_window","rsi_min","rsi_max",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal","macd_mode",
+        "use_bb_filter","bb_window","bb_nstd","bb_mode","bb_percent_b_min",
+        "atr_window","atr_stop_mult","atr_trail_mult",
+        "cost_bps","cash_rate_apy","max_positions","per_trade_pct","max_exposure_pct",
+        "slip_bps",
+    }
+    par = prof.get("params") or {}
+    PROFILE_PARAMS = {k: to_num(v) for k, v in par.items() if k in supported}
+    PROFILE_METRICS = prof.get("metrics") or {}
+
+try:
+    load_local_profile()
+except Exception:
+    PROFILE_PARAMS, PROFILE_METRICS, PROFILE_TICKER = {}, {}, None
+
+# ---------- sidebar: data ----------
+st.sidebar.header("Data")
+ticker = st.sidebar.text_input("Ticker", value=PROFILE_TICKER or "INVE B")
+st.sidebar.write("Source: Borsdata")  # locked
+
+today = dt.date.today()
+start_date = st.sidebar.date_input("From", value=today - dt.timedelta(days=365*5))
+end_date   = st.sidebar.date_input("To", value=today)
+
+# ---------- sidebar: JSON profiles ----------
+ROOT_DIR = Path(__file__).resolve().parents[1]
+OPT_DIR = ROOT_DIR / "outputs" / "opt_results"
+OPT_DIR.mkdir(parents=True, exist_ok=True)
+
+st.sidebar.subheader("Profiles (JSON)")
+
+def list_json():
+    try:
+        files = [p for p in OPT_DIR.glob("*.json") if p.is_file()]
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return files
+    except Exception:
+        return []
+
+files = list_json()
+mode = st.sidebar.radio("Choose source", ["Select from outputs/opt_results", "Upload new"], index=0 if files else 1)
+
+selected_path: Path | None = None
+uploaded = None
+if mode == "Select from outputs/opt_results":
+    if not files:
+        st.sidebar.info("No JSON files found.")
+    else:
+        labels = [f"{p.name} - {dt.datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M')}" for p in files]
+        idx = st.sidebar.selectbox("Select file", list(range(len(files))), format_func=lambda i: labels[i])
+        selected_path = files[idx]
+else:
+    uploaded = st.sidebar.file_uploader("Upload JSON", type=["json"])
+    if uploaded is not None:
+        raw_name = Path(uploaded.name).name
+        target = OPT_DIR / raw_name
+        if target.exists():
+            stem, suf = target.stem, target.suffix
+            target = OPT_DIR / f"{stem}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}{suf}"
+        try:
+            target.write_bytes(uploaded.getvalue())
+            st.sidebar.success(f"Saved: {target.name}")
+            selected_path = target
+        except Exception:
+            fail("Could not save uploaded JSON.", True)
+
+profiles = []
+if selected_path and selected_path.exists():
+    try:
+        b = selected_path.read_bytes()
+        if b.startswith(b"\xEF\xBB\xBF"):  # BOM
+            b = b[3:]
+        data = json.loads(b.decode("utf-8", errors="replace"))
+        profiles = data.get("profiles", [])
+    except Exception:
+        fail(f"Could not read JSON: {selected_path.name}", True)
+
+selected_profile = None
+if profiles:
+    labels = []
+    default_idx = 0
+    for i, p in enumerate(profiles):
+        t = str(p.get("ticker","")).strip()
+        nm = str(p.get("name","")).strip()
+        labels.append(f"{t or '?'} - {nm or '(unnamed)'}")
+        if t.upper() == str(ticker).strip().upper():
+            default_idx = i
+    pidx = st.sidebar.selectbox("Select profile", list(range(len(profiles))), index=default_idx, format_func=lambda i: labels[i])
+    selected_profile = profiles[pidx]
+
+# ---------- sidebar: indicators ----------
+st.sidebar.subheader("Indicators")
+
+def _get(d, k, dv):
+    try:
+        return d.get(k, dv) if isinstance(d, dict) else dv
+    except Exception:
+        return dv
+
+ui_seed = PROFILE_PARAMS if PROFILE_PARAMS else (selected_profile.get("params") if selected_profile else {}) or {}
+
+ui_use_trend  = st.sidebar.checkbox("Trend MA filter", value=bool(_get(ui_seed,"use_trend_filter", False)))
+ui_trend_type = st.sidebar.selectbox("Trend MA type", ["SMA","EMA"], index=(1 if _get(ui_seed,"trend_ma_type","EMA")=="EMA" else 0))
+ui_trend_win  = st.sidebar.number_input("Trend MA window", 0, 400, int(_get(ui_seed,"trend_ma_window", 100)))
+
+ui_use_rsi    = st.sidebar.checkbox("RSI filter", value=bool(_get(ui_seed,"use_rsi_filter", True)))
+ui_rsi_win    = st.sidebar.number_input("RSI window", 2, 100, int(_get(ui_seed,"rsi_window", 14)))
+ui_rsi_min    = st.sidebar.number_input("RSI min (buy)", 0.0, 100.0, float(_get(ui_seed,"rsi_min", 30.0)))
+ui_rsi_max    = st.sidebar.number_input("RSI max (sell)", 0.0, 100.0, float(_get(ui_seed,"rsi_max", 70.0)))
+
+ui_use_macd   = st.sidebar.checkbox("MACD filter", value=bool(_get(ui_seed,"use_macd_filter", False)))
+ui_macd_fast  = st.sidebar.number_input("MACD fast", 1, 200, int(_get(ui_seed,"macd_fast", 12)))
+ui_macd_slow  = st.sidebar.number_input("MACD slow", 2, 400, int(_get(ui_seed,"macd_slow", 26)))
+ui_macd_sig   = st.sidebar.number_input("MACD signal", 1, 200, int(_get(ui_seed,"macd_signal", 9)))
+ui_macd_mode  = st.sidebar.selectbox("MACD mode", ["above_zero","signal_cross","both"], index=(0 if _get(ui_seed,"macd_mode","above_zero")=="above_zero" else 1))
+
+ui_use_bb     = st.sidebar.checkbox("Bollinger Bands", value=bool(_get(ui_seed,"use_bb_filter", False)))
+ui_bb_win     = st.sidebar.number_input("BB window", 2, 400, int(_get(ui_seed,"bb_window", 20)))
+ui_bb_nstd    = st.sidebar.number_input("BB std", 0.1, 6.0, float(_get(ui_seed,"bb_nstd", 2.0)))
+ui_bb_mode    = st.sidebar.selectbox("BB mode", ["exit_below_mid","percent_b"], index=(0 if _get(ui_seed,"bb_mode","exit_below_mid")=="exit_below_mid" else 1))
+ui_bb_pbmin   = st.sidebar.number_input("BB %B min", 0.0, 1.0, float(_get(ui_seed,"bb_percent_b_min", 0.8)))
+
+ui_atr_win    = st.sidebar.number_input("ATR window", 2, 200, int(_get(ui_seed,"atr_window", 14)))
+ui_atr_stop   = st.sidebar.number_input("ATR stop x", 0.0, 10.0, float(_get(ui_seed,"atr_stop_mult", 0.0)))
+ui_atr_trail  = st.sidebar.number_input("ATR trail x", 0.0, 10.0, float(_get(ui_seed,"atr_trail_mult", 0.0)))
+
+ui_cost_bps   = st.sidebar.number_input("Cost (bps)", 0.0, 100.0, float(_get(ui_seed,"cost_bps", 0.0)))
+ui_slip_bps   = st.sidebar.number_input("Slippage (bps)", 0, 100, int(_get(ui_seed,"slip_bps", 0)))
+
+ui_apply_overrides = st.sidebar.checkbox("Apply indicator UI to params", value=False)
+
+# ---------- status ----------
+status = {
+    "Selected file": selected_path.name if selected_path else None,
+    "Profile name": (selected_profile.get("name") if selected_profile else None),
+    "Ticker (profile/input)": (selected_profile.get("ticker") if selected_profile else ticker),
+    "Period": f"{start_date} -> {end_date}",
+}
+st.json(status)
+
+# ---------- run ----------
+run = st.button("Run", width='stretch')
+if not run:
+    st.info("Choose a profile (optional) and click Run.")
+    st.stop()
+
+# ---------- data (borsdata) ----------
+try:
+    from app.data_providers import get_ohlcv
+    use_ticker = (selected_profile.get("ticker") if selected_profile else None) or ticker
+    raw = get_ohlcv(use_ticker, start=start_date.isoformat(), end=end_date.isoformat(), source="borsdata")
+    df = normalize_df(raw)
+except Exception as e:
+    fail(f"Could not fetch data (borsdata) for {ticker}: {e}", e)
+
+if df.empty:
+    fail("No data could be loaded.")
+
+# ---------- params / kwargs ----------
+params = (selected_profile.get("params") or {}) if selected_profile else {}
+SUPPORTED = {
+    "strategy","trend_ma_type","use_trend_filter","trend_ma_window",
+    "fast","slow",
+    "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+    "breakout_lookback","exit_lookback",
+    "use_macd_filter","macd_fast","macd_slow","macd_signal","macd_mode",
+    "use_bb_filter","bb_window","bb_nstd","bb_mode","bb_percent_b_min",
+    "atr_window","atr_stop_mult","atr_trail_mult",
+    "cost_bps","cash_rate_apy","max_positions","per_trade_pct","max_exposure_pct",
+    "slip_bps",
+}
+# If a profile is selected: use exactly its params (sanitized)
+if selected_profile:
+    kwargs = {k: to_num(v) for k, v in (selected_profile.get("params") or {}).items() if k in SUPPORTED}
+elif PROFILE_PARAMS:
+    kwargs = PROFILE_PARAMS.copy()
+else:
+    kwargs = dict(
+        strategy="rsi", trend_ma_type="EMA", use_trend_filter=False, trend_ma_window=0,
+        fast=15, slow=100, use_rsi_filter=True, rsi_window=7, rsi_min=25.0, rsi_max=75.0,
+        breakout_lookback=55, exit_lookback=20,
+        use_macd_filter=False, use_bb_filter=False,
+        atr_window=14, atr_stop_mult=0.0, atr_trail_mult=0.0,
+        cost_bps=0.0, cash_rate_apy=0.0, max_positions=1, per_trade_pct=100.0, max_exposure_pct=100.0,
+        slip_bps=0,
+    )
+
+# Apply UI overrides (only if you check the box)
+if ui_apply_overrides:
+    kwargs.update({
+        "use_trend_filter": bool(ui_use_trend), "trend_ma_type": ui_trend_type, "trend_ma_window": int(ui_trend_win),
+        "use_rsi_filter": bool(ui_use_rsi), "rsi_window": int(ui_rsi_win), "rsi_min": float(ui_rsi_min), "rsi_max": float(ui_rsi_max),
+        "use_macd_filter": bool(ui_use_macd), "macd_fast": int(ui_macd_fast), "macd_slow": int(ui_macd_slow), "macd_signal": int(ui_macd_sig), "macd_mode": ui_macd_mode,
+        "use_bb_filter": bool(ui_use_bb), "bb_window": int(ui_bb_win), "bb_nstd": float(ui_bb_nstd), "bb_mode": ui_bb_mode, "bb_percent_b_min": float(ui_bb_pbmin),
+        "atr_window": int(ui_atr_win), "atr_stop_mult": float(ui_atr_stop), "atr_trail_mult": float(ui_atr_trail),
+        "cost_bps": float(ui_cost_bps), "slip_bps": int(ui_slip_bps),
+    })
+
+# ---------- price + indicators plot ----------
+st.subheader("Price & indicators")
+_plot = df[["Date","Close"]].copy()
+
+def _sma(s, n): return s.rolling(int(max(1,n))).mean()
+def _ema(s, n): return s.ewm(span=int(max(1,n)), adjust=False).mean()
+def _bb(close, n=20, k=2.0):
+    m = close.rolling(int(max(1,n))).mean()
+    s = close.rolling(int(max(1,n))).std(ddof=0)
+    up = m + k*s; lo = m - k*s
+    return m, up, lo
+
+if ui_use_trend and ui_trend_win > 0:
+    _plot["TrendMA"] = _ema(df["Close"], ui_trend_win) if ui_trend_type=="EMA" else _sma(df["Close"], ui_trend_win)
+if ui_use_bb:
+    _mid, _up, _lo = _bb(df["Close"], ui_bb_win, ui_bb_nstd)
+    _plot["BB_mid"], _plot["BB_up"], _plot["BB_lo"] = _mid, _up, _lo
+
+try:
+    import altair as alt
+    base = alt.Chart(_plot).encode(x="Date:T")
+    price = base.mark_line().encode(y=alt.Y("Close:Q", title="Price"))
+    layers = [price]
+    if "TrendMA" in _plot.columns:
+        layers.append(base.mark_line().encode(y="TrendMA:Q"))
+    if "BB_up" in _plot.columns and "BB_lo" in _plot.columns:
+        band = base.mark_area(opacity=0.15).encode(y="BB_lo:Q", y2="BB_up:Q")
+        mid  = base.mark_line(strokeDash=[4,3]).encode(y="BB_mid:Q")
+        layers = [band, mid] + layers
+    chart = alt.layer(*layers).properties(height=280)
+    st.altair_chart(chart, width='stretch')
+except Exception:
+    st.line_chart(_plot.set_index("Date"))
+
+# ---------- run backtest ----------
+try:
+    from app.backtest import run_backtest
+except Exception as e:
+    fail("Import of app.backtest.run_backtest failed.", e)
+
+try:
+    res = run_backtest(df, **kwargs)
+except Exception as e:
+    fail(f"Backtest failed: {e}", e)
+
+summary = res.get("summary", {}) or {}
+equity_buy  = res.get("equity_buy")
+equity_keep = res.get("equity_keep")
+trades = res.get("trades")
+
+def pct(x):
+    try:
+        x = float(x)
+        return x*100.0 if -5.0 <= x <= 5.0 else x
+    except Exception:
+        return None
+
+def buyhold_pct(xdf: pd.DataFrame):
+    try:
+        c0 = float(xdf["Close"].iloc[0]); c1 = float(xdf["Close"].iloc[-1])
+        return (c1/c0 - 1.0) * 100.0
+    except Exception:
+        return None
+
+# --- Results (moved above equity) ---
+try:
+    tr_val = summary.get("TotalReturn")
+    strat_pct = (float(tr_val)*100.0) if tr_val is not None and -5.0 <= float(tr_val) <= 5.0 else float(tr_val or 0.0)
+except Exception:
+    strat_pct = 0.0
+try:
+    c0 = float(df["Close"].iloc[0]); c1 = float(df["Close"].iloc[-1])
+    bh_pct = (c1/c0 - 1.0) * 100.0
+except Exception:
+    bh_pct = 0.0
+trades_cnt = int(summary.get("Trades", (len(trades) if isinstance(trades, pd.DataFrame) else 0)))
+try:
+    mdd_val = summary.get("MaxDD")
+    mdd_pct = (float(mdd_val)*100.0) if mdd_val is not None and -5.0 <= float(mdd_val) <= 5.0 else float(mdd_val or 0.0)
+except Exception:
+    mdd_pct = 0.0
+
+st.subheader("Results")
+c1,c2,c3,c4 = st.columns(4)
+with c1:
+    st.metric("Total return (strategy)", f"{strat_pct:.2f}%")
+    if selected_profile and isinstance(selected_profile.get("metrics"), dict):
+        mt = selected_profile["metrics"]; tr = mt.get("TotalReturn", None)
+        if tr is not None:
+            target = (float(tr)*100.0) if -5.0 <= float(tr) <= 5.0 else float(tr)
+            st.caption(f"Target (JSON): {target:.2f}%")
+with c2: st.metric("Buy & Hold", f"{bh_pct:.2f}%")
+with c3: st.metric("Trades", f"{trades_cnt}")
+with c4: st.metric("Max drawdown", f"{mdd_pct:.2f}%")
+
+st.subheader("Equity (Strategy vs Hold)")
+if isinstance(equity_buy, pd.DataFrame) and isinstance(equity_keep, pd.DataFrame):
+    show = pd.DataFrame({
+        "Strategy (Buy)": equity_buy["Equity"].astype(float),
+        "Hold (Buy & Hold)": equity_keep["Equity"].astype(float),
+    })
+    st.line_chart(show)
+else:
+    st.caption("Equity curves not available.")
+
+strat_pct = pct(summary.get("TotalReturn") or summary.get("TotalReturnPct"))
+bh_pct = buyhold_pct(df)
+
+c1,c2,c3,c4 = st.columns(4)
+with c1:
+    st.metric("Total return (strategy)", f"{(strat_pct or 0):.2f}%")
+    if selected_profile and isinstance(selected_profile.get("metrics"), dict):
+        mt = selected_profile["metrics"]
+        tr = mt.get("TotalReturn", None)
+        if tr is not None:
+            target = (float(tr)*100.0) if -5.0 <= float(tr) <= 5.0 else float(tr)
+            st.caption(f"Target (JSON): {target:.2f}%")
+with c2:
+    st.metric("Buy & Hold", f"{(bh_pct or 0):.2f}%")
+with c3:
+    st.metric("Trades", f"{int(summary.get('Trades', (len(trades) if isinstance(trades, pd.DataFrame) else 0)))}")
+with c4:
+    mdd = pct(summary.get("MaxDD"))
+    st.metric("Max drawdown", f"{(mdd or 0):.2f}%")
+
+st.subheader("Trades")
+if isinstance(trades, pd.DataFrame) and not trades.empty:
+    cols = [c for c in ["EntryTime","EntryPrice","ExitTime","ExitPrice","PnL","reason"] if c in trades.columns]
+    st.dataframe(trades[cols].sort_values("ExitTime", ascending=False), width='stretch')
+else:
+    st.caption("No trades in period.")
+
+with st.expander("Params used (kwargs)"):
+    st.write(kwargs)

@@ -1,0 +1,64 @@
+from __future__ import annotations
+from typing import Iterable, Any
+import pandas as pd
+
+__all__ = [
+    "pick_first",
+    "equal_weight_rebalanced",
+    "equal_weight_buyhold",
+    "equal_weight_bh",  # alias
+]
+
+def pick_first(*vals: Any):
+    """Returnerar första icke-None-värdet (ingen 'truthiness' på DataFrame/Series)."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+def _to_float_series(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce").astype("float64")
+    return s.dropna()
+
+def equal_weight_rebalanced(equities: Iterable[pd.Series]) -> pd.Series:
+    """
+    EW rebalanced av strategikurvor (nivåserier). Vi normaliserar till 1.0,
+    inner-join:ar på gemensam period och rebalanserar dagligen på avkastningar.
+    """
+    series = []
+    for s in equities:
+        s = _to_float_series(pd.Series(s))
+        if s.empty:
+            continue
+        s = s / float(s.iloc[0])
+        series.append(s)
+    if not series:
+        return pd.Series(dtype="float64", name="Portfolio")
+    E = pd.concat(series, axis=1, join="inner")
+    rets = E.pct_change().dropna()
+    port = (1.0 + rets.mean(axis=1)).cumprod()
+    port.name = "Portfolio"
+    return port
+
+def equal_weight_buyhold(prices: pd.DataFrame) -> pd.Series:
+    """
+    EW buy&hold av prisserier:
+    - strikt gemensam period (dropna any)
+    - normalisera varje kolumn till start=1.0
+    - ingen rebalansering: lika vikt hålls konstant -> medel av nivåerna
+    """
+    if prices is None or prices.empty:
+        return pd.Series(dtype="float64", name="Buy&Hold")
+    P = prices.copy()
+    for c in P.columns:
+        P[c] = _to_float_series(P[c])
+    P = P.dropna(how="any")
+    if P.empty:
+        return pd.Series(dtype="float64", name="Buy&Hold")
+    norm = P / P.iloc[0]
+    out = norm.mean(axis=1)
+    out.name = "Buy&Hold"
+    return out
+
+# Alias om sidan råkar importera annat namn
+equal_weight_bh = equal_weight_buyhold

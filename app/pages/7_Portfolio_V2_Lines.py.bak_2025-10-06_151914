@@ -1,0 +1,202 @@
+from __future__ import annotations
+import json
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+# Motor & helpers
+try:
+    from app.backtracker import run_backtest as RUN_BT
+    motor_name = "backtracker"
+except Exception:
+    from app import btwrap as W
+    RUN_BT = W.run_backtest  # type: ignore
+    motor_name = "btwrap"
+
+from app.data_providers import get_ohlcv
+from app.equity_extract import extract_equity
+from app.portfolio_math import pick_first, equal_weight_rebalanced, equal_weight_buyhold
+
+st.title("📈 Portfolio V2 – linjegraf")
+st.caption(f"Motor: {motor_name}  |  Index: OMXS30GI  |  Graf: rebalanced & buy&hold")
+
+INDEX_TICKER = "OMXS30GI"
+
+# ---- Hjälpare ---------------------------------------------------------------
+
+def _earliest_from_date_for_sel(selected_tickers, best_profiles):
+    dates = []
+    for t in selected_tickers:
+        for p in best_profiles:
+            tt = p.get("ticker") or (p.get("params") or {}).get("ticker")
+            if tt != t:
+                continue
+            fd = (p.get("params") or {}).get("from_date")
+            if fd:
+                try:
+                    dates.append(pd.to_datetime(fd))
+                except Exception:
+                    pass
+    return min(dates) if dates else None
+
+def _safe_first_last_dates(idx):
+    try:
+        i0 = pd.to_datetime(idx[0])
+        i1 = pd.to_datetime(idx[-1])
+        return i0.date(), i1.date()
+    except Exception:
+        return None, None
+
+def _is_dt_index(idx) -> bool:
+    try:
+        return pd.api.types.is_datetime64_any_dtype(idx)
+    except Exception:
+        return False
+
+# ---- 1) Bästa profil per fil -----------------------------------------------
+
+profile_files = sorted(Path("profiles").glob("*.json"))
+best_profiles = []
+for pf in profile_files:
+    try:
+        d = json.loads(Path(pf).read_text(encoding="utf-8"))
+        profs = d.get("profiles") or []
+        if not profs:
+            continue
+        pbest = max(profs, key=lambda p: (p.get("metrics") or {}).get("TotalReturn", float("-inf")))
+        best_profiles.append(pbest)
+    except Exception:
+        continue
+
+tickers = [p.get("ticker") or (p.get("params") or {}).get("ticker") for p in best_profiles]
+unique_tickers = sorted({t for t in tickers if t})
+
+with st.sidebar:
+    st.subheader("Universum")
+    sel = st.multiselect(
+        "Välj tickers (bästa profil per fil används):",
+        options=unique_tickers,
+        default=unique_tickers[:3]
+    )
+
+if not sel:
+    st.info("Välj minst en ticker i sidomenyn.")
+    st.stop()
+
+# ---- 2) Kör backtest -> equity-serier --------------------------------------
+
+equities = []
+rows = []
+for t in sel:
+    cand = [p for p in best_profiles if (p.get("ticker") or (p.get("params") or {}).get("ticker")) == t]
+    if not cand:
+        continue
+    p = max(cand, key=lambda p: (p.get("metrics") or {}).get("TotalReturn", float("-inf")))
+    params = dict(p.get("params") or {})
+    res = RUN_BT(p={"ticker": t, "params": params})
+    x = pick_first(res.get("equity"), res.get("summary"), res)  # ingen truthiness
+    s = extract_equity(x)
+    if not s.empty:
+        s.name = t
+        equities.append(s)
+        d0, d1 = _safe_first_last_dates(s.index)
+        rows.append({
+            "Ticker": t,
+            "Profil": p.get("name"),
+            "TR (facit)": (p.get("metrics") or {}).get("TotalReturn"),
+            "Start": d0,
+            "End": d1,
+            "Final (×)": float(s.iloc[-1]),
+        })
+
+if not equities:
+    st.warning("Inga equity-serier kunde hämtas.")
+    st.stop()
+
+meta_df = pd.DataFrame(rows)
+
+# ---- 3) Bygg portföljer -----------------------------------------------------
+
+port_reb = equal_weight_rebalanced(equities)
+port_bh  = equal_weight_buyhold(equities)
+
+if port_reb.empty or port_bh.empty:
+    st.warning("Portföljserierna blev tomma – kontrollera överlapp i datum.")
+    st.dataframe(meta_df, use_container_width=True)
+    st.stop()
+
+# ---- 4) Hämta index, robust start ------------------------------------------
+
+start_hint = _earliest_from_date_for_sel(sel, best_profiles)
+start_str  = start_hint.strftime("%Y-%m-%d") if start_hint is not None else None
+
+idx_full = get_ohlcv(INDEX_TICKER, start=start_str, end=None)["Close"]
+idx_full = pd.to_numeric(idx_full, errors="coerce").dropna()
+idx_norm = idx_full / float(idx_full.iloc[0])
+
+# ---- 5) Align: datum om möjligt, annars positionell align -------------------
+
+use_datetime_axis = _is_dt_index(port_reb.index)
+
+if use_datetime_axis and _is_dt_index(port_bh.index) and _is_dt_index(idx_norm.index):
+    common = port_reb.index.intersection(port_bh.index).intersection(idx_norm.index)
+    port_reb = port_reb.loc[common]
+    port_bh  = port_bh.loc[common]
+    idx_use  = idx_norm.loc[common]
+    x_label  = "Date"
+    df = pd.concat([
+        port_reb.rename("Portfolio (EW rebalanced)"),
+        port_bh.rename("Equal-weight Buy&Hold"),
+        idx_use.rename(f"Index {INDEX_TICKER}")
+    ], axis=1)
+    df = df.dropna(how="any")
+    plot_df = df.reset_index().rename(columns={"index": "Date"})
+else:
+    # Fallback: positionell align (om equity-indexen inte är datum)
+    n = min(len(port_reb), len(port_bh), len(idx_norm))
+    port_reb = port_reb.iloc[:n]
+    port_bh  = port_bh.iloc[:n]
+    idx_use  = idx_norm.iloc[:n]
+    port_reb.index = pd.RangeIndex(n)
+    port_bh.index  = pd.RangeIndex(n)
+    idx_use.index  = pd.RangeIndex(n)
+    x_label  = "Step"
+    df = pd.concat([
+        port_reb.rename("Portfolio (EW rebalanced)"),
+        port_bh.rename("Equal-weight Buy&Hold"),
+        idx_use.rename(f"Index {INDEX_TICKER}")
+    ], axis=1)
+    df = df.dropna(how="any")
+    plot_df = df.reset_index().rename(columns={"index": "Step"})
+
+# ---- 6) Linjegraf -----------------------------------------------------------
+
+series_cols = ["Portfolio (EW rebalanced)", "Equal-weight Buy&Hold", f"Index {INDEX_TICKER}"]
+folded = (
+    alt.Chart(plot_df)
+    .transform_fold(series_cols, as_=["Series", "Value"])
+    .mark_line()
+    .encode(
+        x=alt.X((x_label + (":T" if x_label == "Date" else ":Q")), title=("Datum" if x_label == "Date" else "Steg")),
+        y=alt.Y("Value:Q", title="Normaliserad nivå (×)"),
+        color=alt.Color("Series:N", title="Kurva"),
+        tooltip=[alt.Tooltip((x_label + (":T" if x_label == "Date" else ":Q")), title=x_label),
+                 alt.Tooltip("Series:N", title="Serie"),
+                 alt.Tooltip("Value:Q", title="Nivå", format=".3f")],
+    )
+    .properties(height=420)
+)
+st.altair_chart(folded, use_container_width=True)
+
+# ---- 7) Nyckeltal -----------------------------------------------------------
+
+finals = df.iloc[-1]
+c1, c2, c3 = st.columns(3)
+c1.metric("Portfolio (EW rebalanced)", f"{finals['Portfolio (EW rebalanced)']:.3f}×")
+c2.metric("Equal-weight Buy&Hold", f"{finals['Equal-weight Buy&Hold']:.3f}×")
+c3.metric(f"Index {INDEX_TICKER}", f"{finals[f'Index {INDEX_TICKER}']:.3f}×")
+
+with st.expander("Detaljer per instrument"):
+    st.dataframe(meta_df, use_container_width=True)

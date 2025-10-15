@@ -1,0 +1,119 @@
+from __future__ import annotations
+from typing import Any, Iterable
+import numpy as np
+import pandas as pd
+
+# Kolumnordning vi försöker hålla där de finns
+CANON_ORDER = ["side", "price", "qty", "value", "ticker", "profile", "cash", "equity", "pnl"]
+
+def _safe_num(x):
+    return pd.to_numeric(x, errors="coerce")
+
+def _normalize_trades_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalisera en redan ledger-lik DF (ev. med 'date'-kolumn)."""
+    d = df.copy()
+
+    # Om 'date'-kolumn finns: gör den till DatetimeIndex
+    if "date" in d.columns:
+        dt = pd.to_datetime(d["date"], errors="coerce", utc=False)
+        d = d.drop(columns=["date"])
+        d.index = dt
+
+    # Försök säkra datetime-index om möjligt (men skapa inte 1970 av 0..N)
+    if not isinstance(d.index, pd.DatetimeIndex):
+        try:
+            idx_try = pd.to_datetime(d.index, errors="coerce", utc=False)
+            if isinstance(idx_try, pd.DatetimeIndex) and idx_try.notna().any():
+                d.index = idx_try
+        except Exception:
+            pass
+
+    if "side" in d.columns:
+        d["side"] = d["side"].astype(str).str.upper()
+
+    for c in ["price", "qty", "value", "cash", "equity", "pnl"]:
+        if c in d.columns:
+            d[c] = _safe_num(d[c])
+
+    d = d.sort_index()
+    return d
+
+def _from_entry_exit_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Konvertera sammanfattnings-DF:
+      [EntryTime, EntryPrice, ExitTime, ExitPrice, PnL, (reason)]  -> ledger
+    med två rader per trade: BUY på EntryTime, SELL på ExitTime.
+    qty härleds via PnL/(ExitPrice-EntryPrice) om möjligt, annars 1.0.
+    """
+    d = df.copy()
+    lc = {c.lower(): c for c in d.columns}
+    need = ["entrytime", "entryprice", "exittime", "exitprice"]
+    if not all(n in lc for n in need):
+        return pd.DataFrame()
+
+    et = pd.to_datetime(d[lc["entrytime"]], errors="coerce", utc=False)
+    xt = pd.to_datetime(d[lc["exittime"]], errors="coerce", utc=False)
+    ep = _safe_num(d[lc["entryprice"]])
+    xp = _safe_num(d[lc["exitprice"]])
+
+    pnl = _safe_num(d[lc["pnl"]]) if "pnl" in lc else pd.Series(np.nan, index=d.index)
+
+    diff = xp - ep
+    with np.errstate(divide="ignore", invalid="ignore"):
+        qty = pnl / diff.replace(0, np.nan)
+    qty = qty.where(np.isfinite(qty), 1.0)  # default 1.0 om okänt
+
+    buys = pd.DataFrame({"date": et, "side": "BUY", "price": ep, "qty": qty, "value": ep * qty})
+    sells = pd.DataFrame({"date": xt, "side": "SELL", "price": xp, "qty": qty, "value": xp * qty})
+
+    out = pd.concat([buys, sells], ignore_index=True).dropna(subset=["date"])
+    out = out.sort_values("date").set_index("date")
+
+    # Lägg ev. meta-kolumner om de finns
+    for extra in ["ticker", "profile", "reason"]:
+        if extra in d.columns and extra not in out.columns:
+            out[extra] = d[extra] if extra in d else None
+
+    return _normalize_trades_df(out)
+
+def _extract_trades_obj(x: Any) -> Any:
+    """Plocka ut 'trades' ur en result-dict om den finns, annars x."""
+    if isinstance(x, dict):
+        if "trades" in x:
+            return x["trades"]
+        if "summary" in x and isinstance(x["summary"], dict) and "trades" in x["summary"]:
+            return x["summary"]["trades"]
+    return x
+
+def to_trades_df(x: Any) -> pd.DataFrame:
+    """
+    Accepterar:
+      - dict med nyckeln 'trades'
+      - DataFrame i ledger- eller Entry/Exit-format
+      - list/dict av trade events
+    Returnerar en ledger-DF med DatetimeIndex och kolumner enligt CANON_ORDER där de finns.
+    """
+    obj = _extract_trades_obj(x)
+    if obj is None:
+        return pd.DataFrame()
+
+    # DataFrame-väg
+    if isinstance(obj, pd.DataFrame):
+        lc = {c.lower() for c in obj.columns}
+        if {"entrytime", "entryprice", "exittime", "exitprice"}.issubset(lc):
+            df = _from_entry_exit_df(obj)
+        else:
+            df = _normalize_trades_df(obj)
+        cols = [c for c in CANON_ORDER if c in df.columns]
+        return df[cols] if cols else df
+
+    # list/dict-väg -> gör DF och normalisera
+    if isinstance(obj, list):
+        df = pd.DataFrame(obj)
+        return to_trades_df(df)
+    if isinstance(obj, dict):
+        df = pd.DataFrame([obj])
+        return to_trades_df(df)
+
+    # okänt
+    return pd.DataFrame()

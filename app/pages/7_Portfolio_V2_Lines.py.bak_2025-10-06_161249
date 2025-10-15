@@ -1,0 +1,166 @@
+from __future__ import annotations
+import json
+from pathlib import Path
+from typing import List, Dict, Any
+
+import pandas as pd
+import streamlit as st
+
+# Motor – backtracker om möjligt, annars btwrap
+try:
+    from app.backtracker import run_backtest  # type: ignore
+    MOTOR = "backtracker"
+except Exception:
+    from app import btwrap as _W  # type: ignore
+    run_backtest = _W.run_backtest            # type: ignore
+    MOTOR = "btwrap"
+
+from app.data_providers import get_ohlcv
+from app.equity_extract import extract_equity
+from app.portfolio_math import (
+    pick_first,
+    equal_weight_rebalanced,
+    equal_weight_buyhold,
+)
+
+INDEX_TICKER = "OMXS30GI"
+
+st.title("📈 Portfolio V2 – linjegraf (Strategi, Buy&Hold, Index)")
+st.caption("Välj upp till 10 tickers – vi tar bästa profilen per ticker (högst TotalReturn).")
+
+# --- Hjälpare ---------------------------------------------------------------
+
+def best_profile_params_for_ticker(ticker: str) -> Dict[str, Any] | None:
+    """Läs profiles/{ticker}.json och returnera params för bästa profil (TotalReturn)."""
+    p = Path("profiles") / f"{ticker}.json"
+    if not p.exists():
+        return None
+    data = json.loads(p.read_text(encoding="utf-8"))
+    profs = data.get("profiles") or []
+    if not profs:
+        return None
+    # Max på metrics.TotalReturn (finns i våra nyare filer)
+    best = max(
+        profs,
+        key=lambda pr: (pr.get("metrics") or {}).get("TotalReturn", float("-inf")),
+    )
+    params = dict(best.get("params") or {})
+    return params
+
+def load_strategy_equity(ticker: str, params: Dict[str, Any]) -> pd.Series:
+    """Kör backtest och returnera equity-serien som pd.Series."""
+    res = run_backtest(p={"ticker": ticker, "params": params})
+    x = pick_first(res.get("equity"), res.get("summary"), res)
+    s = extract_equity(x)
+    return s
+
+def load_price_series(ticker: str, start: str) -> pd.Series:
+    """Hämta Close för ticker från Börsdata från start, som serie."""
+    df = get_ohlcv(ticker=ticker, start=start, end=None)
+    s = pd.to_numeric((df["Close"] if "Close" in df else df.iloc[:, 0]), errors="coerce").dropna()
+    s.name = ticker
+    return s
+
+def fmt_date_safe(x) -> str:
+    """Säkert datum-format utan att anta .date finns."""
+    try:
+        return str(pd.Timestamp(x).date())
+    except Exception:
+        return "—"
+
+# --- UI: välj tickers -------------------------------------------------------
+
+# Läs alla tänkbara tickers från profile-filerna
+all_tickers = sorted({p.stem for p in Path("profiles").glob("*.json")})
+default_sel = ["BOL", "EQT", "epi-a"] if all_tickers else []
+tickers = st.multiselect("Välj tickers (max 10)", options=all_tickers, default=default_sel, max_selections=10)
+
+if not tickers:
+    st.info("Välj minst en ticker för att se kurvor.")
+    st.stop()
+
+# --- Bygg strategi-kurvor ---------------------------------------------------
+
+equity_series: List[pd.Series] = []
+first_dates: List[pd.Timestamp] = []
+
+for t in tickers:
+    params = best_profile_params_for_ticker(t)
+    if not params:
+        st.warning(f"Saknar profiler för {t} – hoppar över.")
+        continue
+    s = load_strategy_equity(t, params)
+    if s.empty:
+        st.warning(f"Ingen equity för {t} – hoppar över.")
+        continue
+    equity_series.append(s)
+    first_dates.append(pd.to_datetime(s.index[0]))
+
+if not equity_series:
+    st.error("Ingen strategi-kurva kunde laddas.")
+    st.stop()
+
+# Portfölj (EW rebalanced på strategi-returer, strikt gemensam period)
+port_reb = equal_weight_rebalanced(equity_series)
+
+# Använd portföljens datum som referens (gemensam period)
+start_dt = port_reb.index[0]      # spara riktiga datum innan reset_index
+end_dt   = port_reb.index[-1]
+
+# --- Buy&Hold (priser, utan rebalansering) ---------------------------------
+
+# Hämta prisserier från gemensam start (portfölj-start) – strikt inner join sker i funktionen
+price_series: List[pd.Series] = []
+for t in tickers:
+    try:
+        ps = load_price_series(t, start=str(start_dt.date()))
+        price_series.append(ps)
+    except Exception as e:
+        st.warning(f"Prisdata misslyckades för {t}: {type(e).__name__}: {e}")
+
+bh_curve = equal_weight_buyhold(price_series)
+# Klipp till portföljens datum för jämförbarhet
+bh_curve = bh_curve.reindex(port_reb.index).dropna()
+
+# --- Index (OMXS30GI) ------------------------------------------------------
+
+try:
+    idx = load_price_series(INDEX_TICKER, start=str(start_dt.date()))
+    idx = idx.reindex(port_reb.index).dropna()
+    idx = idx / float(idx.iloc[0])
+    idx.name = INDEX_TICKER
+except Exception:
+    idx = pd.Series(index=port_reb.index, dtype="float64", name=INDEX_TICKER)
+
+# --- Plot-data --------------------------------------------------------------
+
+df_plot = pd.DataFrame({
+    "Portfolio": port_reb,
+    "Buy&Hold": bh_curve if not bh_curve.empty else pd.Series(index=port_reb.index, dtype="float64"),
+    INDEX_TICKER: idx if not idx.empty else pd.Series(index=port_reb.index, dtype="float64"),
+}).dropna(how="all")
+
+# Vi plottar mot en enkel stegs-axel men visar riktiga datum i caption
+df_plot_reset = df_plot.reset_index(drop=True)
+
+import altair as alt
+base = alt.Chart(df_plot_reset).transform_fold(
+    ["Buy&Hold", INDEX_TICKER, "Portfolio"], as_=["Kurva", "Nivå"]
+).mark_line().encode(
+    x=alt.X("index:Q", title="Steg"),
+    y=alt.Y("Nivå:Q", title="Normaliserad nivå (×)"),
+    color=alt.Color("Kurva:N", sort=["Buy&Hold", INDEX_TICKER, "Portfolio"]),
+).properties(width="container", height=420)
+
+st.altair_chart(base, use_container_width=True)
+
+# --- Summering --------------------------------------------------------------
+
+st.caption(f"Motor: {MOTOR} | Start: {fmt_date_safe(start_dt)}  Slut: {fmt_date_safe(end_dt)}")
+
+stats = {
+    "Portfolio_final": float(port_reb.iloc[-1]) if len(port_reb) else None,
+    "BuyHold_final": float(bh_curve.iloc[-1]) if len(bh_curve) else None,
+    f"{INDEX_TICKER}_final": float(idx.iloc[-1]) if len(idx) else None,
+}
+st.json(stats)

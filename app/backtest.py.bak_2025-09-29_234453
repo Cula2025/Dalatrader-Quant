@@ -1,0 +1,400 @@
+﻿from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+
+# ========= Indikatorer =========
+def rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0).rolling(window).mean()
+    down = (-delta.clip(upper=0)).rolling(window).mean()
+    rs = up / down.replace(0, np.nan)
+    out = 100.0 - 100.0 / (1.0 + rs)
+    return out.fillna(50.0)
+
+def ema(series: pd.Series, window: int) -> pd.Series:
+    return series.ewm(span=window, adjust=False).mean()
+
+def macd(close: pd.Series, fast: int=12, slow: int=26, signal:int=9) -> Tuple[pd.Series,pd.Series,pd.Series]:
+    m = ema(close, fast) - ema(close, slow)
+    s = ema(m, signal)
+    h = m - s
+    return m, s, h
+
+def bb_percent_b(close: pd.Series, window:int=20, nstd:float=2.0) -> pd.Series:
+    mid = close.rolling(window).mean()
+    std = close.rolling(window).std(ddof=0)
+    upper = mid + nstd*std
+    lower = mid - nstd*std
+    pctb = (close - lower) / (upper - lower)
+    return pctb.clip(0, 1)
+
+def atr(df: pd.DataFrame, window:int=14) -> pd.Series:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    pc = c.shift(1)
+    tr = pd.concat([(h-l).abs(), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
+    return tr.rolling(window).mean()
+
+
+# ========= Parametrar =========
+@dataclass
+class Params:
+    # RSI
+    use_rsi_filter: bool = True
+    rsi_window: int      = 14
+    rsi_min: float       = 25.0
+    rsi_max: float       = 60.0
+
+    # Trend-gate
+    use_trend_filter: bool = True
+    trend_ma_type:   str   = "EMA"
+    trend_ma_window: int   = 100
+
+    # Donchian breakout/exit
+    breakout_lookback: int = 55   # 0 = av
+    exit_lookback:     int = 20   # 0 = av
+
+    # MACD
+    use_macd_filter: bool = False
+    macd_fast:  int = 12
+    macd_slow:  int = 26
+    macd_signal:int = 9
+
+    # Bollinger %B (mean-reversion gate)
+    use_bb_filter: bool = False
+    bb_window: int = 20
+    bb_nstd: float = 2.0
+    bb_min: float  = 0.2   # kräv %B <= bb_min vid entry om på
+
+    # Stop-loss
+    use_stop_loss: bool = False
+    stop_mode: str      = "pct"   # "pct" | "atr"
+    stop_loss_pct: float = 0.08
+    atr_window: int      = 14
+    atr_mult: float      = 2.0
+
+
+# ========= Hjälp =========
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    x = _coerce_df(df)
+    if "Date" not in x.columns:
+        idx = x.index.name or "Date"
+        x = x.reset_index().rename(columns={idx: "Date"})
+    x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
+    for c in ("Open","High","Low","Close","Volume"):
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=["Date","Close"]).sort_values("Date").reset_index(drop=True)
+    return x
+
+def _compute_signals(df: pd.DataFrame, p: Params) -> pd.DataFrame:
+    x = df.copy()
+
+    # Bas
+    x["RSI"] = rsi(x["Close"], p.rsi_window)
+
+    if p.use_trend_filter and p.trend_ma_window > 0:
+        x["TREND"] = ema(x["Close"], p.trend_ma_window)
+    else:
+        x["TREND"] = np.nan
+
+    if p.use_macd_filter:
+        _, _, h = macd(x["Close"], p.macd_fast, p.macd_slow, p.macd_signal)
+        x["MACD_H"] = h
+    else:
+        x["MACD_H"] = 0.0
+
+    if p.use_bb_filter:
+        x["PCTB"] = bb_percent_b(x["Close"], p.bb_window, p.bb_nstd)
+    else:
+        x["PCTB"] = 0.5
+
+    # Donchian
+    if p.breakout_lookback > 0:
+        x["HH"] = x["High"].rolling(p.breakout_lookback).max()
+    else:
+        x["HH"] = np.nan
+    if p.exit_lookback > 0:
+        x["LL"] = x["Low"].rolling(p.exit_lookback).min()
+    else:
+        x["LL"] = np.nan
+
+    # Villkor
+    cond_trend = (not p.use_trend_filter) | (x["Close"] > x["TREND"])
+    cond_macd  = (not p.use_macd_filter)  | (x["MACD_H"] > 0)
+    cond_bb    = (not p.use_bb_filter)    | (x["PCTB"] <= p.bb_min)
+
+    # RSI korsningar
+    rsi_up   = (x["RSI"].shift(1) < p.rsi_min) & (x["RSI"] >= p.rsi_min)
+    rsi_down = (x["RSI"].shift(1) > p.rsi_max) & (x["RSI"] <= p.rsi_max)
+
+    # Breakout
+    bo_active = p.breakout_lookback > 0
+    bo_ok     = x["High"] >= x["HH"] if bo_active else pd.Series(True, index=x.index)
+    ex_bo     = x["Low"]  <= x["LL"] if p.exit_lookback > 0 else pd.Series(False, index=x.index)
+
+    # **Entry OR-logik**: RSI-kors eller (om aktivt) breakout – plus övriga filter
+    x["BUY"]  = (rsi_up | (bo_active & bo_ok)) & cond_trend & cond_macd & cond_bb
+    # Exit: RSI ned-kors eller Donchian-exit
+    x["SELL"] = (rsi_down | ex_bo)
+
+    return x
+
+# ========= Backtest =========
+def run_backtest(df: pd.DataFrame, p: Params) -> Dict[str, Any]:
+    df = _fix_df_source(df, (p if isinstance(p, dict) else (vars(p) if hasattr(p, "__dict__") else None)))
+
+    x = _normalize_df(df)
+    x = _compute_signals(x, p)
+
+    cash = 100_000.0
+    pos  = 0.0
+    entry_px = 0.0
+    entry_time = None
+
+    eq_curve: List[Dict[str, Any]] = []
+    trades: List[Dict[str, Any]] = []
+
+    atr_ser = atr(x, p.atr_window) if (p.use_stop_loss and p.stop_mode == "atr") else None
+
+    for i, row in x.iterrows():
+        px = float(row["Close"])
+        # Equity
+        eq_curve.append({"Date": row["Date"], "Equity": cash + pos*px})
+
+        # Stop-loss
+        if pos > 0 and p.use_stop_loss:
+            if p.stop_mode == "pct":
+                stop = entry_px * (1.0 - p.stop_loss_pct)
+            else:
+                a = float(atr_ser.iloc[i]) if atr_ser is not None else 0.0
+                stop = entry_px - p.atr_mult * a
+            if px <= stop:
+                cash += pos * px
+                trades.append({
+                    "EntryTime": entry_time, "EntryPrice": entry_px,
+                    "ExitTime": row["Date"], "ExitPrice": px,
+                    "PnL": pos*(px-entry_px), "reason": "StopLoss"
+                })
+                pos = 0.0
+                entry_px = 0.0
+                entry_time = None
+                continue
+
+        # Exit
+        if pos > 0 and bool(row["SELL"]):
+            cash += pos * px
+            trades.append({
+                "EntryTime": entry_time, "EntryPrice": entry_px,
+                "ExitTime": row["Date"], "ExitPrice": px,
+                "PnL": pos*(px-entry_px), "reason": "SignalExit"
+            })
+            pos = 0.0
+            entry_px = 0.0
+            entry_time = None
+            continue
+
+        # Entry
+        if pos == 0 and bool(row["BUY"]):
+            pos = cash / px   # all-in
+            entry_px = px
+            entry_time = row["Date"]
+            cash = 0.0
+
+    # Stäng på slutet
+    if pos > 0:
+        px = float(x.iloc[-1]["Close"])
+        cash += pos*px
+        trades.append({
+            "EntryTime": entry_time, "EntryPrice": entry_px,
+            "ExitTime": x.iloc[-1]["Date"], "ExitPrice": px,
+            "PnL": pos*(px-entry_px), "reason": "EoP"
+        })
+        pos = 0.0
+
+    eq_df = pd.DataFrame(eq_curve).dropna()
+    final_eq = float(eq_df["Equity"].iloc[-1]) if not eq_df.empty else 100_000.0
+    tr_dec = final_eq/100_000.0 - 1.0
+
+    c0, c1 = float(x["Close"].iloc[0]), float(x["Close"].iloc[-1])
+    buyhold = c1/c0 - 1.0
+
+    roll_max = eq_df["Equity"].cummax() if not eq_df.empty else pd.Series([100_000.0])
+    dd = (eq_df["Equity"]/roll_max) - 1.0 if not eq_df.empty else pd.Series([0.0])
+    maxdd = float(dd.min()) if not dd.empty else 0.0
+
+    ret = eq_df["Equity"].pct_change().dropna()
+    sharpe_d = float(np.sqrt(252) * (ret.mean() / (ret.std() + 1e-9))) if not ret.empty else 0.0
+
+    years = max(1e-9, (x["Date"].iloc[-1] - x["Date"].iloc[0]).days / 365.25)
+    cagr = (final_eq/100_000.0) ** (1/years) - 1.0
+
+    return {
+        "summary": {
+            "Bars": len(x),
+            "Trades": len(trades),
+            "TotalReturn": tr_dec,
+            "MaxDD": maxdd,
+            "SharpeD": sharpe_d,
+            "BuyHold": buyhold,
+            "FinalEquity": final_eq,
+            "CAGR": cagr,
+        },
+        "equity": eq_df,
+        "trades": pd.DataFrame(trades),
+    }
+# --- helper: robust DataFrame coercion for flaky provider results ---
+def _coerce_df(df):
+    import pandas as pd
+    # None?
+    if df is None:
+        raise ValueError("Data provider returned None")
+    # tuple/list? försök första element som funkar
+    if isinstance(df, (list, tuple)):
+        for item in df:
+            try:
+                return _coerce_df(item)
+            except Exception:
+                continue
+        raise ValueError(f"Unsupported tuple/list from data provider: {[type(x).__name__ for x in df]}")
+    # redan en DataFrame?
+    try:
+        if isinstance(df, pd.DataFrame):
+            return df.copy()
+    except Exception:
+        pass
+    # dict med vanlig nyckel?
+    if isinstance(df, dict):
+        for key in ("data", "df"):
+            if key in df:
+                return _coerce_df(df[key])
+    # lista av dictar → records
+    if isinstance(df, list) and all(isinstance(x, dict) for x in df):
+        return _coerce_df(df)
+    # sista utväg
+    return _coerce_df(df)
+# --- robust override of _coerce_df with max-depth and richer type handling ---
+def _coerce_df(df, _depth=0, _max_depth=5):
+    import json
+    import pandas as pd
+    from collections.abc import Iterable
+
+    if _depth > _max_depth:
+        raise RecursionError("coerce_df: max depth exceeded; type=" + type(df).__name__)
+
+    # 1) None -> fel
+    if df is None:
+        raise ValueError("Data provider returned None")
+
+    # 2) Redan DataFrame
+    try:
+        if isinstance(df, pd.DataFrame):
+            return df.copy()
+    except Exception:
+        pass
+
+    # 3) Sträng: försök JSON-decoda annars fel
+    if isinstance(df, str):
+        try:
+            parsed = json.loads(df)
+            return _coerce_df(parsed, _depth+1, _max_depth)
+        except Exception:
+            raise ValueError(f"Unsupported string from data provider (not JSON): '{df[:120].replace("\n","\\n")}'")
+
+    # 4) Lista/Tuple
+    if isinstance(df, (list, tuple)):
+        if not df:
+            raise ValueError("Empty list/tuple from data provider")
+        # prioritera första element som går att koercera
+        for it in df:
+            try:
+                return _coerce_df(it, _depth+1, _max_depth)
+            except Exception:
+                continue
+        # fallback: records om det ser ut som list[dict]
+        if all(isinstance(x, dict) for x in df):
+            return pd.DataFrame(df).copy()
+        raise ValueError("No usable element found in list/tuple from data provider")
+
+    # 5) Dict
+    if isinstance(df, dict):
+        # vanliga nycklar
+        for key in ("data", "df", "payload"):
+            if key in df:
+                return _coerce_df(df[key], _depth+1, _max_depth)
+        # om alla values är skalärer -> gör en rad
+        try:
+            if all(not isinstance(v, (list, tuple, dict)) for v in df.values()):
+                return pd.DataFrame([df]).copy()
+        except Exception:
+            pass
+        # om minst en kolumn har list-längd -> vanlig DataFrame
+        if any(isinstance(v, (list, tuple)) for v in df.values()):
+            return pd.DataFrame(df).copy()
+        # sista utväg: prova ändå
+        try:
+            return pd.DataFrame(df).copy()
+        except Exception as e:
+            raise ValueError(f"Unsupported dict for DataFrame: {e}")
+
+    # 6) Objekt med to_pandas/to_frame
+    for meth in ("to_pandas", "to_frame"):
+        if hasattr(df, meth) and callable(getattr(df, meth)):
+            res = getattr(df, meth)()
+            return _coerce_df(res, _depth+1, _max_depth)
+
+    # 7) Iterable av dicts
+    if isinstance(df, Iterable) and not isinstance(df, (bytes, bytearray)):
+        try:
+            peek = next(iter(df))
+        except Exception:
+            peek = None
+        if isinstance(peek, dict):
+            return pd.DataFrame(list(df)).copy()
+
+    # 8) Sista chans: direkt DataFrame-cast (utan rekursion till samma obj)
+    try:
+        return pd.DataFrame(df).copy()
+    except Exception as e:
+        raise ValueError(f"Cannot coerce {type(df).__name__} to DataFrame: {e}")
+# --- debug helper: logga vad dataprovidern faktiskt returnerar ---
+def _GET_OHLCV_DEBUG(*args, **kwargs):
+    from app.data_providers import get_ohlcv as GET_OHLCV
+    import json
+    df = _GET_OHLCV_DEBUG(*args, **kwargs)
+    try:
+        tname = type(df).__name__
+        preview = None
+        if isinstance(df, str):
+            preview = df[:120]
+        elif isinstance(df, (list, tuple)):
+            preview = f"list/tuple len={len(df)} types={[type(x).__name__ for x in df[:3]]}"
+        elif isinstance(df, dict):
+            preview = f"dict keys={list(df.keys())[:6]}"
+        else:
+            s = str(df)
+            preview = s[:120].replace("\n", "\\n")
+        print(f"[bt-debug] GET_OHLCV returned type={tname} preview={preview}", flush=True)
+    except Exception as e:
+        print(f"[bt-debug] GET_OHLCV logging failed: {type(e).__name__}: {e}", flush=True)
+    return df
+# --- helper: if df is actually a ticker string, fetch data first ---
+
+
+def _fix_df_source(df, params):
+    """If df is a ticker string, fetch OHLCV. params may be dict or object."""
+    prof = params if isinstance(params, dict) else (vars(params) if hasattr(params, "__dict__") else {})
+    if isinstance(df, str):
+        s = df.strip()
+        # Heuristik: kort sträng med bokstäver/siffror => sannolikt ticker
+        if s and any(c.isalpha() for c in s) and len(s) <= 32:
+            ticker = s
+            start = prof.get("from_date")
+            end = prof.get("to_date")
+            try:
+                return _GET_OHLCV_DEBUG(ticker=ticker, start=start, end=end)
+            except Exception as e:
+                raise ValueError(f"Could not fetch OHLCV for '{s}': {type(e).__name__}: {e}")
+    return df

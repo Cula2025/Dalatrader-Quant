@@ -1,0 +1,113 @@
+from typing import Dict, Any
+import os, importlib.util, pandas as pd
+from app.data_providers import get_ohlcv
+
+# Sätts med sed nedan till absolut sökväg:
+ENGINE_PATH = os.path.abspath("/srv/trader/app/app/safebt.py")
+ENTRY_FN = "run"
+
+def _load():
+    spec = importlib.util.spec_from_file_location("engine_mod", ENGINE_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Kan inte ladda motorfil: {ENGINE_PATH}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod
+
+def _to_series(eq):
+    s = pd.Series(dtype="float64") if eq is None else pd.to_numeric(pd.Series(eq), errors="coerce").dropna()
+    try:
+        s.index = pd.to_datetime(s.index); s = s.sort_index()
+    except Exception:
+        pass
+    if len(s):
+        s.iloc[0] = 1.0
+    return s
+
+def run_backtest(p: Dict[str, Any], df=None):
+    t = (p or {}).get("ticker", "GETI B")
+    params = (p or {}).get("params", {}) or {}
+    if df is None:
+        df = get_ohlcv(t, start=str(params.get("start","2020-10-05")), end=params.get("end"))
+    m = _load()
+    fn = getattr(m, ENTRY_FN, None)
+    if not callable(fn):
+        raise RuntimeError(f"Entrypoint '{ENTRY_FN}' saknas i {ENGINE_PATH}")
+
+    # prova några signaturer
+    tried = []
+    for args,kwargs in [
+        ((t, params, df), {}),
+        ((t, params), {}),
+        ((t,), {"params": params, "df": df}),
+        ((), {"ticker": t, "params": params, "df": df}),
+        ((df, params), {}),
+        ((), {}),
+    ]:
+        try:
+            out = fn(*args, **kwargs)
+            break
+        except TypeError as e:
+            tried.append(str(e)); continue
+
+    # normalisera output
+    if isinstance(out, dict):
+        eq = out.get("equity") or out.get("equity_curve") or out.get("eq")
+        trades = (out.get("trades") or out.get("orders") or out.get("signals")
+                  or out.get("transactions") or out.get("trade_list") or [])
+    elif isinstance(out, (list, tuple)):
+        eq = out[0] if len(out) > 0 else None
+        trades = out[1] if len(out) > 1 else []
+    else:
+        eq, trades = None, []
+
+    return {"equity": _to_series(eq), "trades": trades}
+
+# === metrics-patch: komplettera result med metrics om de saknas ===
+def _runbacktest_with_metrics(_orig_fn):
+    def _wrap(p: dict, df=None):
+        res = _orig_fn(p, df)
+        try:
+            import pandas as pd
+            from app.data_providers import get_ohlcv as _GET_OHLCV
+            # equity → Series
+            s = pd.to_numeric(pd.Series(res.get("equity")), errors="coerce").dropna()
+            metrics = dict(res.get("metrics") or {})
+            if len(s):
+                # Bas-mått
+                total_return = float(s.iloc[-1] / s.iloc[0])
+                final_eq     = float(s.iloc[-1])
+                rets = s.pct_change().dropna()
+                sharpe = float((rets.mean() / rets.std() * (252 ** 0.5)) if rets.std() and rets.std() != 0 else 0.0)
+                dd = float((s / s.cummax() - 1.0).min())
+                # BH på samma fönster (ankra till equity.start)
+                tkr = (p or {}).get("ticker") or (p or {}).get("symbol") or ""
+                bhx = 0.0
+                if tkr:
+                    px = _GET_OHLCV(tkr, start=str(s.index[0].date()))
+                    close = pd.to_numeric(pd.Series(px.get("Close")), errors="coerce").dropna()
+                    close = close[close.index >= s.index[0]]
+                    if len(close):
+                        bhx = float(close.iloc[-1] / close.iloc[0])
+                # Trades
+                trades_len = len(res.get("trades", []))
+                # Fyll metrics om de saknas
+                metrics.setdefault("TotalReturn", total_return)
+                metrics.setdefault("SharpeD", sharpe)
+                metrics.setdefault("MaxDD", dd)
+                metrics.setdefault("FinalEquity", final_eq)
+                metrics.setdefault("Trades", trades_len)
+                metrics.setdefault("BuyHold", bhx)
+            res["metrics"] = metrics
+        except Exception:
+            # Låt aldrig metrics-beräkningen fälla hela backtestet
+            pass
+        return res
+    return _wrap
+
+try:
+    # ersätt run_backtest med wrappern (bara om den finns)
+    run_backtest = _runbacktest_with_metrics(run_backtest)  # type: ignore
+except NameError:
+    pass
+# === /metrics-patch ===

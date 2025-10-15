@@ -1,0 +1,43 @@
+from __future__ import annotations
+from typing import Iterable, Any, Dict, List
+import pandas as pd
+
+def pick_first(*vals: Any):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+def equal_weight_rebalanced(equities: Iterable[pd.Series]) -> pd.Series:
+    series = []
+    for s in equities:
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            continue
+        s = s / float(s.iloc[0])
+        series.append(s)
+    if not series:
+        return pd.Series(dtype="float64")
+    E = pd.concat(series, axis=1, join="inner")
+    rets = E.pct_change().dropna()
+    port = (1.0 + rets.mean(axis=1)).cumprod()
+    port.name = "Portfolio"
+    return port
+
+def equal_weight_buyhold_from_closes(close_frames: Dict[str, pd.Series]) -> pd.Series:
+    """Buy&Hold (ingen rebal) för flera tickers baserat på Close.
+       Normaliserar varje serie till 1.0 på gemensam start och tar medelvärdet av nivåerna."""
+    normed: List[pd.Series] = []
+    for t, s in close_frames.items():
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            continue
+        s = s / float(s.iloc[0])
+        s.name = t
+        normed.append(s)
+    if not normed:
+        return pd.Series(dtype="float64", name="BH")
+    E = pd.concat(normed, axis=1, join="inner")
+    bh = E.mean(axis=1)
+    bh.name = "Buy&Hold"
+    return bh

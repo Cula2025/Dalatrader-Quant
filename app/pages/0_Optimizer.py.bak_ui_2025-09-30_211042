@@ -1,0 +1,250 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# Branding (valfritt)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title="Dala Trader – Optimizer", page_icon="⚙️")
+st.title("⚙️ Optimizer")
+st.caption("Söker bästa parametrar för vald ticker och period. Sparar 3 riskprofiler: conservative/balanced/aggressive.")
+
+# === Importera backtestmotorn
+try:
+    from backtest import _GET_OHLCV_DEBUG as GET_OHLCV
+    from backtest import run_backtest as RUN
+except Exception:
+    from app.backtest import _GET_OHLCV_DEBUG as GET_OHLCV   # fallback path
+    from app.backtest import run_backtest as RUN
+
+# === UI: indata
+with st.sidebar:
+    st.subheader("Indata")
+    ticker_raw = st.text_input("Ticker", value=st.session_state.get("ticker", "GETI B"), help="Börsdata-ticker. .ST tas automatiskt bort internt.")
+    today = date.today()
+    try:
+        five_years_ago = today.replace(year=today.year - 5)
+    except ValueError:
+        # 29 feb -> 28 feb fallback
+        five_years_ago = today - timedelta(days=5*365)
+    from_date = st.date_input("From", value=st.session_state.get("from_date", five_years_ago))
+    to_date   = st.date_input("To",   value=st.session_state.get("to_date", today))
+    sims      = st.number_input("Antal simuleringar", min_value=100, max_value=100000, value=10_000, step=100)
+    seed      = st.number_input("Slumpfrö (reproducibelt)", min_value=0, max_value=2_147_483_647, value=12345, step=1)
+
+    st.caption("Tips: Börja med 1000–5000 för snabbhet, öka sedan.")
+    run_btn = st.button("🚀 Kör optimering")
+
+# === Hjälp: normalisera ticker (‘VOLV-B.ST’ -> ‘VOLV B’)
+def _normalize_ticker(t: str) -> str:
+    if not t: return ""
+    s = t.strip()
+    if s.upper().endswith(".ST"):
+        s = s[:-3]
+    s = s.replace("-", " ")
+    return s
+
+# === Parametrar & sampling
+@dataclass
+class SampledParams:
+    params: Dict[str, Any]
+
+def _ur(rng: np.random.Generator, a: float, b: float) -> float:
+    return float(rng.random() * (b - a) + a)
+
+def sample_params(rng: np.random.Generator) -> Dict[str, Any]:
+    """Prova alla indikatorfamiljer inom givna intervall."""
+    use_trend_filter  = bool(rng.integers(0, 2))
+    use_macd_filter   = bool(rng.integers(0, 2))
+    use_bb_filter     = bool(rng.integers(0, 2))
+    use_stop_loss     = bool(rng.integers(0, 2))
+    use_atr_trailing  = bool(rng.integers(0, 2))
+
+    trend_ma_type = rng.choice(["SMA", "EMA"])  # om du bara stödjer EMA internt, sätt "EMA"
+
+    params = {
+        "use_rsi_filter": True,  # vi använder alltid RSI-filter i den här optimizern
+        "rsi_window":    int(rng.integers(5, 36)),        # 5..35
+        "rsi_min":       _ur(rng, 5.0, 35.0),
+        "rsi_max":       _ur(rng, 60.0, 85.0),
+
+        "use_trend_filter": use_trend_filter,
+        "trend_ma_type":  trend_ma_type,
+        "trend_ma_window": int(rng.integers(20, 201)),
+
+        "breakout_lookback": int(rng.integers(20, 121)),
+        "exit_lookback":     int(rng.integers(10, 61)),
+
+        "use_macd_filter": use_macd_filter,
+        "macd_fast":   int(rng.integers(8, 17)),
+        "macd_slow":   int(rng.integers(18, 31)),
+        "macd_signal": int(rng.integers(8, 15)),
+
+        "use_bb_filter": use_bb_filter,
+        "bb_window": int(rng.integers(15, 31)),
+        "bb_nstd":   _ur(rng, 1.6, 2.4),
+        "bb_min":    _ur(rng, 0.0, 0.8),
+
+        "use_stop_loss": use_stop_loss,
+        "stop_mode": rng.choice(["pct", "atr"]),
+        "stop_loss_pct": _ur(rng, 0.03, 0.20),
+
+        "atr_window": int(rng.integers(10, 21)),
+        "atr_mult":   _ur(rng, 1.2, 3.2),
+
+        "use_atr_trailing": use_atr_trailing,
+        "atr_trail_mult":   _ur(rng, 1.2, 3.5),
+    }
+
+    # Sanitet: se till att rsi_min < rsi_max
+    if params["rsi_min"] >= params["rsi_max"]:
+        lo = min(params["rsi_min"], params["rsi_max"])
+        hi = max(params["rsi_min"], params["rsi_max"])
+        params["rsi_min"] = lo
+        params["rsi_max"] = max(hi, lo + 1.0)
+
+    return params
+
+# === Scoring (högre = bättre)
+def score(metrics: Dict[str, Any]) -> float:
+    tr = float(metrics.get("TotalReturn", 0.0))
+    dd = float(metrics.get("MaxDD", 0.0))  # typiskt negativt
+    sh = float(metrics.get("SharpeD", 0.0))
+    # Bas: totalavkastning, bonus för Sharpe, straff för drawdown (mer negativ DD → större straff)
+    return tr + 0.15 * sh + 0.35 * min(0.0, dd)
+
+# === Kör en batch simuleringar på en färdigklippt OHLCV
+def run_sims(df: pd.DataFrame, sims: int, seed: int) -> List[Dict[str, Any]]:
+    rng = np.random.default_rng(int(seed))
+    results: List[Dict[str, Any]] = []
+
+    for _ in range(int(sims)):
+        p = sample_params(rng)
+        try:
+            # injicera datum till motorn (används för rapportering/metadata)
+            res = RUN(df, {**p})
+            summ = res.get("summary", {}) if isinstance(res, dict) else {}
+            m = {
+                "TotalReturn": float(summ.get("TotalReturn", 0.0)),
+                "MaxDD": float(summ.get("MaxDD", 0.0)),
+                "SharpeD": float(summ.get("SharpeD", 0.0)),
+                "BuyHold": float(summ.get("BuyHold", 0.0)),
+                "CAGR": float(summ.get("CAGR", 0.0)) if "CAGR" in summ else None,
+                "Trades": int(summ.get("Trades", 0)),
+                "FinalEquity": float(summ.get("FinalEquity", 0.0)),
+                "Bars": int(summ.get("Bars", 0)),
+            }
+            sc = score(m)
+            results.append({"params": p, "metrics": m, "score": sc})
+        except Exception as e:
+            # hoppa felande kombo, fortsätt
+            continue
+
+    return results
+
+# === Välj 3 profiler ur toppkandidater
+def pick_three(cands: List[Dict[str, Any]], ticker: str) -> List[Dict[str, Any]]:
+    if not cands:
+        return []
+    # Sortera på score, ta ett “fönster” av toppar att hämta riskprofiler ur
+    top = sorted(cands, key=lambda x: x["score"], reverse=True)[: max(50, len(cands)//20) ]
+
+    # Conservative = min MaxDD bland topparna
+    cons = min(top, key=lambda x: x["metrics"].get("MaxDD", 0.0))
+    # Aggressive = max TotalReturn i topparna
+    aggr = max(top, key=lambda x: x["metrics"].get("TotalReturn", 0.0))
+    # Balanced = bästa Sharpe bland de som inte är cons/aggr
+    rest = [x for x in top if x is not cons and x is not aggr]
+    if rest:
+        bal = max(rest, key=lambda x: x["metrics"].get("SharpeD", 0.0))
+    else:
+        bal = cons
+
+    out = [
+        {"name": f"{ticker} – conservative", "ticker": ticker, "params": cons["params"], "metrics": cons["metrics"]},
+        {"name": f"{ticker} – balanced",    "ticker": ticker, "params": bal["params"],  "metrics": bal["metrics"]},
+        {"name": f"{ticker} – aggressive",  "ticker": ticker, "params": aggr["params"], "metrics": aggr["metrics"]},
+    ]
+    return out
+
+# === Kör optimeringen när knappen trycks
+if run_btn:
+    tkr = _normalize_ticker(ticker_raw)
+    if not tkr:
+        st.error("Ange en ticker.")
+        st.stop()
+
+    frm = str(from_date)
+    to  = str(to_date)
+
+    # 1) Hämta OHLCV EN gång och KLIPP exakt datumintervall
+    try:
+        df = GET_OHLCV(ticker=tkr, start=frm, end=to)
+    except Exception as e:
+        st.error(f"Kunde inte hämta data för {tkr}: {type(e).__name__}: {e}")
+        st.stop()
+
+    # Datum-klippning (tål både index=Date och kolumn=Date)
+    if isinstance(df.index, pd.DatetimeIndex):
+        df = df.loc[(df.index >= frm) & (df.index <= to)].copy()
+        df["Date"] = df.index
+    elif "Date" in df.columns:
+        df = df[(df["Date"] >= frm) & (df["Date"] <= to)].copy()
+        if not isinstance(df["Date"].dtype, pd.DatetimeTZDtype) and not np.issubdtype(df["Date"].dtype, np.datetime64):
+            df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        df["Date"] = df.index
+    else:
+        st.error("OHLCV saknar Date-index/kolumn efter hämtning.")
+        st.stop()
+
+    if len(df) < 50:
+        st.error("För lite data i valt intervall.")
+        st.stop()
+
+    with st.spinner("Kör simuleringar…"):
+        cands = run_sims(df, sims=int(sims), seed=int(seed))
+
+    if not cands:
+        st.error("Inga giltiga körningar (alla felade). Justera intervall eller minska begränsningar.")
+        st.stop()
+
+    best3 = pick_three(cands, tkr)
+
+    # Spara
+    out_dir = Path("profiles"); out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / f"{tkr}.json"
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump({"profiles": best3}, f, ensure_ascii=False, indent=2)
+
+    st.success(f"Sparat: {out_path}")
+    st.code(json.dumps({"profiles": best3}, ensure_ascii=False, indent=2), language="json")
+
+    # Liten tabellöversikt
+    tbl = pd.DataFrame(
+        [
+            {
+                "Name": p["name"],
+                "TotalReturn": p["metrics"].get("TotalReturn"),
+                "SharpeD": p["metrics"].get("SharpeD"),
+                "MaxDD": p["metrics"].get("MaxDD"),
+                "Trades": p["metrics"].get("Trades"),
+                "FinalEquity": p["metrics"].get("FinalEquity"),
+            }
+            for p in best3
+        ]
+    )
+    st.dataframe(tbl, width='stretch')

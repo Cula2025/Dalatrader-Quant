@@ -1,0 +1,492 @@
+from __future__ import annotations
+
+import json
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+import streamlit as st
+
+# ===== Importera backtest-motorn =====
+try:
+    import app.portfolio_backtest as PB  # type: ignore
+except Exception as e:
+    st.error(f"Kan inte importera app.portfolio_backtest: {e}", icon="?")
+    st.stop()
+
+ROOT = Path(__file__).resolve().parents[1]
+PRICES_DIR = ROOT / "outputs" / "prices"
+PROFILES_DIR = ROOT / "outputs" / "profiles"
+PORTFOLIOS_DIR = ROOT / "storage" / "portfolios"
+
+# ---------- Hj�lp ----------
+
+def _safe_date(val: Any, default: date) -> date:
+    if not val:
+        return default
+    if isinstance(val, date):
+        return val
+    s = str(val).strip()
+    if not s:
+        return default
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    try:
+        return date.fromisoformat(s)
+    except Exception:
+        return default
+
+def _portfolio_files() -> List[Path]:
+    return sorted([p for p in PORTFOLIOS_DIR.glob("*.json") if p.is_file()])
+
+def _load_json(fp: Path) -> Dict[str, Any]:
+    return json.loads(fp.read_text(encoding="utf-8"))
+
+def _norm(t: str) -> str:
+    return t.replace(" ", "_").replace("/", "-")
+
+def _read_csv_for_ticker(ticker: str) -> Optional[pd.DataFrame]:
+    base = _norm(ticker)
+    candidates = list(PRICES_DIR.glob(f"{base}_*.csv")) or list(PRICES_DIR.glob(f"*{base}*.csv"))
+    if not candidates:
+        return None
+    fp = sorted(candidates)[-1]
+    try:
+        df = pd.read_csv(fp)
+    except Exception:
+        df = pd.read_csv(fp, encoding="latin-1")
+
+    cols = {c.lower(): c for c in df.columns}
+    date_col = cols.get("date") or cols.get("datum") or cols.get("time")
+    close_col = cols.get("close") or cols.get("pris") or cols.get("close_price")
+    if not date_col or not close_col:
+        return None
+
+    rename_map = {}
+    if date_col != "Date":
+        rename_map[date_col] = "Date"
+    if close_col != "Close":
+        rename_map[close_col] = "Close"
+    for want in ["Open", "High", "Low", "Volume"]:
+        lc = want.lower()
+        if lc in cols and cols[lc] != want:
+            rename_map[cols[lc]] = want
+    df = df.rename(columns=rename_map)
+
+    try:
+        df["Date"] = pd.to_datetime(df["Date"])
+    except Exception:
+        df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+
+    df = df.sort_values("Date").dropna(subset=["Date", "Close"])
+    return df
+
+def _load_universe_data_fallback(source: str, tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    start_dt = pd.Timestamp(start) if start else pd.Timestamp("1900-01-01")
+    end_dt = pd.Timestamp(end) if end else pd.Timestamp.today()
+
+    if source == "csv":
+        for t in tickers:
+            df = _read_csv_for_ticker(t)
+            if df is None:
+                st.warning(f"{t}: hittade ingen CSV i {PRICES_DIR}", icon="??")
+                continue
+            dff = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)].copy()
+            if dff.empty:
+                st.warning(f"{t}: inga rader i vald period.", icon="??")
+                continue
+            out[t] = dff
+        return out
+
+    # B�rsdata
+    try:
+        from app.env_bootstrap import load_env  # type: ignore
+        load_env()
+    except Exception:
+        pass
+    try:
+        import app.bd_modern_client as BD  # type: ignore
+    except Exception as e:
+        st.error(f"Kunde inte importera B�rsdata-klient: {e}", icon="?")
+        return out
+
+    for t in tickers:
+        try:
+            df = BD.get_ohlcv(t, start, end)
+        except TypeError:
+            try:
+                df = BD.get_ohlcv(symbol=t, start=start, end=end)  # type: ignore
+            except Exception as e2:
+                st.warning(f"{t}: kunde inte h�mta data. Senaste fel: {e2}", icon="??")
+                continue
+        except Exception as e:
+            st.warning(f"{t}: kunde inte h�mta data. Senaste fel: {e}", icon="??")
+            continue
+
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            dff = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)].copy()
+            if dff.empty:
+                st.warning(f"{t}: inga rader i vald period.", icon="??")
+                continue
+            out[t] = dff
+        else:
+            st.warning(f"{t}: B�rsdata returnerade ingen data.", icon="??")
+    return out
+
+def load_universe_data(source: str, tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
+    if hasattr(PB, "load_universe_data"):
+        try:
+            return PB.load_universe_data(source=source, tickers=tickers, start=start, end=end)  # type: ignore
+        except TypeError:
+            try:
+                return PB.load_universe_data(source, tickers, start, end)  # type: ignore
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return _load_universe_data_fallback(source, tickers, start, end)
+
+def _init_state_once() -> None:
+    if st.session_state.get("_pf_init"):
+        return
+    st.session_state["_pf_init"] = True
+    st.session_state.setdefault("pf_loaded_name", "")
+    st.session_state.setdefault("pf_name", "MinPortf�lj")
+    st.session_state.setdefault("pf_source", "csv")
+    st.session_state.setdefault("pf_universe", [])
+    st.session_state.setdefault("pf_start", date(2020, 1, 1))
+    st.session_state.setdefault("pf_end", date.today())
+    st.session_state.setdefault("pf_capital", 100_000.0)
+    st.session_state.setdefault("pf_per_trade", 5.0)      # f�rsiktigare default
+    st.session_state.setdefault("pf_max_exp", 60.0)       # f�rsiktigare default
+    st.session_state.setdefault("pf_max_pos", 5)          # f�rsiktigare default
+    st.session_state.setdefault("pf_profiles_mode", "Matcha profiler PER ticker")
+    st.session_state.setdefault("pf_profiles_payload", [])  # [{ticker, params}]
+    st.session_state.setdefault("pf_selected_file", "")
+
+def _apply_portfolio_payload(payload: Dict[str, Any]) -> None:
+    st.session_state["pf_name"]   = payload.get("name", st.session_state["pf_name"])
+    st.session_state["pf_source"] = payload.get("source", st.session_state["pf_source"])
+    st.session_state["pf_start"]  = _safe_date(payload.get("start"), st.session_state["pf_start"])
+    st.session_state["pf_end"]    = _safe_date(payload.get("end"),   st.session_state["pf_end"])
+
+    uni = payload.get("universe") or []
+    if isinstance(uni, str):
+        uni = [x.strip() for x in uni.splitlines() if x.strip()]
+    st.session_state["pf_universe"] = list(uni)
+
+    rules = payload.get("rules", {}) or {}
+    st.session_state["pf_capital"]   = float(rules.get("capital", st.session_state["pf_capital"]))
+    st.session_state["pf_per_trade"] = float(rules.get("per_trade_pct", st.session_state["pf_per_trade"]))
+    st.session_state["pf_max_exp"]   = float(rules.get("max_exposure_pct", st.session_state["pf_max_exp"]))
+    st.session_state["pf_max_pos"]   = int(rules.get("max_positions", st.session_state["pf_max_pos"]))
+
+    st.session_state["pf_profiles_mode"]    = payload.get("profiles_mode", st.session_state["pf_profiles_mode"])
+    st.session_state["pf_profiles_payload"] = payload.get("profiles", []) or []
+
+def _show_status() -> None:
+    uni = st.session_state["pf_universe"]
+    profiles = st.session_state["pf_profiles_payload"]
+    st.caption(
+        f"?? Portf�lj: **{st.session_state['pf_name']}** | "
+        f"?? Tickers: **{len(uni)}** | "
+        f"?? Profiler: **{len(profiles)}** | "
+        f"??? K�lla: **{st.session_state['pf_source']}** | "
+        f"?? Period: **{st.session_state['pf_start']} ? {st.session_state['pf_end']}**"
+    )
+
+# ---------- Profiler per ticker ----------
+
+def _index_profiles_by_ticker(profiles: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    idx: Dict[str, Dict[str, Any]] = {}
+    for p in profiles:
+        t = str((p or {}).get("ticker", "")).strip()
+        if t:
+            idx[t] = p
+    return idx
+
+def _load_best_for_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    """F�rs�k hitta och l�sa en *_best.json som h�r till tickern."""
+    base = _norm(ticker)
+    candidates = [
+        PROFILES_DIR / f"{base}_best.json",
+        PROFILES_DIR / f"{ticker}_best.json",
+        *PROFILES_DIR.glob(f"*{base}*best.json"),
+        *PROFILES_DIR.glob(f"*{ticker.replace(' ', '_')}*best.json"),
+    ]
+    for fp in candidates:
+        if fp.is_file():
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                # Normalisera s� den alltid inneh�ller {ticker, params}
+                if isinstance(data, dict) and "params" in data:
+                    out = {"ticker": ticker, "params": data["params"]}
+                    return out
+                if isinstance(data, dict) and "profiles" in data and isinstance(data["profiles"], list):
+                    for p in data["profiles"]:
+                        if isinstance(p, dict) and str(p.get("ticker", "")).strip().upper() == ticker.upper():
+                            return {"ticker": ticker, "params": p.get("params", {})}
+            except Exception:
+                pass
+    return None
+
+def _auto_load_best_profiles_for_universe(tickers: List[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    found: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for t in tickers:
+        prof = _load_best_for_ticker(t)
+        if prof:
+            found.append(prof)
+        else:
+            missing.append(t)
+    return found, missing
+
+# ---------- PortfolioParams (dynamisk) ----------
+
+def _build_portfolio_params() -> Any:
+    """
+    Bygg kwargs exakt efter vad PortfolioParams.__init__ accepterar.
+    Returnerar instans eller dict (fallback).
+    """
+    import inspect
+
+    ui = {
+        "capital": float(st.session_state["pf_capital"]),
+        "per_trade_pct": float(st.session_state["pf_per_trade"]),
+        "max_exposure_pct": float(st.session_state["pf_max_exp"]),
+        "max_positions": int(st.session_state["pf_max_pos"]),
+        "profiles_mode": str(st.session_state["pf_profiles_mode"]),
+        "profiles": list(st.session_state["pf_profiles_payload"]),
+    }
+    alias_map = {
+        "capital": ["initial_capital", "starting_capital", "capital"],
+        "per_trade_pct": ["position_pct", "risk_per_trade_pct", "risk_pct", "per_trade_pct"],
+        "max_exposure_pct": ["max_total_exposure_pct", "max_exposure_pct", "max_exp_pct"],
+        "max_positions": ["max_open_positions", "max_positions", "max_pos"],
+        "profiles_mode": ["profiles_mode", "mode"],
+        "profiles": ["profiles", "profile_list"],
+    }
+
+    try:
+        sig = inspect.signature(PB.PortfolioParams)
+    except (ValueError, TypeError):
+        sig = inspect.signature(PB.PortfolioParams.__init__)  # type: ignore
+
+    init_params = [
+        p.name for p in sig.parameters.values()
+        if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) and p.name != "self"
+    ]
+
+    kwargs: Dict[str, Any] = {}
+    for ui_key, value in ui.items():
+        for cand in alias_map[ui_key]:
+            if cand in init_params:
+                kwargs[cand] = value
+                break
+
+    try:
+        return PB.PortfolioParams(**kwargs)  # type: ignore
+    except Exception:
+        return kwargs
+
+# ---------- UI ----------
+
+st.set_page_config(page_title="Portf�lj", layout="wide")
+_init_state_once()
+st.title("?? Portf�lj")
+
+left, right = st.columns([1, 2], gap="large")
+
+with left:
+    st.subheader("Ladda portf�lj")
+    files = _portfolio_files()
+    names = ["(v�lj)"] + [p.name for p in files]
+    current = st.session_state.get("pf_selected_file") or "(v�lj)"
+    sel = st.selectbox(
+        "V�lj portf�lj (storage/portfolios)",
+        names,
+        index=names.index(current) if current in names else 0,
+        key="pf_selected_file",
+    )
+    if sel != "(v�lj)" and sel != st.session_state.get("pf_loaded_name"):
+        try:
+            payload = _load_json(PORTFOLIOS_DIR / sel)
+            _apply_portfolio_payload(payload)
+            st.session_state["pf_loaded_name"] = sel
+            st.success(f"Laddade portf�lj: {sel}", icon="?")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Kunde inte l�sa portf�ljfilen: {e}", icon="?")
+
+with right:
+    st.subheader("Resultat")
+
+_show_status()
+st.divider()
+
+c1, c2 = st.columns(2)
+with c1:
+    st.text_input("Namn", key="pf_name")
+with c2:
+    st.radio("Datak�lla", ["borsdata", "csv"], key="pf_source", horizontal=True)
+
+st.caption("Universum")
+uni_text = "\n".join(st.session_state["pf_universe"])
+new_uni = st.text_area("En ticker per rad", value=uni_text, key="_uni_text", height=140)
+if new_uni != uni_text:
+    st.session_state["pf_universe"] = [ln.strip() for ln in new_uni.splitlines() if ln.strip()]
+
+d1, d2 = st.columns(2)
+with d1:
+    st.date_input("Start", key="pf_start", format="YYYY/MM/DD")
+with d2:
+    st.date_input("Slut", key="pf_end", format="YYYY/MM/DD")
+
+st.subheader("Portf�ljregler")
+st.number_input("Startkapital", min_value=1000.0, max_value=1e9, step=1000.0, key="pf_capital")
+r1, r2 = st.columns(2)
+with r1:
+    st.number_input("Max % per aff�r", min_value=0.1, max_value=100.0, step=0.5, key="pf_per_trade")
+with r2:
+    st.number_input("Max total exponering %", min_value=1.0, max_value=100.0, step=1.0, key="pf_max_exp")
+st.number_input("Max antal �ppna positioner", min_value=1, max_value=100, step=1, key="pf_max_pos")
+
+st.subheader("Profiler fr�n Backtrack")
+st.radio(
+    "Hur anv�nda profilerna?",
+    ["V�lj EN profil (alla tickers)", "Matcha profiler PER ticker"],
+    key="pf_profiles_mode",
+    index=1,  # g�r per-ticker till default
+)
+
+# Auto-ladda *_best.json f�r universum
+if st.button("?? Auto-ladda *_best.json f�r universum", width='stretch'):
+    uni = st.session_state["pf_universe"]
+    if not uni:
+        st.warning("L�gg in tickers i universum f�rst.", icon="??")
+    else:
+        found, missing = _auto_load_best_profiles_for_universe(uni)
+        if found:
+            st.session_state["pf_profiles_payload"] = found
+            st.success(f"Hittade profiler f�r {len(found)} tickers.", icon="?")
+        if missing:
+            st.warning("Saknar profiler f�r: " + ", ".join(missing), icon="??")
+        st.rerun()
+
+profiles_payload = st.session_state["pf_profiles_payload"]
+if profiles_payload:
+    df_preview = pd.DataFrame([
+        {
+            "Ticker": p.get("ticker", ""),
+            "Strategy": (p.get("params") or {}).get("strategy", ""),
+            "Params": json.dumps((p.get("params") or {}), ensure_ascii=False)
+        }
+        for p in profiles_payload
+    ])
+    st.dataframe(df_preview, width='stretch', hide_index=True, height=min(300, 36 + 28 * max(1, len(df_preview))))
+
+st.divider()
+
+# K�r
+if st.button("?? K�r portf�lj", width='stretch'):
+    tickers = st.session_state["pf_universe"]
+    if not tickers:
+        st.error("Universum �r tomt � fyll i minst en ticker.", icon="?")
+        st.stop()
+
+    # S�kerst�ll att per-ticker-profiler finns om det l�get �r valt
+    per_ticker = st.session_state["pf_profiles_mode"].startswith("Matcha")
+    by_ticker: Dict[str, Dict[str, Any]] = _index_profiles_by_ticker(profiles_payload) if per_ticker else {}
+
+    if per_ticker:
+        missing = [t for t in tickers if t not in by_ticker]
+        if missing:
+            st.warning("Saknar profil f�r: " + ", ".join(missing) + ". Auto-ladda eller l�gg till manuellt.", icon="??")
+
+    # Ladda data
+    try:
+        data = load_universe_data(
+            source=st.session_state["pf_source"],
+            tickers=tickers,
+            start=st.session_state["pf_start"].isoformat(),
+            end=st.session_state["pf_end"].isoformat(),
+        )
+    except Exception as e:
+        st.error(f"Kunde inte ladda data: {e}", icon="?")
+        st.stop()
+
+    if not data:
+        st.error("Ingen data laddades � kontrollera tickers och datak�lla.", icon="?")
+        st.stop()
+
+    # Om per-ticker: injicera r�tt params per ticker i params/profiles
+    if per_ticker:
+        # normalisera payloaden till [{ticker, params}]
+        merged: List[Dict[str, Any]] = []
+        for t in tickers:
+            p = by_ticker.get(t)
+            if p:
+                merged.append({"ticker": t, "params": p.get("params", {})})
+        st.session_state["pf_profiles_payload"] = merged  # uppdatera
+
+    # Bygg PortfolioParams
+    params = _build_portfolio_params()
+
+    # K�r backtest
+    try:
+        equity, trades, stats = PB.run_portfolio_backtest(data, params)
+    except Exception as e:
+        st.error(f"Fel vid k�rning: {e}", icon="?")
+        st.stop()
+
+    st.success("Klar! ?", icon="?")
+    if isinstance(equity, pd.DataFrame) and not equity.empty:
+        idxcol = "Date" if "Date" in equity.columns else equity.columns[0]
+        st.line_chart(equity.set_index(idxcol))
+
+    colA, colB = st.columns([1, 2])
+    with colA:
+        if isinstance(stats, dict):
+            pretty = {k: (f"{v:.2f}" if isinstance(v, (int, float)) else v) for k, v in stats.items()}
+            st.json(pretty, expanded=False)
+    with colB:
+        if isinstance(trades, pd.DataFrame) and not trades.empty:
+            st.dataframe(trades, width='stretch', height=420)
+
+# Spara portf�lj
+st.subheader("Spara som (storage/portfolios/�)")
+save_name = st.text_input(
+    "Filnamn",
+    value=st.session_state.get("pf_loaded_name") or f"{st.session_state['pf_name']}.json"
+)
+if st.button("?? Spara portf�lj", width='stretch'):
+    payload_out = {
+        "name": st.session_state["pf_name"],
+        "source": st.session_state["pf_source"],
+        "universe": st.session_state["pf_universe"],
+        "start": st.session_state["pf_start"].isoformat(),
+        "end": st.session_state["pf_end"].isoformat(),
+        "rules": {
+            "capital": float(st.session_state["pf_capital"]),
+            "per_trade_pct": float(st.session_state["pf_per_trade"]),
+            "max_exposure_pct": float(st.session_state["pf_max_exp"]),
+            "max_positions": int(st.session_state["pf_max_pos"]),
+        },
+        "profiles_mode": st.session_state["pf_profiles_mode"],
+        "profiles": list(st.session_state["pf_profiles_payload"]),
+    }
+    try:
+        out_fp = PORTFOLIOS_DIR / (save_name if save_name.endswith(".json") else f"{save_name}.json")
+        out_fp.write_text(json.dumps(payload_out, ensure_ascii=False, indent=2), encoding="utf-8")
+        st.success(f"Sparade: {out_fp}", icon="?")
+        st.session_state["pf_loaded_name"] = out_fp.name
+        st.rerun()
+    except Exception as e:
+        st.error(f"Kunde inte spara portf�lj: {e}", icon="?")
+
+

@@ -1,0 +1,89 @@
+# -*- coding: utf-8 -*-
+from datetime import date
+import pandas as pd
+import streamlit as st
+
+from app.data_providers import get_ohlcv as GET_OHLCV
+from app.btwrap import run_backtest as RUN_BT
+
+st.set_page_config(page_title="Dala Trader – Backtest (minimal)", page_icon="🧪", layout="wide")
+st.title("🧪 Backtest (minimal)")
+
+# --- UI ---
+with st.sidebar:
+    st.subheader("Inmatning")
+    ticker = st.text_input("Ticker", value=st.session_state.get("ticker","HM-B.ST"), key="__bt_ticker_min__")
+    start = st.date_input("Start", value=date(2020,1,1), key="__bt_start__")
+    end   = st.date_input("Slut",  value=date.today(), key="__bt_end__")
+    run   = st.button("Kör backtest", type="primary")
+
+# --- helpers ---
+def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("Tom DataFrame från GET_OHLCV()")
+
+    # Gör index till datum om möjligt
+    if not isinstance(df.index, pd.DatetimeIndex):
+        for cand in ("Date","date","timestamp","time"):
+            if cand in df.columns:
+                df[cand] = pd.to_datetime(df[cand], errors="coerce")
+                df = df.set_index(cand)
+                break
+        else:
+            df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df.sort_index()
+
+    # Se till att både TitleCase och lowercase finns för O/H/L/C/V
+    def add(dst, srcs):
+        if dst not in df.columns:
+            for s in srcs:
+                if s in df.columns:
+                    df[dst] = df[s]
+                    return
+    add("Open",   ["open","o","open_price","OPEN"])
+    add("High",   ["high","h","high_price","HIGH"])
+    add("Low",    ["low","l","low_price","LOW"])
+    add("Close",  ["close","c","adjclose","adj_close","price","last","CLOSE"])
+    add("Volume", ["volume","v","vol","turnover","VOLUME"])
+
+    for T,l in [("Open","open"),("High","high"),("Low","low"),("Close","close"),("Volume","volume")]:
+        if T in df.columns and l not in df.columns:
+            df[l] = df[T]
+        if l in df.columns and T not in df.columns:
+            df[T] = df[l]
+
+    # Filtrera bort rader utan Close
+    df = df[df["Close"].notna()]
+    return df
+
+# --- main ---
+if run:
+    try:
+        st.info("🔎 Hämtar prisdata …")
+        df = GET_OHLCV(ticker, start, end)
+        st.success(f"Data: {len(df)} rader, {df.index.min().date()} → {df.index.max().date()}")
+
+        df = _ensure_ohlcv(df)
+
+        st.info("🚀 Kör backtest …")
+        # Kör med wrapper – den hittar rätt funktionssignatur och Params automatiskt
+        result = RUN_BT(df)
+
+        st.success("✅ Backtest klart")
+        if isinstance(result, dict):
+            st.subheader("Resultatnycklar")
+            st.json({k:type(v).__name__ for k,v in result.items()})
+            # visa equity om finns
+            eq = result.get("equity") or result.get("equity_curve")
+            if isinstance(eq, (pd.Series, pd.DataFrame)):
+                st.line_chart(eq)
+        else:
+            st.write("Resultattyp:", type(result).__name__)
+            st.write(result)
+
+    except Exception as e:
+        st.error(f"Backtest misslyckades: {e}")
+        import traceback
+        st.code("".join(traceback.format_exc()), language="text")
+else:
+    st.caption("Välj ticker och period i sidopanelen och klicka **Kör backtest**.")

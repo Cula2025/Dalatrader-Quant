@@ -1,0 +1,459 @@
+﻿from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import argparse
+import json
+import math
+import numpy as np
+import pandas as pd
+
+# =========================
+#  Moving averages / helpers
+# =========================
+
+def sma(s: pd.Series, win: int) -> pd.Series:
+    return s.rolling(win, min_periods=win).mean()
+
+def ema(s: pd.Series, win: int) -> pd.Series:
+    return s.ewm(span=win, adjust=False, min_periods=win).mean()
+
+def ma(series: pd.Series, win: int, kind: str = "SMA") -> pd.Series:
+    k = (kind or "SMA").upper()
+    return ema(series, win) if k == "EMA" else sma(series, win)
+
+# =========================
+#  Signal generators
+# =========================
+
+def compute_signals_breakout(
+    df: pd.DataFrame,
+    breakout_lookback: int,
+    exit_lookback: int,
+    use_trend_filter: bool = False,
+    trend_ma_window: int = 100,
+    trend_ma_type: str = "SMA",
+) -> pd.DataFrame:
+    hi = df["High"].rolling(breakout_lookback, min_periods=breakout_lookback).max().shift(1)
+    lo = df["Low"].rolling(exit_lookback, min_periods=exit_lookback).min().shift(1)
+    out = pd.DataFrame(index=df.index)
+    out["entry"] = df["Close"] > hi
+    out["exit"]  = df["Close"] < lo
+    if use_trend_filter:
+        tma = ma(df["Close"], trend_ma_window, trend_ma_type)
+        out["trend_ok"] = df["Close"] > tma
+    else:
+        out["trend_ok"] = True
+    return out.fillna(False)
+
+def compute_signals_ma_cross(
+    df: pd.DataFrame,
+    fast: int,
+    slow: int,
+    use_trend_filter: bool = False,
+    trend_ma_window: int = 200,
+    trend_ma_type: str = "SMA",
+) -> pd.DataFrame:
+    f = ma(df["Close"], fast, "SMA")
+    s = ma(df["Close"], slow, "SMA")
+    cross_up = (f > s) & (f.shift(1) <= s.shift(1))
+    cross_dn = (f < s) & (f.shift(1) >= s.shift(1))
+    out = pd.DataFrame(index=df.index)
+    out["entry"] = cross_up
+    out["exit"]  = cross_dn
+    if use_trend_filter:
+        tma = ma(df["Close"], trend_ma_window, trend_ma_type)
+        out["trend_ok"] = df["Close"] > tma
+    else:
+        out["trend_ok"] = True
+    return out.fillna(False)
+
+# =========================
+#  Data loading
+# =========================
+
+def _read_csv_ohlcv(fp: Path, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
+    df = pd.read_csv(fp, sep=None, engine="python")
+    rename = {c: {"date":"Date","open":"Open","high":"High","low":"Low","close":"Close",
+                  "adj close":"Adj Close","volume":"Volume"}.get(c.lower(), c) for c in df.columns}
+    df = df.rename(columns=rename)
+    if "Date" not in df.columns:
+        raise ValueError(f"CSV saknar 'Date' -> {fp}")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    if start: df = df.loc[df.index >= pd.to_datetime(start)]
+    if end:   df = df.loc[df.index <= pd.to_datetime(end)]
+    need = [c for c in ["Open","High","Low","Close"] if c in df.columns]
+    if len(need) < 4:
+        raise ValueError(f"CSV saknar OHLC -> {fp.name}")
+    return df[need].copy()
+
+def load_universe_data(
+    universe: Iterable[str],
+    source: str,
+    start: Optional[str],
+    end: Optional[str],
+) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    if source == "csv":
+        for item in universe:
+            fp = Path(item)
+            if not fp.exists(): continue
+            try:
+                out[fp.stem] = _read_csv_ohlcv(fp, start, end)
+            except Exception:
+                pass
+        return out
+    # Börsdata via vår adapter
+    try:
+        from app.data_providers import get_ohlcv  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"Kan inte importera app.data_providers.get_ohlcv: {e}")
+    for t in universe:
+        try:
+            df = get_ohlcv("borsdata", t, start, end)
+            if df is not None and not df.empty:
+                out[t] = df
+        except Exception:
+            pass
+    return out
+
+# =========================
+#  Portfolio engine
+# =========================
+
+@dataclass
+class PortfolioParams:
+    start_capital: float = 100_000.0
+    per_trade_pct: float = 0.05          # 0.05 = 5% av portföljvärdet vid entry
+    max_positions: int = 5
+    max_exposure_pct: float = 0.25       # mot startkapital
+
+    strategy: str = "breakout"           # 'breakout' | 'ma_cross'
+    breakout_lookback: int = 20
+    exit_lookback: int = 10
+    fast: int = 20
+    slow: int = 50
+
+    use_trend_filter: bool = True
+    trend_ma_window: int = 100
+    trend_ma_type: str = "SMA"
+
+    stop_loss_pct: Optional[float] = 0.08
+    take_profit_pct: Optional[float] = 0.20
+    trailing_stop_pct: Optional[float] = 0.10
+    cooldown_days_after_sl: int = 0
+
+@dataclass
+class Trade:
+    Ticker: str
+    EntryDate: pd.Timestamp
+    ExitDate: pd.Timestamp
+    EntryPrice: float
+    ExitPrice: float
+    Qty: int
+    Return: float
+    PnL: float
+    ExitReason: str
+
+def _to_pct(x: Optional[float]) -> Optional[float]:
+    return None if x is None else float(x)
+
+def _entry_candidates_for_day(signals: Dict[str, pd.DataFrame], date: pd.Timestamp) -> List[str]:
+    out: List[str] = []
+    for t, sig in signals.items():
+        if date in sig.index and bool(sig.at[date, "entry"]) and bool(sig.at[date, "trend_ok"]):
+            out.append(t)
+    return out
+
+def _exit_reasons_for_day(
+    df: pd.DataFrame,
+    sig: pd.DataFrame,
+    date: pd.Timestamp,
+    entry_price: float,
+    peak_price: float,
+    params: PortfolioParams
+) -> Optional[str]:
+    close = float(df.at[date, "Close"])
+    if bool(sig.at[date, "exit"]):
+        return "RuleExit"
+    tp = _to_pct(params.take_profit_pct)
+    if tp is not None and close >= entry_price * (1.0 + tp):
+        return "TakeProfit"
+    sl = _to_pct(params.stop_loss_pct)
+    if sl is not None and close <= entry_price * (1.0 - sl):
+        return "StopLoss"
+    tr = _to_pct(params.trailing_stop_pct)
+    if tr is not None and peak_price > 0 and close <= peak_price * (1.0 - tr):
+        return "TrailingStop"
+    return None
+
+def _sharpe_daily(returns: pd.Series) -> float:
+    r = returns.dropna()
+    if len(r) < 2: return 0.0
+    mu = r.mean()
+    sd = r.std(ddof=0)
+    if sd == 0 or np.isnan(sd): return 0.0
+    return float(mu / sd * math.sqrt(252))
+
+def _max_drawdown(equity: pd.Series) -> float:
+    cummax = equity.cummax()
+    dd = equity / cummax - 1.0
+    return float(dd.min() if len(dd) else 0.0)
+
+def run_portfolio_backtest(
+    universe_data: Dict[str, pd.DataFrame],
+    params: PortfolioParams,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    # 1) Signals
+    signals: Dict[str, pd.DataFrame] = {}
+    for t, df in universe_data.items():
+        if df is None or df.empty: continue
+        if params.strategy == "ma_cross":
+            sig = compute_signals_ma_cross(
+                df, params.fast, params.slow,
+                use_trend_filter=params.use_trend_filter,
+                trend_ma_window=params.trend_ma_window,
+                trend_ma_type=params.trend_ma_type,
+            )
+        else:
+            sig = compute_signals_breakout(
+                df, params.breakout_lookback, params.exit_lookback,
+                use_trend_filter=params.use_trend_filter,
+                trend_ma_window=params.trend_ma_window,
+                trend_ma_type=params.trend_ma_type,
+            )
+        signals[t] = sig
+
+    # 2) Timeline
+    all_dates = sorted(set().union(*[df.index for df in universe_data.values() if df is not None and not df.empty]))
+    if not all_dates:
+        return pd.DataFrame({"Equity": []}), pd.DataFrame([]), {"Strategy": params.strategy, "TotalReturn": 0.0}
+
+    # 3) State
+    start_cap = float(params.start_capital)
+    cash = start_cap
+    positions: Dict[str, Dict[str, Any]] = {}
+    last_sl_exit_date: Dict[str, pd.Timestamp] = {}
+    trades: List[Trade] = []
+    equity_series: List[Tuple[pd.Timestamp, float]] = []
+
+    per_trade = float(params.per_trade_pct)
+    max_expo  = float(params.max_exposure_pct)
+    max_pos   = int(params.max_positions)
+    invested_value = 0.0
+
+    def portfolio_value(dt: pd.Timestamp) -> float:
+        val = cash
+        for t, pos in positions.items():
+            df = universe_data.get(t)
+            if df is None or dt not in df.index: continue
+            val += pos["qty"] * float(df.at[dt, "Close"])
+        return val
+
+    # 4) Iterate days
+    for date in all_dates:
+        # exits first
+        exits_for_day: List[Tuple[str, str, float]] = []
+        for t, pos in list(positions.items()):
+            df = universe_data[t]
+            if date not in df.index: continue
+            close = float(df.at[date, "Close"])
+            pos["peak_price"] = max(pos["peak_price"], close)
+            reason = _exit_reasons_for_day(df, signals[t], date, pos["entry_price"], pos["peak_price"], params)
+            if reason:
+                exits_for_day.append((t, reason, close))
+
+        for t, reason, price in exits_for_day:
+            pos = positions.pop(t, None)
+            if not pos: continue
+            qty = pos["qty"]; entry_p = pos["entry_price"]
+            pnl = (price - entry_p) * qty
+            ret = 0.0 if entry_p == 0 else (price / entry_p - 1.0)
+            cash += price * qty
+            invested_value -= price * qty
+            if invested_value < 0: invested_value = 0.0
+            trades.append(Trade(
+                Ticker=t, EntryDate=pos["entry_date"], ExitDate=date,
+                EntryPrice=entry_p, ExitPrice=price, Qty=qty,
+                Return=ret, PnL=pnl, ExitReason=reason
+            ))
+            if reason == "StopLoss" and params.cooldown_days_after_sl > 0:
+                last_sl_exit_date[t] = date
+
+        # entries up to constraints
+        cands = _entry_candidates_for_day(signals, date)
+        for t in cands:
+            if t in positions: continue
+            df = universe_data[t]
+            if date not in df.index: continue
+
+            if t in last_sl_exit_date and params.cooldown_days_after_sl > 0:
+                if date <= last_sl_exit_date[t] + pd.Timedelta(days=params.cooldown_days_after_sl):
+                    continue
+
+            if len(positions) >= max_pos: break
+
+            current_port_val = portfolio_value(date)
+            current_exposure = invested_value / start_cap if start_cap > 0 else 0.0
+            if current_exposure >= max_expo: break
+
+            alloc_cash_cap = per_trade * current_port_val
+            remaining_expo_cash = max(0.0, max_expo * start_cap - invested_value)
+            size_cash = min(alloc_cash_cap, remaining_expo_cash, cash)
+            price = float(df.at[date, "Close"])
+            qty = int(size_cash // price)
+            if qty <= 0: continue
+
+            cost = qty * price
+            cash -= cost
+            invested_value += cost
+            positions[t] = {
+                "qty": qty, "entry_price": price, "peak_price": price, "entry_date": date
+            }
+
+        equity_series.append((date, portfolio_value(date)))
+
+    # close leftover at end (mark-to-market)
+    if positions:
+        last_date = all_dates[-1]
+        for t, pos in list(positions.items()):
+            df = universe_data[t]
+            if last_date not in df.index: continue
+            price = float(df.at[last_date, "Close"])
+            qty = pos["qty"]
+            pnl = (price - pos["entry_price"]) * qty
+            ret = 0.0 if pos["entry_price"] == 0 else (price / pos["entry_price"] - 1.0)
+            trades.append(Trade(
+                Ticker=t, EntryDate=pos["entry_date"], ExitDate=last_date,
+                EntryPrice=pos["entry_price"], ExitPrice=price, Qty=qty,
+                Return=ret, PnL=pnl, ExitReason="OpenEnd"
+            ))
+        positions.clear()
+
+    equity_df = pd.DataFrame(equity_series, columns=["Date","Equity"]).set_index("Date").sort_index()
+    trades_df = pd.DataFrame([t.__dict__ for t in trades]) if trades else pd.DataFrame(
+        columns=["Ticker","EntryDate","ExitDate","EntryPrice","ExitPrice","Qty","Return","PnL","ExitReason"])
+
+    if not equity_df.empty:
+        daily = equity_df["Equity"].pct_change().fillna(0.0)
+        total_return = float(equity_df["Equity"].iloc[-1] / float(params.start_capital) - 1.0)
+        sharpe_d = _sharpe_daily(daily)
+        maxdd = _max_drawdown(equity_df["Equity"])
+    else:
+        total_return = 0.0; sharpe_d = 0.0; maxdd = 0.0
+
+    if not trades_df.empty:
+        wins   = trades_df[trades_df["PnL"] > 0]["PnL"].sum()
+        losses = trades_df[trades_df["PnL"] < 0]["PnL"].sum()
+        pf = float((wins / abs(losses)) if losses < 0 else (np.inf if wins > 0 else 0.0))
+        winrate = float((trades_df["PnL"] > 0).mean())
+    else:
+        pf = 0.0; winrate = 0.0
+
+    stats = {
+        "Strategy": params.strategy,
+        "TotalReturn": total_return,
+        "MaxDD": maxdd,
+        "SharpeD": sharpe_d,
+        "Trades": int(len(trades_df)),
+        "WinRate": winrate,
+        "PF": pf,
+        "StartCapital": float(params.start_capital),
+        "EndCapital": float(equity_df["Equity"].iloc[-1]) if not equity_df.empty else float(params.start_capital),
+    }
+    return equity_df, trades_df, stats
+
+# =========================
+#  Save helpers
+# =========================
+
+def save_portfolio_result(
+    equity: pd.DataFrame,
+    trades: pd.DataFrame,
+    stats: Dict[str, Any],
+    out_prefix: Path
+) -> Dict[str, Path]:
+    out_prefix = Path(out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    eq_fp = out_prefix.with_suffix(".equity.csv")
+    tr_fp = out_prefix.with_suffix(".trades.csv")
+    st_fp = out_prefix.with_suffix(".stats.json")
+    equity.to_csv(eq_fp)
+    trades.to_csv(tr_fp, index=False)
+    st_fp.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"equity": eq_fp, "trades": tr_fp, "stats": st_fp}
+
+# =========================
+#  CLI
+# =========================
+
+def _as_decimal(x: Optional[float]) -> Optional[float]:
+    return None if x is None else float(x) / 100.0
+
+def main_cli() -> None:
+    p = argparse.ArgumentParser(description="Portfolio backtest")
+    p.add_argument("--source", choices=["borsdata","csv"], required=True)
+    p.add_argument("--universe", required=True, help="Sökväg till .txt (en rad per ticker/CSV) eller kommasep lista")
+    p.add_argument("--start", default=None)
+    p.add_argument("--end", default=None)
+
+    p.add_argument("--capital", type=float, default=100000)
+    p.add_argument("--per-trade", type=float, default=5.0, help="% per affär, ex 5")
+    p.add_argument("--max-exp", type=float, default=25.0, help="Max exponering % av startkapital, ex 25")
+    p.add_argument("--max-pos", type=int, default=5)
+
+    p.add_argument("--strategy", choices=["breakout","ma_cross"], default="breakout")
+    p.add_argument("--bo", type=int, default=20)
+    p.add_argument("--ex", type=int, default=10)
+    p.add_argument("--fast", type=int, default=20)
+    p.add_argument("--slow", type=int, default=50)
+    p.add_argument("--tf", action="store_true")
+    p.add_argument("--tma", type=int, default=100)
+    p.add_argument("--tma-type", choices=["SMA","EMA"], default="SMA")
+
+    p.add_argument("--sl", type=float, default=8.0, help="Stop-loss %, ex 8")
+    p.add_argument("--tp", type=float, default=20.0, help="Take-profit %, ex 20")
+    p.add_argument("--trailing", type=float, default=10.0, help="Trailing stop %, ex 10")
+    p.add_argument("--cool", type=int, default=0, help="Cooldown dagar efter SL")
+
+    p.add_argument("--out-prefix", default=str(Path("outputs/portfolio/run").resolve()))
+    args = p.parse_args()
+
+    # Universe
+    f = Path(args.universe)
+    if f.exists() and f.is_file():
+        txt = f.read_text(encoding="utf-8", errors="ignore")
+        items = [line.strip() for line in txt.splitlines() if line.strip()]
+    else:
+        items = [s.strip() for s in args.universe.split(",") if s.strip()]
+
+    data = load_universe_data(items, args.source, args.start, args.end)
+
+    pp = PortfolioParams(
+        start_capital=float(args.capital),
+        per_trade_pct=float(args.per_trade)/100.0,
+        max_positions=int(args.max_pos),
+        max_exposure_pct=float(args.max_exp)/100.0,
+        strategy=args.strategy,
+        breakout_lookback=int(args.bo), exit_lookback=int(args.ex),
+        fast=int(args.fast), slow=int(args.slow),
+        use_trend_filter=bool(args.tf),
+        trend_ma_window=int(args.tma), trend_ma_type=str(args.tma_type),
+        stop_loss_pct=_as_decimal(args.sl),
+        take_profit_pct=_as_decimal(args.tp),
+        trailing_stop_pct=_as_decimal(args.trailing),
+        cooldown_days_after_sl=int(args.cool),
+    )
+
+    eq, tr, st = run_portfolio_backtest(data, pp)
+    outp = save_portfolio_result(eq, tr, st, Path(args.out_prefix))
+    print("[OK] Saved:")
+    for k, v in outp.items():
+        print(f"  {k}: {v}")
+    print("Stats:", json.dumps(st, ensure_ascii=False, indent=2))
+
+if __name__ == "__main__":
+    main_cli()
+'@
+$code | Set-Content .\app\portfolio_backtest.py -Encoding UTF8

@@ -1,0 +1,59 @@
+{
+  "selector": {
+    "slots_per_day": 2,
+    "weights": {
+      "total_return": 0.2173913043478261,
+      "win_rate": 0.13043478260869565,
+      "recent_momentum": 0.08695652173913045,
+      "breakout_z": 0.15217391304347827,
+      "trend_over_atr": 0.10869565217391305,
+      "rel_strength_20d": 0.08695652173913045,
+      "freshness": 0.04347826086956522,
+      "liquidity": 0.04347826086956522,
+      "corr_penalty": 0.08695652173913045,
+      "sector_penalty": 0.04347826086956522
+    },
+    "filters": {
+      "min_days_since_last_exit": 0,
+      "exclude": []
+    },
+    "tiebreaker": "liquidity_then_cap",
+    "mode": "simple",
+    "caps": {
+      "correlation_cap": 0.85,
+      "sector_cap": 0.4,
+      "allow_pyramiding": false,
+      "backlog_days": 3
+    }
+  },
+  "caps": {
+    "correlation_cap": 0.85,
+    "sector_cap": 0.4,
+    "allow_pyramiding": false,
+    "backlog_days": 3
+  },
+  "panic_rule": {
+    "enabled": true,
+    "index_ticker": "OMXS30GI",
+    "trigger": "daily_change",
+    "threshold": -0.05,
+    "cooloff_days": 1,
+    "reentry_relief": -0.03
+  },
+  "portfolio": {
+    "start_date": "2023-10-13"
+  },
+  "position_limits": {
+    "max_position_pct": 0.2,
+    "max_gross_leverage": 1.0
+  },
+  "signal_strength": {
+    "enabled": false,
+    "method": "sma_atr",
+    "sma_window": 50,
+    "atr_window": 14,
+    "mult_min": 0.5,
+    "mult_max": 1.5
+  },
+  "leverage_whitelist": {}
+}

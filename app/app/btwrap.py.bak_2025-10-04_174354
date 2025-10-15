@@ -1,0 +1,72 @@
+# -*- coding: utf-8 -*-
+import inspect
+
+def _pick_run_fn(obj):
+    # obj kan vara modul, tuple, eller callable
+    if callable(obj):
+        return obj
+    # om tuple: leta namngivna först
+    if isinstance(obj, tuple):
+        for it in obj:
+            if not hasattr(it, "__name__"):  # kan vara modul/klass
+                continue
+            nm = getattr(it, "__name__", "").lower()
+            if nm in ("run_backtest","backtest","simulate","run"):
+                if callable(it):
+                    return it
+        for it in obj:
+            if callable(it):
+                try:
+                    sig = inspect.signature(it)
+                    if len(sig.parameters) in (1,2):
+                        return it
+                except Exception:
+                    pass
+        # leta på ett ev. modulobjekt i tuplen
+        for it in obj:
+            fn = _pick_run_fn(getattr(it, "run_backtest", None) or
+                              getattr(it, "backtest", None) or
+                              getattr(it, "simulate", None) or
+                              getattr(it, "run", None))
+            if fn: return fn
+        return None
+    # modul?
+    for name in ("run_backtest","backtest","simulate","run"):
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+def _pick_params(obj):
+    # Returnera Params-klassen om vi hittar den (annars None)
+    cand = None
+    if isinstance(obj, tuple):
+        for it in obj:
+            if inspect.isclass(it) and getattr(it, "__name__", "").lower() == "params":
+                return it
+        for it in obj:
+            if hasattr(it, "Params") and inspect.isclass(getattr(it, "Params")):
+                return getattr(it, "Params")
+        return None
+    cand = getattr(obj, "Params", None)
+    return cand if inspect.isclass(cand) else None
+
+def run_backtest(df=None, p=None):
+    # dalatrader: se till att df finns via loader
+    try:
+        _p = locals().get('p') if 'p' in locals() else globals().get('p')
+        _ticker=_fd=_td=None
+        if isinstance(_p, dict):
+            _ticker = (_p.get('ticker') or '').strip()
+            _params = _p.get('params') or {}
+            _fd = _params.get('from_date') or _p.get('from_date')
+            _td = _params.get('to_date') or _p.get('to_date')
+        if df is None and _ticker:
+            _df_try = _load_df_any_alias(_ticker, _fd, _td)
+            if _df_try is not None:
+                df = _df_try
+    except Exception as _e:
+        print('[btwrap] pre-data hook error:', type(_e).__name__, _e)
+    """Hämtar backtest-modulen via _import_backtest() och kör det bästa vi hittar."""
+    from app.portfolio_signals import _import_backtest
+

@@ -1,0 +1,117 @@
+from __future__ import annotations
+from typing import Optional, Dict, Any, List
+import os, json, time
+import pandas as pd
+import requests
+
+# TEMP: hårdkodad nyckel – byt till .env senare
+_BD_KEY = "85218870c1744409b0624920db023ba8"
+
+_BASE = "https://apiservice.borsdata.se"
+_INSTR_PATH = "/v1/instruments"
+_PRICE_ONE  = "/v1/instruments/{insId}/stockprices"
+_PRICE_ARR  = "/v1/instruments/stockprices"  # instList=...
+
+_CACHE_DIR = os.path.join("/srv/trader", "storage")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+_INSTR_CACHE = os.path.join(_CACHE_DIR, "_borsdata_instruments.json")
+_INSTR_TTL = 24*3600
+
+def _http_json(url: str, params: Dict[str, Any]) -> Dict[str, Any] | List[Dict[str, Any]]:
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def _load_instruments() -> pd.DataFrame:
+    try:
+        if os.path.exists(_INSTR_CACHE) and (time.time() - os.path.getmtime(_INSTR_CACHE) < _INSTR_TTL):
+            with open(_INSTR_CACHE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = _http_json(_BASE + _INSTR_PATH, params={"authKey": _BD_KEY})
+            with open(_INSTR_CACHE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+    except Exception:
+        data = {}
+    items = data.get("instruments") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        items = []
+    df = pd.DataFrame(items)
+    for col in ("ticker","insId"):
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df[["insId","ticker"]].dropna().astype({"insId":"int"}).drop_duplicates()
+
+def _find_insid(ticker: str) -> int | None:
+    df = _load_instruments()
+    if df.empty: return None
+    t = ticker.strip().upper().replace(" ", "_")
+    m = df[df["ticker"].str.upper().str.replace(" ", "_") == t]
+    if not m.empty:
+        return int(m.iloc[0]["insId"])
+    return None
+
+def _rows_from_price_payload(data) -> List[Dict[str, Any]]:
+    """Returnera listan av OHLCV-poster oavsett om svaret är one/array-variant."""
+    if isinstance(data, dict):
+        # one-instrument: {"instrument":2, "stockPricesList":[{...}, ...]}
+        if "stockPricesList" in data and isinstance(data["stockPricesList"], list):
+            return data["stockPricesList"]
+        # array-variant: {"stockPricesArrayList":[{"instrument":2,"stockPricesList":[...]}, ...]}
+        if "stockPricesArrayList" in data and isinstance(data["stockPricesArrayList"], list):
+            for item in data["stockPricesArrayList"]:
+                if isinstance(item, dict) and isinstance(item.get("stockPricesList"), list):
+                    return item["stockPricesList"]
+    elif isinstance(data, list):
+        return data
+    return []
+
+def get_ohlcv(ticker: str, start: Optional[str]=None, end: Optional[str]=None, freq: str="1d") -> pd.DataFrame:
+    """EOD från Börsdata -> DataFrame(Open,High,Low,Close,Volume) med Date-index."""
+    insId = _find_insid(ticker)
+    if not insId:
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+    params = {"authKey": _BD_KEY}
+    if start: params["from"] = start
+    if end:   params["to"]   = end
+    params["maxCount"] = 50000
+
+    # Försök single-endpoint först
+    try:
+        data = _http_json(_BASE + _PRICE_ONE.format(insId=insId), params=params)
+        rows = _rows_from_price_payload(data)
+        if not rows:
+            # fallback: array-endpoint
+            data2 = _http_json(_BASE + _PRICE_ARR, params={"authKey": _BD_KEY, "instList": str(insId), **({"from": start} if start else {}), **({"to": end} if end else {})})
+            rows = _rows_from_price_payload(data2)
+    except Exception:
+        rows = []
+
+    if not rows:
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+
+    recs = []
+    for r in rows:
+        d = r.get("d") or r.get("date") or r.get("Date")
+        if not d: continue
+        try:
+            day = pd.to_datetime(d).normalize()
+        except Exception:
+            continue
+        o = r.get("o") or r.get("Open")
+        h = r.get("h") or r.get("High")
+        l = r.get("l") or r.get("Low")
+        c = r.get("c") or r.get("Close")
+        v = r.get("v") or r.get("Volume")
+        recs.append({"Date": day, "Open": o, "High": h, "Low": l, "Close": c, "Volume": v})
+
+    df = pd.DataFrame.from_records(recs).dropna(subset=["Close"])
+    if df.empty:
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+    df = df.sort_values("Date").set_index("Date")
+    # typa numeriskt
+    for col in ["Open","High","Low","Close","Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if end:
+        df = df[df.index <= pd.to_datetime(end).normalize()]
+    return df

@@ -1,0 +1,174 @@
+﻿from __future__ import annotations
+import json, datetime as dt
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import pandas as pd
+import streamlit as st
+
+from app.data_providers import get_ohlcv
+from app.backtest import run_backtest as run_bt
+
+# ---------- Data ----------
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    x = df.copy()
+    if "Date" not in x.columns:
+        idx = x.index.name or "Date"
+        x = x.reset_index().rename(columns={idx: "Date"})
+    x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
+    for c in ("Open","High","Low","Close","Volume"):
+        if c in x.columns: x[c] = pd.to_numeric(x[c], errors="coerce")
+    return x.dropna(subset=["Date","Close"]).sort_values("Date").reset_index(drop=True)
+
+def fetch_df(ticker: str, start: str, end: str) -> pd.DataFrame:
+    return normalize_df(get_ohlcv(ticker=ticker, start=start, end=end, source="borsdata"))
+
+# ---------- Profiler ----------
+def canonicalize_profiles(obj: Any, fallback_ticker: str) -> List[Dict[str, Any]]:
+    """
+    Accepterar:
+      - {"profiles":[{name,ticker,params}, ...]}
+      - [{...params...}]
+      - {...params...}
+    Returnerar alltid en lista av {"name","ticker","params"}.
+    """
+    profiles: List[Dict[str,Any]] = []
+
+    if isinstance(obj, dict) and "profiles" in obj and isinstance(obj["profiles"], list):
+        # redan korrekt
+        for it in obj["profiles"]:
+            if not isinstance(it, dict): continue
+            name  = it.get("name") or f"{fallback_ticker} â€“ profile"
+            tick  = it.get("ticker") or fallback_ticker
+            params = dict(it.get("params") or {})
+            profiles.append({"name": name, "ticker": tick, "params": params})
+        return profiles
+
+    if isinstance(obj, list):
+        for i, p in enumerate(obj):
+            if isinstance(p, dict):
+                profiles.append({"name": f"{fallback_ticker} â€“ p{i+1}", "ticker": fallback_ticker, "params": dict(p)})
+        return profiles
+
+    if isinstance(obj, dict):
+        # Enkelt legacy: bara param-dict
+        profiles.append({"name": f"{fallback_ticker} â€“ p1", "ticker": fallback_ticker, "params": dict(obj)})
+        return profiles
+
+    return profiles
+
+# ---------- UI ----------
+st.set_page_config(page_title="Dalatrader â€” Backtracker", layout="wide")
+st.title("Backtracker (JSON-profiler)")
+
+today = dt.date.today()
+col0, col1, col2, col3 = st.columns([1,1,1,1])
+with col0:
+    ticker = st.text_input("Ticker", "VOLV B")
+with col1:
+    start = st.text_input("Start (YYYY/MM/DD)", "2020/01/01")
+with col2:
+    end = st.text_input("Slut (YYYY/MM/DD)", today.strftime("%Y/%m/%d"))
+with col3:
+    preset = st.selectbox("FÃ¶rvalda perioder", ["Ingen","2020â€“2025","2022â€“2025","2020â€“2021"])
+    if preset == "2020â€“2025": start, end = "2020/01/01", today.strftime("%Y/%m/%d")
+    if preset == "2022â€“2025": start, end = "2022/01/01", today.strftime("%Y/%m/%d")
+    if preset == "2020â€“2021": start, end = "2020/01/01", "2021/12/31"
+
+st.subheader("Profiler")
+uploader = st.file_uploader("Ladda upp JSON (profiler)", type=["json"])
+txt = st.text_area("Eller klistra in JSON hÃ¤r (valfritt)")
+
+# Snabbval: listar filer som Optimizer sparat
+root = Path(__file__).resolve().parents[1]
+opt_dir = root / "outputs" / "opt_results"
+opt_files = sorted([p for p in opt_dir.glob("*_best_backtrack.json")])
+sel = st.selectbox("Eller vÃ¤lj en sparad fil (frÃ¥n Optimizer)", ["(ingen)"]+[p.name for p in opt_files])
+
+profiles: List[Dict[str,Any]] = []
+src_note = ""
+
+if uploader is not None:
+    try:
+        obj = json.loads(uploader.getvalue().decode("utf-8"))
+        profiles = canonicalize_profiles(obj, ticker)
+        src_note = f"Uppladdad fil: {uploader.name}"
+    except Exception as e:
+        st.error(f"Kunde inte tolka uppladdad JSON: {e}")
+
+elif txt.strip():
+    try:
+        obj = json.loads(txt)
+        profiles = canonicalize_profiles(obj, ticker)
+        src_note = "JSON frÃ¥n text-rutan"
+    except Exception as e:
+        st.error(f"Kunde inte tolka inklistrad JSON: {e}")
+
+elif sel != "(ingen)":
+    try:
+        p = opt_dir / sel
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        profiles = canonicalize_profiles(obj, ticker)
+        src_note = f"Sparad fil: {p}"
+    except Exception as e:
+        st.error(f"Kunde inte lÃ¤sa sparad fil: {e}")
+
+if profiles:
+    st.success(f"Hittade {len(profiles)} profiler ({src_note}).")
+    with st.expander("Visar profiler (tolkade)"):
+        st.json({"profiles": profiles})
+else:
+    st.info("Ladda eller vÃ¤lj profiler fÃ¶r att kÃ¶ra.")
+
+# KÃ¶rning
+df = pd.DataFrame()
+if st.button("Fetch data"):
+    try:
+        df = fetch_df(ticker, start, end)
+        st.session_state["df_bt"] = df
+        st.success(f"Laddade {len(df)} rader. Period: {df['Date'].iloc[0].date()} â†’ {df['Date'].iloc[-1].date()}")
+        st.dataframe(df.tail(5, width='stretch'), width='stretch')
+    except Exception as e:
+        st.error(f"Kunde inte ladda/stÃ¤da data: {e}")
+
+df = st.session_state.get("df_bt", pd.DataFrame())
+
+if st.button("KÃ¶r backtest pÃ¥ alla profiler"):
+    if df.empty:
+        st.warning("HÃ¤mta data fÃ¶rst.")
+    elif not profiles:
+        st.warning("Inga profiler.")
+    else:
+        rows = []
+        for p in profiles:
+            name  = p.get("name","profile")
+            tick  = p.get("ticker", ticker)
+            pars  = dict(p.get("params") or {})
+            try:
+                res = run_bt(df.copy(), **pars)
+                sm  = res.get("summary", {}) or {}
+                out = {
+                    "Profile": name,
+                    "Ticker": tick,
+                    "Trades": int(sm.get("Trades",0) or 0),
+                    "TotalReturn%": float(sm.get("TotalReturnPct", sm.get("TotalReturn",0))) if "TotalReturnPct" in sm else float(sm.get("TotalReturn",0))*100,
+                    "MaxDD%": float(sm.get("MaxDD",0))*100 if abs(float(sm.get("MaxDD",0))) < 2 else float(sm.get("MaxDD",0)),
+                    "SharpeD": float(sm.get("SharpeD",0)),
+                    "FinalEquity": float(sm.get("FinalEquity",0)),
+                }
+                rows.append(out)
+                # Visa detaljer per profil
+                with st.expander(f"Result: {name}"):
+                    st.json(sm)
+                    trades = res.get("trades")
+                    if isinstance(trades, pd.DataFrame) and not trades.empty:
+                        keep = [c for c in ["EntryTime","EntryPrice","ExitTime","ExitPrice","PnL","reason"] if c in trades.columns]
+                        st.dataframe(trades[keep].tail(50, width='stretch'), width='stretch')
+            except Exception as e:
+                rows.append({"Profile": name, "Ticker": tick, "Error": str(e)})
+        st.subheader("SammanstÃ¤llning")
+        if rows:
+            st.dataframe(pd.DataFrame(rows, width='stretch'), width='stretch')
+
+
+

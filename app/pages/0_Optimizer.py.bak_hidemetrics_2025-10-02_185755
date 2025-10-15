@@ -1,0 +1,865 @@
+from __future__ import annotations
+# === injected header: ensure period-clipping helpers exist ====================
+# === injected header: ensure period-clipping helpers exist ====================
+try:
+    _clip_to_period  # type: ignore[name-defined]
+except NameError:
+    import streamlit as st
+# --- dalatrader: disable charts on optimizer ---
+def __dt_nochart(*_args, **_kwargs):
+    return None
+try:
+    # gör graffunktioner till no-op (visar inget och beräknar inget)
+    st.line_chart = __dt_nochart
+    st.altair_chart = __dt_nochart
+    st.area_chart = __dt_nochart
+except Exception:
+    pass
+# --- /disable charts ---
+    def _opt_period():
+        """Hämta start/stop-datum (förhands/opt) från session_state."""
+        fd = str(st.session_state.get('from_date') or st.session_state.get('opt_from') or '').strip()
+        td = str(st.session_state.get('to_date') or st.session_state.get('opt_to') or '').strip()
+        return fd, td
+
+    def _clip_to_period(df):
+        """Klipp en pandas.DataFrame till [from_date, to_date] om möjligt."""
+        try:
+            import pandas as _pd
+            fd, td = _opt_period()
+            if not hasattr(df, 'index'):
+                return df
+            idx = df.index
+            if not isinstance(idx, _pd.DatetimeIndex):
+                try:
+                    idx = _pd.to_datetime(idx)
+                except Exception:
+                    return df
+            start = _pd.to_datetime(fd) if fd else None
+            end   = _pd.to_datetime(td) if td else None
+            if start is not None:
+                df = df.loc[idx >= start]
+            if end is not None:
+                df = df.loc[idx <= end]
+            return df
+        except Exception:
+            return df
+
+    _clip_df = _clip_to_period
+# ==========================================================================
+
+try:
+    _clip_to_period  # type: ignore[name-defined]
+except NameError:
+    import streamlit as st
+    def _opt_period():
+        """Hämta start/stop-datum (förhands/opt) från session_state."""
+        fd = str(st.session_state.get("from_date") or
+                 st.session_state.get("opt_from") or "").strip()
+        td = str(st.session_state.get("to_date") or
+                 st.session_state.get("opt_to") or "").strip()
+        return fd, td
+
+    def _clip_to_period(df):
+        """Klipp en pandas.DataFrame till [from_date, to_date] om möjligt."""
+        try:
+            import pandas as _pd
+            fd, td = _opt_period()
+            if not hasattr(df, "index"):
+                return df
+            idx = df.index
+            if not isinstance(idx, _pd.DatetimeIndex):
+                try:
+                    idx = _pd.to_datetime(idx)
+                except Exception:
+                    return df
+            start = _pd.to_datetime(fd) if fd else None
+            end   = _pd.to_datetime(td) if td else None
+            if start is not None:
+                df = df.loc[idx >= start]
+            if end is not None:
+                df = df.loc[idx <= end]
+            return df
+        except Exception:
+            return df
+
+    # Bakåtkompatibelt alias
+    _clip_df = _clip_to_period
+# ============================================================================
+
+# -*- coding: utf-8 -*-
+
+import json, time, random, pathlib
+from datetime import date, timedelta
+from typing import Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# === preview window helpers (idempotent) =====================================
+def _get_preview_window():
+    """
+    Returnerar (start, end) som str YYYY-MM-DD för förhandsgranskningen.
+    Prioritet:
+      1) st.session_state["opt_from"], ["opt_to"] från senaste opt-körning
+      2) st.session_state["from_date"], ["to_date"] (fält i UI)
+      3) params i vald profil (om st.session_state._pending_profile tillförts)
+      4) fallback: 5 år bakåt till idag
+    """
+    import pandas as pd
+    import datetime as dt
+    s = st.session_state
+
+    def _norm(x):
+        if not x:
+            return ""
+        # acceptera "YYYY-MM-DD" eller "YYYY/MM/DD"
+        x = str(x).replace("/", "-").strip()
+        try:
+            return pd.to_datetime(x).date().isoformat()
+        except Exception:
+            return ""
+
+    # 1) senaste opt-körning (vi sparar ofta dessa i session)
+    opt_from = _norm(s.get("opt_from"))
+    opt_to   = _norm(s.get("opt_to"))
+    if opt_from and opt_to:
+        return opt_from, opt_to
+
+    # 2) direkta fält i UI
+    fd = _norm(s.get("from_date"))
+    td = _norm(s.get("to_date"))
+    if fd and td:
+        return fd, td
+
+    # 3) från ev. pending profil i session (om någon lyftes in)
+    prof = s.get("_pending_profile") or {}
+    params = prof.get("params") or {}
+    fd = _norm(params.get("from_date") or prof.get("from_date") or prof.get("start"))
+    td = _norm(params.get("to_date")   or prof.get("to_date")   or prof.get("end"))
+    if fd and td:
+        return fd, td
+
+    # 4) fallback 5 år bakåt
+    today = dt.date.today()
+    fd = (today - dt.timedelta(days=365*5)).isoformat()
+    td = today.isoformat()
+    return fd, td
+
+
+def _clip_df(df):
+    """Klipper en DataFrame/Series till previewfönstret om möjligt."""
+    import pandas as pd
+    if df is None:
+        return df
+    if not hasattr(df, "index"):
+        return df
+    try:
+        start, end = _get_preview_window()
+        # säkerställ datetimeindex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            # försök hitta Date-kolumn
+            if "Date" in getattr(df, "columns", []):
+                df = df.set_index("Date")
+        if not isinstance(df.index, pd.DatetimeIndex):
+            # sista chans: försök konvertera index
+            df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df.sort_index()
+        mask = (df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))
+        return df.loc[mask]
+    except Exception:
+        return df
+# === /preview window helpers ==================================================
+
+# --- helper: clip any Series/DataFrame to current optimizer period ---
+# def _clip_to_period(obj):
+#     try:
+#         import pandas as pd
+#         fd = pd.to_datetime(st.session_state.get("from_date") or st.session_state.get("start"))
+#         td = pd.to_datetime(st.session_state.get("to_date")   or st.session_state.get("end"))
+#         if fd is None or td is None:
+#             return obj
+#         # Series
+#         if hasattr(obj, "index") and not hasattr(obj, "columns"):
+#             try:
+#                 return obj.loc[(obj.index >= fd) & (obj.index <= td)]
+#             except Exception:
+#                 return obj
+#         # DataFrame
+#         if hasattr(obj, "index") and hasattr(obj, "columns"):
+#             try:
+#                 return obj.loc[(obj.index >= fd) & (obj.index <= td)]
+#             except Exception:
+#                 return obj
+#     except Exception:
+#         pass
+#     return obj
+# 
+# 
+# # ensure ticker exists in session_state if old key was used
+# if "ticker" not in st.session_state and "opt_ticker" in st.session_state:
+#     st.session_state["ticker"] = (st.session_state.get("opt_ticker") or "").strip()
+# 
+# 
+# 
+# # === PREVIEW HOOK (capturar resultat-DataFrame) ===
+# try:
+#     import streamlit as _st_hook
+#     if not _st_hook.session_state.get("_OPT_PREVIEW_DF_HOOK_INSTALLED"):
+#         _st_orig_dataframe = _st_hook.dataframe
+        def _st_dataframe_hook(obj, *a, **k):
+            try:
+                if hasattr(obj, "columns") and "SharpeD" in list(getattr(obj, "columns", [])):
+                    # Spara undan DF för preview
+                    _st_hook.session_state["_opt_preview_df"] = obj
+            except Exception:
+                pass
+            return _st_orig_dataframe(obj, *a, **k)
+        _st_hook.dataframe = _st_dataframe_hook
+        _st_hook.session_state["_OPT_PREVIEW_DF_HOOK_INSTALLED"] = True
+try:
+    pass
+except Exception as _e_hook:
+    pass
+    print("[opt-preview] kunde inte installera dataframe-hook:", type(_e_hook).__name__, _e_hook)
+# === /PREVIEW HOOK ===
+
+# Branding (frivillig)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title="Dala Trader – Optimizer", page_icon="⚙️")
+st.title("⚙️ Optimizer")
+st.caption("Optimerar tre strategier per ticker över valt intervall. Hämtar OHLCV en gång och kör allt lokalt för fart.")
+
+# ---- Imports för motorerna
+from app.data_providers import get_ohlcv as GET_OHLCV
+from backtest import run_backtest as RUN_BT
+
+# ---- Hjälp
+def ur(rng: random.Random, a: float, b: float) -> float:
+    return a + (b - a) * rng.random()
+
+def make_params(rng: random.Random) -> Dict[str, Any]:
+    use_trend_filter = bool(rng.getrandbits(1))
+    use_macd_filter  = bool(rng.getrandbits(1))
+    use_bb_filter    = bool(rng.getrandbits(1))
+    use_stop_loss    = bool(rng.getrandbits(1))
+    use_atr_trailing = bool(rng.getrandbits(1))
+    trend_ma_type    = rng.choice(["SMA","EMA"])
+    return {
+        "use_rsi_filter": True,
+        "rsi_window": rng.randint(8, 32),
+        "rsi_min": ur(rng, 5.0, 35.0),
+        "rsi_max": ur(rng, 60.0, 85.0),
+
+        "use_trend_filter": use_trend_filter,
+        "trend_ma_type": trend_ma_type,
+        "trend_ma_window": rng.randint(20, 200),
+
+        "breakout_lookback": rng.randint(20, 120),
+        "exit_lookback":     rng.randint(10, 60),
+
+        "use_macd_filter": use_macd_filter,
+        "macd_fast":   rng.randint(8, 16),
+        "macd_slow":   rng.randint(18, 30),
+        "macd_signal": rng.randint(8, 14),
+
+        "use_bb_filter": use_bb_filter,
+        "bb_window": rng.randint(15, 30),
+        "bb_nstd":   ur(rng, 1.6, 2.4),
+        "bb_min":    ur(rng, 0.0, 0.8),
+
+        "use_stop_loss": use_stop_loss,
+        "stop_mode": rng.choice(["pct","atr"]),
+        "stop_loss_pct": ur(rng, 0.03, 0.20),
+
+        "atr_window": rng.randint(10, 20),
+        "atr_mult":   ur(rng, 1.2, 3.2),
+
+        "use_atr_trailing": use_atr_trailing,
+        "atr_trail_mult":   ur(rng, 1.2, 3.5),
+    }
+
+def score(metrics: Dict[str, Any]) -> float:
+    tr = float(metrics.get("TotalReturn") or 0.0)
+    sh = float(metrics.get("SharpeD") or 0.0)
+    mdd = float(metrics.get("MaxDD") or 0.0)  # negativt tal
+    return 2.0*tr + 1.0*sh + 0.5*(-mdd)
+
+def five_year_window():
+    end = date.today()
+    start = end - timedelta(days=365*5 + 2)
+    return start, end
+
+@st.cache_data(show_spinner=False)
+def load_ohlcv_cached(ticker: str, start: str, end: str) -> pd.DataFrame:
+    df = GET_OHLCV(ticker=ticker, start=start, end=end)
+    return df
+
+def run_optimizer_ui(ticker: str, sims: int, seed: int, start: str, end: str):
+    t0 = time.time()
+    df = load_ohlcv_cached(ticker, start, end)
+    if df is None or len(getattr(df, "index", [])) == 0:
+        st.error("Tomt OHLCV för perioden.")
+        return
+
+    rng = random.Random(seed)
+    best: List[Tuple[float, Dict[str,Any], Dict[str,Any]]] = []
+    prog = st.progress(0)
+    status = st.empty()
+
+    for i in range(1, sims+1):
+        p = make_params(rng)
+        p["from_date"] = start
+        p["to_date"]   = end
+        try:
+            res = RUN_BT(df, p)
+            m = res.get("summary", {}) if isinstance(res, dict) else {}
+            s = score(m)
+            best.append((s, p, m))
+            if len(best) > 16:
+                best.sort(key=lambda x: x[0], reverse=True)
+                best = best[:16]
+        except Exception as e:
+            # svälj enstaka fel
+            pass
+
+        if (i % max(1, sims//100)) == 0 or i == sims:
+            prog.progress(int(i*100/sims))
+            status.text(f"Kör sim {i}/{sims} …")
+
+    best.sort(key=lambda x: x[0], reverse=True)
+    top = best[:3]
+    names = ["conservative", "balanced", "aggressive"]
+    profiles = []
+    for idx, (s, p, m) in enumerate(top):
+        profiles.append({
+            "name": f"{ticker} – {names[idx]}",
+            "ticker": ticker,
+            "params": p,
+            "metrics": m,
+        })
+
+    outdir = pathlib.Path("profiles")
+    outdir.mkdir(parents=True, exist_ok=True)
+    outfile = outdir / f"{ticker}.json"
+    outfile.write_text(json.dumps({"profiles": profiles}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    st.success(f"Klar. Sparade {len(profiles)} profiler → {outfile}")
+    # visa tabell
+    rows = []
+    for pr in profiles:
+        m = pr.get("metrics", {})
+        rows.append({
+            "Name": pr.get("name",""),
+            "TotalReturn": m.get("TotalReturn"),
+            "SharpeD": m.get("SharpeD"),
+            "MaxDD": m.get("MaxDD"),
+            "Trades": m.get("Trades"),
+            "FinalEquity": m.get("FinalEquity"),
+            "BuyHold": m.get("BuyHold"),
+        })
+    st.dataframe(pd.DataFrame(rows))
+
+    # applicera bästa till sessionen
+    best_params = profiles[0]["params"] if profiles else None
+    if best_params and st.button(f"✅ Använd bästa för {ticker} i Backtest"):
+        for k, v in best_params.items():
+            st.session_state[k] = v
+        st.session_state["ticker"] = ticker
+        st.success("Applicerat till session. Gå till Backtest och kör.")
+
+# ---------- UI-kontroller ----------
+col1, col2, col3, col4 = st.columns([1.1,1,1,1])
+with col1:
+    ticker = st.text_input("Ticker", value=st.session_state.get("ticker","GETI B")).strip()
+    # sync ticker widget -> session_state
+    st.session_state["ticker"] = (ticker or "").strip()
+
+with col2:
+    sims = st.number_input("Antal simuleringar", min_value=100, max_value=100_000, value=1000, step=100)
+with col3:
+    seed = st.number_input("Seed", min_value=0, max_value=1_000_000, value=42, step=1)
+with col4:
+    last5 = st.checkbox("5 år bakåt (auto)", value=True)
+
+if last5:
+    s, e = five_year_window()
+    start, end = s.isoformat(), e.isoformat()
+else:
+    s = st.date_input("Start", value=five_year_window()[0])
+    e = st.date_input("Slut", value=five_year_window()[1])
+    start, end = s.isoformat(), e.isoformat()
+
+st.markdown("---")
+if st.button("🚀 Kör optimering"):
+    if not ticker:
+        st.error("Ange en ticker.")
+    else:
+        run_optimizer_ui(ticker, int(sims), int(seed), start, end)
+else:
+    st.info("Tips: börja med 1 000–2 000 simuleringar. Öka när det ser rimligt ut.")
+
+# --- OPT PREVIEW CHART BLOCK ---
+import datetime as _dt
+from app.btwrap import run_backtest as _RUNBT
+from app.data_providers import get_ohlcv as _GET_OHLCV
+import pandas as _pd
+
+# === Datumväljare (påverkar optimering och graf) ===
+# === Hjälpare för att plocka params ur state ===
+def _collect_params_from_state():
+    s = st.session_state
+    keys = [
+        "from_date","to_date",
+        "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+        "use_trend_filter","trend_ma_type","trend_ma_window",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal",
+        "use_bb_filter","bb_window","bb_nstd","bb_min",
+        "use_stop_loss","stop_mode","stop_loss_pct",
+        "atr_window","atr_mult",
+        "use_atr_trailing","atr_trail_mult",
+    ]
+    out = {}
+    for k in keys:
+        if k in s:
+            out[k] = s[k]
+    # Fallbacks
+    if not out.get("from_date") and "opt_from_date" in s:
+        out["from_date"] = str(s["opt_from_date"])
+    if not out.get("to_date") and "opt_to_date" in s:
+        out["to_date"] = str(s["opt_to_date"])
+    return out
+
+def _norm_equity_from_close(df):
+    if df is None or not isinstance(df, _pd.DataFrame) or "Close" not in df.columns:
+        return _pd.Series(dtype=float)
+    s = _pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if s.empty:
+        return s
+    return s / s.iloc[0]
+
+# === Förhands-graf: Strategi vs Buy&Hold vs OMXS30 ===
+st.markdown("### 📈 Förhandsgranskning (nuvarande inställningar)")
+_ticker = (st.session_state.get("ticker") or st.session_state.get("TICKER") or "").strip()
+_index  = (st.session_state.get("index_ticker") or "OMXS30").strip()
+
+col1, col2 = st.columns(2)
+with col1:
+    st.caption("Ticker: **{}**  |  Index: **{}**".format(_ticker or "–", _index))
+with col2:
+    st.caption("Period: **{} → {}**".format(st.session_state.get("from_date","?"), st.session_state.get("to_date","?")))
+
+if _ticker:
+    try:
+        _params = _collect_params_from_state()
+        # Strategi
+        _res = _RUNBT(_ticker, _params)
+        _eq  = _res.get("equity")
+        if isinstance(_eq, _pd.DataFrame) and {"Date","Equity"}.issubset(_eq.columns):
+            strat = _eq.set_index("Date")["Equity"]
+            strat = strat / strat.iloc[0]
+        else:
+            strat = _pd.Series(dtype=float)
+
+        # Buy&Hold (ticker) och OMXS30
+        _start = _params.get("from_date"); _end = _params.get("to_date")
+        px_t = _GET_OHLCV(_ticker, start=_start, end=_end)
+        px_i = _GET_OHLCV(_index,  start=_start, end=_end)
+        bh   = _norm_equity_from_close(px_t).rename("Buy&Hold")
+        idx = _clip_df(_norm_equity_from_close(px_i).rename(_index))
+
+        # Sammanslagning
+        df_plot = _pd.concat(
+            [strat.rename("Strategi"), bh, idx],
+            axis=1
+        ).dropna(how="all")
+        if not df_plot.empty:
+            st.line_chart(_clip_df(_clip_to_period(df_plot)))
+            # Snabb sammanfattning
+            last = df_plot.iloc[-1]
+            c1, c2, c3 = st.columns(3)
+            if "Strategi" in last:
+                c1.metric("Strategi slutvärde", "{:.2f}x".format(last["Strategi"]))
+            else:
+                c1.metric("Strategi slutvärde", "—")
+            if "Buy&Hold" in last:
+                c2.metric("Buy&Hold slutvärde", "{:.2f}x".format(last["Buy&Hold"]))
+            else:
+                c2.metric("Buy&Hold slutvärde", "—")
+            if _index in last:
+                c3.metric("{} slutvärde".format(_index), "{:.2f}x".format(last[_index]))
+            else:
+                c3.metric("{} slutvärde".format(_index), "—")
+        else:
+            st.info("Ingen data att plotta för vald period/inställningar.")
+    except Exception as _e:
+        import traceback as _tb
+        st.warning("Förhandsgranskning misslyckades: {}: {}".format(type(_e).__name__, _e))
+        st.code(_tb.format_exc())
+else:
+    st.info("Ange en ticker i Optimizern för att se grafen.")
+# --- /OPT PREVIEW CHART BLOCK ---
+
+
+# === _SHOW_OPTIMIZER_PREVIEW_BLOCK ===
+import streamlit as _st
+import pandas as _pd
+
+def _opt_norm(_s):
+    if _s is None or len(_s)==0: return _s
+    s = _pd.Series(_s).astype(float)
+    return s / s.iloc[0] if s.iloc[0] else s
+
+def _opt_get_close(_ticker, _start, _end):
+    try:
+        from app.data import get_ohlcv as _GET
+    except Exception:
+        try:
+            from app.sources import get_ohlcv as _GET
+        except Exception:
+            return _pd.Series(dtype="float64")
+    try:
+        df = _GET(_ticker, start=_start, end=_end)
+    except TypeError:
+        df = _GET(_ticker, _start, _end)
+    except Exception:
+        return _pd.Series(dtype="float64")
+    if df is None or len(df)==0: return _pd.Series(dtype="float64")
+    for c in ("Close","close","Adj Close","adjclose","adj_close","Price","price","last"):
+        if c in df.columns:
+            s = _pd.Series(df[c].values, index=_pd.to_datetime(df.index)).sort_index()
+            return s
+    try:
+        s = _pd.Series(df.values, index=_pd.to_datetime(df.index)).sort_index()
+        return s
+    except Exception:
+        return _pd.Series(dtype="float64")
+
+def _opt_try_run_bt(_ticker, _params):
+    try:
+        from app.btwrap import run_backtest as _RUNBT
+    except Exception as e:
+        return None, None, e
+    # variant 1
+    try:
+        out = _RUNBT({"ticker": _ticker, "params": _params})
+        if isinstance(out, tuple) and len(out)>=2 and hasattr(out[1], "iloc"):
+            return out[0], out[1], None
+        if isinstance(out, dict) and isinstance(out.get("equity") or out.get("Equity"), _pd.DataFrame):
+            return out.get("summary") or out, (out.get("equity") or out.get("Equity")), None
+    except Exception as e:
+        last = e
+    else:
+        last = None
+    # variant 2
+    try:
+        out = _RUNBT(_ticker, _params)
+        if isinstance(out, tuple) and len(out)>=2 and hasattr(out[1], "iloc"):
+            return out[0], out[1], None
+        if isinstance(out, dict) and isinstance(out.get("equity") or out.get("Equity"), _pd.DataFrame):
+            return out.get("summary") or out, (out.get("equity") or out.get("Equity")), None
+    except Exception as e:
+        last = e
+    return None, None, last
+
+def _show_optimizer_preview():
+    df = _st.session_state.get("_opt_preview_df")
+    if df is None or len(df)==0:
+        return  # inget att visa än
+    ticker = (_st.session_state.get("ticker") or "").strip()
+    start  = str(_st.session_state.get("from_date") or _st.session_state.get("start") or "")
+    end    = str(_st.session_state.get("to_date")   or _st.session_state.get("end")   or "")
+    if not (ticker and start and end):
+        return
+
+    # Sortera bästa rad
+    dfx = df.copy()
+    for c in ("SharpeD","TotalReturn"):
+        if c not in dfx.columns:
+            dfx[c] = _pd.NA
+    dfx = dfx.sort_values(by=["SharpeD","TotalReturn"], ascending=[False, False])
+    row = dfx.iloc[0]
+
+    # Params (från 'params'-kolumn om den finns)
+    params = {}
+    if "params" in row and isinstance(row["params"], dict):
+        params = dict(row["params"])
+    else:
+        for k in ["use_rsi_filter","rsi_window","rsi_min","rsi_max","use_trend_filter","trend_ma_type","trend_ma_window",
+                  "breakout_lookback","exit_lookback","use_macd_filter","macd_fast","macd_slow","macd_signal",
+                  "use_bb_filter","bb_window","bb_nstd","bb_min","use_stop_loss","stop_mode","stop_loss_pct",
+                  "atr_window","atr_mult","use_atr_trailing","atr_trail_mult"]:
+            if k in dfx.columns and _pd.notna(row.get(k)):
+                params[k] = row[k]
+
+    # Kör backtest → equity
+    summary, eq, err = _opt_try_run_bt(ticker, params)
+    _st.markdown("### Förhandsgranskning")
+    if err is not None:
+        _st.warning(f"Förhands-backtest misslyckades: {type(err).__name__}: {err}")
+        return
+    if eq is None or "Equity" not in eq.columns:
+        _st.info("Ingen equity-serie tillgänglig för förhandsgranskning.")
+        return
+
+    strat = _opt_norm(eq["Equity"].rename("Strategi"))
+    bh = _opt_norm(_opt_get_close(ticker, start, end)).rename("Buy&Hold")
+    idx = _opt_norm(_opt_get_close("OMXS30", start, end)).rename("OMXS30 (index)")
+
+    dd = _clip_df(_pd.concat([strat, bh, idx], axis=1).dropna(how="all").sort_index())
+    if dd.empty:
+        _st.info("Saknar prisdata för att rita graf.")
+        return
+
+    _st.caption(f"Ticker: {ticker} | Index: OMXS30 — Period: {start} → {end}")
+    _st.line_chart(_clip_df(_clip_to_period(dd)))
+
+# Rendera preview allra sist (efter att DataFrame har visats)
+try:
+    _show_optimizer_preview()
+except Exception as _e_prev:
+    print("[opt-preview] preview-fel:", type(_e_prev).__name__, _e_prev)
+# === /_SHOW_OPTIMIZER_PREVIEW_BLOCK ===
+
+
+# --- OPT_PREVIEW_CHART ---
+# Förhandsgranskning: Strategi vs Buy&Hold vs OMX30
+# - Hittar ticker automatiskt (session → profiler)
+# - Kör backtest på bästa profilen i profiles/<TICKER>.json
+# - Ritar jämförelse mot Buy&Hold och OMX30 (yfinance om möjligt)
+
+import pandas as pd
+import streamlit as st
+from pathlib import Path as _Path
+
+# safe-imports
+try:
+    from app.btwrap import run_backtest as _RUNBT  # vår wrapper runt backtest
+except Exception as _e:
+    _RUNBT = None
+    st.warning("[Preview] Kunde inte importera run_backtest: %s: %s" % (type(_e).__name__, _e))
+
+def _opt_guess_ticker() -> str:
+    # 1) försök från session med vanliga nycklar
+    for k in ("ticker","opt_ticker","srv_ticker","symbol","ticker_input"):
+        v = st.session_state.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # 2) försök via senaste profilfilen i profiles/
+    base = _Path("/srv/trader/app/profiles") if _Path("/srv/trader/app/profiles").exists() else _Path("profiles")
+    try:
+        files = sorted(base.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if files:
+            # läs ticker ur filen om den finns
+            import json
+            with open(files[0], "r", encoding="utf-8") as f:
+                data = json.load(f)
+            profs = data.get("profiles", [])
+            if profs:
+                t = (profs[0].get("ticker") or "").strip()
+                if t:
+                    return t
+            # annars ta filnamnets stem
+            return files[0].stem
+    except Exception:
+        pass
+    return ""
+
+def _preview_find_profiles_file(ticker: str | None) -> _Path | None:
+    base = _Path("/srv/trader/app/profiles") if _Path("/srv/trader/app/profiles").exists() else _Path("profiles")
+    if ticker:
+        cand = base / f"{ticker}.json"
+        if cand.exists():
+            return cand
+    # fallback: senaste *.json
+    files = sorted(base.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+def _preview_load_best_params(prof_path: _Path):
+    try:
+        import json
+        with open(prof_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        profiles = data.get("profiles", [])
+        if not profiles:
+            return None
+        # anta att index 0 = bäst
+        return profiles[0].get("params") or {}
+    except Exception as e:
+        st.warning("[Preview] Kunde inte läsa %s: %s: %s" % (prof_path.name, type(e).__name__, e))
+        return None
+
+def _preview_load_index_series(sym: str, start: str | None, end: str | None, label: str):
+    try:
+        import yfinance as yf
+    except Exception:
+        return None
+    try:
+        df = yf.download(sym, start=start, end=end, progress=False)
+        if not isinstance(df, pd.DataFrame) or df.empty or "Close" not in df:
+            return None
+        s = (df["Close"] / df["Close"].iloc[0]).rename(label)
+        s.index = pd.to_datetime(s.index)
+        return s
+    except Exception:
+        return None
+
+def _preview_plot():
+    ticker = _opt_guess_ticker()
+    fd = st.session_state.get("from_date") or None
+    td = st.session_state.get("to_date") or None
+
+    
+
+#                 def _clip_to_period(df: _pd.DataFrame, from_date: str, to_date: str) -> _pd.DataFrame:
+#                     if df is None or not isinstance(df, _pd.DataFrame) or df.empty:
+#                         return df
+#                     out = df.copy()
+#                     # Normalize index to DatetimeIndex if possible
+#                     if not isinstance(out.index, _pd.DatetimeIndex):
+#                         if "Date" in out.columns:
+#                             out = out.set_index(_pd.to_datetime(out["Date"], errors="coerce"))
+#                         else:
+#                             out.index = _pd.to_datetime(out.index, errors="coerce")
+#                     if from_date:
+#                         out = out[out.index >= _pd.to_datetime(from_date, errors="coerce")]
+#                     if to_date:
+#                         out = out[out.index <= _pd.to_datetime(to_date, errors="coerce")]
+#                     return out
+#         
+#                 # Only try to plot if we have a ticker and params
+#                 if _ticker and _params:
+#                     try:
+#                         # 1) Run backtest on best params
+#                         from app.btwrap import run_backtest as __RUNBT
+#                         _params["from_date"] = _from or _params.get("from_date")
+#                         _params["to_date"]   = _to   or _params.get("to_date")
+#                         _res = __RUNBT({"ticker": _ticker, "params": _params})
+#                         _eq  = _res.get("equity")
+#                         if isinstance(_eq, _pd.DataFrame) and not _eq.empty:
+#                             _eq = _eq.rename(columns={"Equity":"Strategy"}).copy()
+#                         else:
+#                             _st.warning("Ingen equitykurva från backtest – kan inte rita strategi.")
+#                             _eq = None
+#         
+#                         # 2) Build Buy&Hold from the same price series used in backtest
+#                         #    We’ll fetch OHLCV and cumulate close/first_close to an index
+#                         from app.data_providers import get_ohlcv as __GET
+#                         _px = __GET(_ticker, start=_params.get("from_date"), end=_params.get("to_date"))
+#                         _bh = None
+#                         if isinstance(_px, _pd.DataFrame) and not _px.empty:
+#                             # Normalize columns
+#                             cols = {c:str(c).strip().lower() for c in _px.columns}
+#                             _px = _px.rename(columns=cols)
+#                             price_col = "close" if "close" in _px.columns else list(_px.columns)[0]
+#                             base = _px[price_col].iloc[0]
+#                             if base and base == base:  # not NaN
+#                                 _bh = _clip_df((_px[price_col] / base).rename("Buy&Hold").to_frame())
+#                                 _bh.index = _pd.to_datetime(_px.index)
+#                         else:
+#                             _st.info("Kunde inte bygga Buy&Hold – saknar prisdata.")
+#         
+#                         # 3) Get OMXS30 (or configurable) over same period
+#                         idx_ticker = _st.session_state.get("__opt_index__", "OMXS30")
+#                         _idx = None
+#                         try:
+#                             _ix = _clip_df(__GET(idx_ticker, start=_params.get("from_date"), end=_params.get("to_date")))
+#                             if isinstance(_ix, _pd.DataFrame) and not _ix.empty:
+#                                 cols = {c:str(c).strip().lower() for c in _ix.columns}
+#                                 _ix = _ix.rename(columns=cols)
+#                                 price_col = "close" if "close" in _ix.columns else list(_ix.columns)[0]
+#                                 base = _ix[price_col].iloc[0]
+#                                 if base and base == base:
+#                                     _idx = _clip_df((_ix[price_col] / base).rename(f"{idx_ticker} (index)").to_frame())
+#                                     _idx.index = _pd.to_datetime(_ix.index)
+#                         except Exception as _e:
+#                             _st.info(f"Kunde inte hämta index ({idx_ticker}): {type(_e).__name__}: {_e}")
+#         
+#                         # 4) Assemble plot frame
+#                         frames = []
+#                         if _eq is not None and not _eq.empty:
+#                             frames.append(_eq.set_index(_pd.to_datetime(_eq["Date"]))[["Strategy"]] if "Date" in _eq.columns else _eq[["Strategy"]])
+#                         if _bh is not None and not _bh.empty:
+#                             frames.append(_bh)
+#                         if _idx is not None and not _idx.empty:
+#                             frames.append(_idx)
+#         
+#                         if frames:
+#                             _df_plot = _pd.concat(frames, axis=1)
+#                             _df_plot = _clip_to_period(_df_plot, _from, _to)
+#                             _df_plot = _df_plot.sort_index()
+#                             # Drop columns that don’t exist to avoid blank chart
+#                             _df_plot = _clip_df(_df_plot[[c for c in ["Strategy","Buy&Hold",f"{idx_ticker} (index)"] if c in _df_plot.columns]])
+#                             if not _df_plot.empty:
+#                                 _st.line_chart(_clip_df(_df_plot))
+#                             else:
+#                                 _st.info("Inget att rita efter filtrering.")
+#                         else:
+#                             _st.info("Saknar kurvor för att rita jämförelse.")
+#                     except Exception as _e:
+#                         import traceback as _tb
+#                         _st.error(f"Misslyckades att rita jämförelse: {type(_e).__name__}: {_e}")
+#                         _st.code(_tb.format_exc())
+#                 else:
+#                     _st.info("Kör en optimering först (eller välj en sparad payload) för att kunna visa grafen.")
+#         # === /OPTIMIZER comparison chart ===
+#         
+#     # --- /Disabled ---
+#     # --- /Disabled ---
+# 
+# # --- Disabled legacy block: best preview graph ---
+def __opt_best_preview_disabled():
+    """disabled block placeholder"""
+    pass
+
+
+# --- clean _clip_to_period implementation (appended) ---
+def _clip_to_period(df, from_date: str, to_date: str):
+    """
+    Klipper en DataFrame till [from_date, to_date] på index eller 'Date'-kolumn.
+    Robust: faller tillbaka till oförändrad df vid fel.
+    """
+    try:
+        import pandas as pd
+        if df is None:
+            return pd.DataFrame()
+        # Copy för säker mutation
+        _df = df.copy()
+
+        # Hitta tidaxel
+        if "Date" in getattr(_df, "columns", []):
+            idx = pd.to_datetime(_df["Date"], errors="coerce")
+            use_col = True
+        else:
+            idx = pd.to_datetime(getattr(_df, "index", pd.Index([])), errors="coerce")
+            use_col = False
+
+        # Bygg masker
+        m_from = pd.Series(True, index=range(len(idx)))
+        m_to   = pd.Series(True, index=range(len(idx)))
+        if from_date:
+            m_from = idx >= pd.to_datetime(from_date, errors="coerce")
+        if to_date:
+            m_to   = idx <= pd.to_datetime(to_date, errors="coerce")
+        m = (m_from & m_to).fillna(False)
+
+        # Applicera
+        if use_col:
+            return _df.loc[m.values]
+        else:
+            return _df.loc[m.to_numpy()]
+    except Exception:
+        return df
+# --- /clean _clip_to_period ---
+# --- dalatrader_disable_preview ---
+def _preview_plot():
+    """disabled at runtime by dalatrader_disable_preview"""
+    return
+# --- /dalatrader_disable_preview ---

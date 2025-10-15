@@ -1,0 +1,87 @@
+import json
+from pathlib import Path
+import pandas as pd
+import streamlit as st
+
+from app import btwrap as W
+from app.trade_extract import to_trades_df
+from app.portfolio_engine import (
+    signals_from_trades_df, fetch_prices, simulate_constant_fraction, buyhold_equal_weight
+)
+from app.data_providers import get_ohlcv
+
+st.set_page_config(page_title="Portfolio V2 – 1/3-regel", layout="wide")
+st.title("📈 Portfolio V2 – 1/3-regel (ingen belåning)")
+
+# Välj profiler
+all_files = sorted([str(p) for p in Path("profiles").glob("*.json")])
+sel_files = st.multiselect("Profilfiler (profiles/*.json)", all_files, default=all_files[:3])
+
+if not sel_files:
+    st.info("Välj minst en profilfil.")
+    st.stop()
+
+# Plocka bästa profilen i varje fil (högst TotalReturn), kör backtest och hämta signaler
+signals = []
+tickers = []
+start_dates = []
+
+for f in sel_files:
+    data = json.loads(Path(f).read_text(encoding="utf-8"))
+    profs = data.get("profiles") or []
+    if not profs: continue
+    # bäst på TotalReturn
+    profs = sorted(profs, key=lambda p: (p.get("metrics") or {}).get("TotalReturn", 0.0), reverse=True)
+    p = profs[0]
+    ticker = p.get("ticker") or (p.get("params") or {}).get("ticker")
+    params = dict(p.get("params") or {})
+    start_dates.append(params.get("from_date"))
+    st.caption(f"**{ticker}** – använder profil: *{p.get('name')}*")
+    res = W.run_backtest(p={"ticker": ticker, "params": params})
+    trades = to_trades_df((res.get("trades", None) if res.get("trades", None) is not None else res))
+    sig = signals_from_trades_df(trades, ticker=ticker, profile=p.get("name") or ticker)
+    signals.append(sig)
+    tickers.append(ticker)
+
+if not signals:
+    st.error("Hittade inga signaler.")
+    st.stop()
+
+signals = pd.concat(signals, ignore_index=True)
+start = min([d for d in start_dates if d], default="2020-01-01")
+
+# Priser för alla tickers + OMXS30GI
+prices = fetch_prices(tickers, start=start)
+idx = get_ohlcv("OMXS30GI", start=str(prices.index[0].date()), end=None)[["Close"]].dropna()
+idx.index = pd.to_datetime(idx.index).normalize()
+idx = idx.reindex(prices.index).ffill()["Close"].rename("OMXS30GI")
+
+# Kör portföljsim
+eq, ledger = simulate_constant_fraction(signals, prices, start_cash=100_000.0, fraction=1/3)
+bh = buyhold_equal_weight(prices, start_cash=100_000.0)
+
+# Normalisera till multiplar (x)
+df_plot = pd.concat([
+    (eq/eq.iloc[0]).rename("Portfolio"),
+    (bh/bh.iloc[0]).rename("Buy&Hold"),
+    (idx/idx.iloc[0]).rename("OMXS30GI")
+], axis=1).dropna(how="all")
+
+# Visa
+st.line_chart(df_plot)
+
+m = {
+    "Portfolio_final": float(df_plot["Portfolio"].iloc[-1]) if "Portfolio" in df_plot else None,
+    "BuyHold_final":   float(df_plot["Buy&Hold"].iloc[-1])  if "Buy&Hold" in df_plot else None,
+    "Index_final":     float(df_plot["OMXS30GI"].iloc[-1])  if "OMXS30GI" in df_plot else None,
+}
+c1,c2,c3 = st.columns(3)
+c1.metric("Portfolio", f"{m['Portfolio_final']:.2f}×" if m["Portfolio_final"] else "—")
+c2.metric("Buy & Hold", f"{m['BuyHold_final']:.2f}×" if m["BuyHold_final"] else "—")
+c3.metric("OMXS30GI", f"{m['Index_final']:.2f}×" if m["Index_final"] else "—")
+
+with st.expander("📒 Utförda affärer (simulerade med 1/3-regel)"):
+    if not ledger.empty:
+        st.dataframe(ledger.reset_index().rename(columns={"index":"date"}))
+    else:
+        st.write("Inga affärer.")

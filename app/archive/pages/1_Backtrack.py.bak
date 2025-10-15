@@ -1,0 +1,657 @@
+﻿from __future__ import annotations
+import json
+import io
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
+import datetime as dt
+
+import pandas as pd
+import streamlit as st
+
+# Egna moduler
+import app.portfolio_backtest as PB
+from app.portfolio_backtest import PortfolioParams
+
+LOGO_PATH = Path(__file__).resolve().parents[1] / "assets" / "logo.svg"
+st.set_page_config(page_title="Backtrack", layout="wide")
+
+# Orange primärknapp (matcha brand)
+st.markdown(
+    """
+<style>
+button[kind="primary"], button[data-testid="baseButton-secondary"] {
+  background: #FF7A1A !important;
+  color: #111 !important;
+  border: 0 !important;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# ==========
+# PRESETS
+# ==========
+# Minsta möjliga indikatorer per papper för reproducerbarhet.
+PRESETS: Dict[str, Dict[str, Any]] = {
+    # ABB – ma_cross med 10/100, ingen trend -> replikerar ~139–141% ROI-caset
+    "ABB": {
+        "strategy": "ma_cross",
+        "trend_on": False,
+        "trend_type": "EMA",
+        "trend_win": 0,
+        "ma_fast": 10,
+        "ma_slow": 100,
+        # stäng allt annat
+        "rsi_on": False, "rsi_win": 14, "rsi_min": 30.0, "rsi_max": 70.0,
+        "macd_on": False, "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "macd_mode": "above_zero",
+        "bb_on": False, "bb_window": 20, "bb_nstd": 2.0, "bb_mode": "exit_below_mid", "bb_pb_min": 0.8,
+        "atr_win": 14, "atr_stop": 0.0, "atr_trail": 0.0,
+        "cost_bps": 0.0, "cash_rate": 0.0, "max_pos": 1, "max_exp": 100.0, "per_trade_pct": 100.0,
+    },
+    # VOLV B – RSI(10) 35→75 med trendfilter EMA150 (vinnare vi hittade)
+    "VOLV B": {
+        "strategy": "rsi",
+        "trend_on": True,
+        "trend_type": "EMA",
+        "trend_win": 150,
+        "rsi_on": True, "rsi_win": 10, "rsi_min": 35.0, "rsi_max": 75.0,
+        # övrigt av
+        "ma_fast": 15, "ma_slow": 100,
+        "macd_on": False, "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "macd_mode": "above_zero",
+        "bb_on": False, "bb_window": 20, "bb_nstd": 2.0, "bb_mode": "exit_below_mid", "bb_pb_min": 0.8,
+        "atr_win": 14, "atr_stop": 0.0, "atr_trail": 0.0,
+        "cost_bps": 0.0, "cash_rate": 0.0, "max_pos": 1, "max_exp": 100.0, "per_trade_pct": 100.0,
+    },
+}
+
+
+def _init_state_once() -> None:
+    if st.session_state.get("_bt_init"):
+        return
+    st.session_state["_bt_init"] = True
+
+    # Endast Börsdata-läge här
+    st.session_state.setdefault("tickers_text", "ABB\nVOLV B")
+
+    # Datum
+    st.session_state.setdefault("start", pd.to_datetime("2020-01-01").date())
+    st.session_state.setdefault("end", pd.to_datetime("today").date())
+
+    # Strategi & parametrar
+    st.session_state.setdefault("strategy", "ma_cross")  # ma_cross | rsi | breakout
+
+    # Trend
+    st.session_state.setdefault("trend_on", True)
+    st.session_state.setdefault("trend_type", "EMA")  # EMA | SMA
+    st.session_state.setdefault("trend_win", 200)
+
+    # MA-cross
+    st.session_state.setdefault("ma_fast", 15)
+    st.session_state.setdefault("ma_slow", 100)
+
+    # RSI
+    st.session_state.setdefault("rsi_on", False)
+    st.session_state.setdefault("rsi_win", 14)
+    st.session_state.setdefault("rsi_min", 30.0)
+    st.session_state.setdefault("rsi_max", 70.0)
+
+    # Breakout
+    st.session_state.setdefault("bo_lb", 55)
+    st.session_state.setdefault("bo_exit_lb", 20)
+
+    # MACD
+    st.session_state.setdefault("macd_on", False)
+    st.session_state.setdefault("macd_fast", 12)
+    st.session_state.setdefault("macd_slow", 26)
+    st.session_state.setdefault("macd_signal", 9)
+    st.session_state.setdefault("macd_mode", "above_zero")
+
+    # Bollinger
+    st.session_state.setdefault("bb_on", False)
+    st.session_state.setdefault("bb_window", 20)
+    st.session_state.setdefault("bb_nstd", 2.0)
+    st.session_state.setdefault("bb_mode", "exit_below_mid")
+    st.session_state.setdefault("bb_pb_min", 0.8)
+
+    # ATR-stopp
+    st.session_state.setdefault("atr_win", 14)
+    st.session_state.setdefault("atr_stop", 0.0)
+    st.session_state.setdefault("atr_trail", 0.0)
+
+    # Kostnader / pos
+    st.session_state.setdefault("cost_bps", 0.0)
+    st.session_state.setdefault("cash_rate", 0.0)
+    st.session_state.setdefault("max_pos", 1)
+    st.session_state.setdefault("max_exp", 100.0)
+    st.session_state.setdefault("per_trade_pct", 100.0)
+
+_init_state_once()
+
+# Header
+cols = st.columns([1, 6])
+with cols[0]:
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), use_column_width=True)
+with cols[1]:
+    st.title("Backtrack – Börsdata")
+
+
+# =========================
+#  ROBUST Börsdata-laddare
+# =========================
+def _try_get_ohlcv_positional(func, t: str, s: Optional[str], e: Optional[str]):
+    s_date = None if s is None else dt.date.fromisoformat(s)
+    e_date = None if e is None else dt.date.fromisoformat(e)
+
+    variants = [
+        (t, s, e),
+        (t, s, None),
+        (t, None, e),
+        (t, None, None),
+        (t,),
+        (t, s_date, e_date),
+        (t, s_date, None),
+        (t, None, e_date),
+    ]
+    last_err = None
+    for args in variants:
+        try:
+            return func(*args), None  # type: ignore
+        except TypeError as te:
+            last_err = te
+        except Exception as ex:
+            last_err = ex
+    return None, last_err
+
+
+def _fetch_borsdata_universe(tickers: List[str], start, end) -> Dict[str, pd.DataFrame]:
+    s, e = str(start), str(end)
+    get_funcs = []
+    try:
+        from app.data_providers import get_ohlcv as dp_get  # type: ignore
+        get_funcs.append(dp_get)
+    except Exception:
+        pass
+    try:
+        from app.bd_modern_client import get_ohlcv as modern_get  # type: ignore
+        get_funcs.append(modern_get)
+    except Exception:
+        pass
+    try:
+        from app.bd_legacy_client import get_ohlcv as legacy_get  # type: ignore
+        get_funcs.append(legacy_get)
+    except Exception:
+        pass
+
+    if not get_funcs:
+        st.error("Hittar ingen get_ohlcv-funktion i app.data_providers / bd_modern_client / bd_legacy_client.", icon="❌")
+        return {}
+
+    out: Dict[str, pd.DataFrame] = {}
+    for t in tickers:
+        df = None
+        last_err = None
+        for f in get_funcs:
+            df, last_err = _try_get_ohlcv_positional(f, t, s, e)
+            if df is not None:
+                break
+
+        if df is None or getattr(df, "empty", True):
+            st.warning(f"{t}: kunde inte hämta data. Senaste fel: {last_err}", icon="⚠️")
+            continue
+
+        # Säkerställ index/kolumner
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.sort_values("Date").set_index("Date")
+
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            if c not in df.columns:
+                if c == "Volume":
+                    df[c] = 0.0
+                else:
+                    df[c] = df["Close"]
+
+        out[t] = df
+    return out
+
+
+# =========================
+#   SIDOPANEL (parametrar)
+# =========================
+with st.sidebar:
+    st.header("Data & intervall (Börsdata)")
+    st.caption("En ticker per rad. Ex: ABB, VOLV B, ERIC B")
+    st.text_area("Tickers", key="tickers_text", height=140)
+
+    c1, c2 = st.columns(2)
+    c1.date_input("Start", key="start")
+    c2.date_input("Slut", key="end")
+
+    st.divider()
+    st.header("Strategi (manuell körning)")
+    st.selectbox("Typ", ["ma_cross", "rsi", "breakout"], key="strategy")
+
+    if st.session_state["strategy"] == "ma_cross":
+        c1, c2 = st.columns(2)
+        c1.number_input("EMA snabb", 2, 300, key="ma_fast")
+        c2.number_input("EMA långsam", 5, 400, key="ma_slow")
+    elif st.session_state["strategy"] == "rsi":
+        st.toggle("Aktivera RSI-filter", key="rsi_on", value=True)
+        r1, r2, r3 = st.columns(3)
+        r1.number_input("RSI-fönster", 2, 200, key="rsi_win")
+        r2.number_input("RSI min (enter)", 0.0, 100.0, key="rsi_min")
+        r3.number_input("RSI max (exit)", 0.0, 100.0, key="rsi_max")
+    elif st.session_state["strategy"] == "breakout":
+        b1, b2 = st.columns(2)
+        b1.number_input("Lookback (HH)", 2, 400, key="bo_lb")
+        b2.number_input("Exit lookback (LL)", 2, 400, key="bo_exit_lb")
+
+    st.divider()
+    st.header("Filter")
+    st.toggle("Trendfilter", key="trend_on", value=True)
+    f1, f2 = st.columns(2)
+    f1.selectbox("MA-typ", ["EMA", "SMA"], key="trend_type")
+    f2.number_input("Trend MA-fönster", 0, 500, key="trend_win")  # 0 = inget filter
+
+    st.toggle("MACD-filter", key="macd_on", value=False)
+    m1, m2, m3 = st.columns(3)
+    m1.number_input("MACD fast", 2, 200, key="macd_fast")
+    m2.number_input("MACD slow", 2, 400, key="macd_slow")
+    m3.number_input("MACD signal", 1, 100, key="macd_signal")
+    st.selectbox("MACD-läge", ["above_zero", "signal_cross"], key="macd_mode")
+
+    st.toggle("Bollinger", key="bb_on", value=False)
+    bb1, bb2 = st.columns(2)
+    bb1.number_input("BB window", 2, 400, key="bb_window")
+    bb2.number_input("BB nstd", 0.5, 5.0, key="bb_nstd")
+    st.selectbox("BB-läge", ["exit_below_mid", "close_above_upper", "%B_gt"], key="bb_mode")
+    if st.session_state["bb_mode"] == "%B_gt":
+        st.number_input("%B min", 0.0, 1.5, key="bb_pb_min")
+
+    st.divider()
+    st.header("Stops & kostnader")
+    a1, a2, a3 = st.columns(3)
+    a1.number_input("ATR window", 2, 200, key="atr_win")
+    a2.number_input("ATR Stop x", 0.0, 10.0, key="atr_stop")
+    a3.number_input("ATR Trail x", 0.0, 10.0, key="atr_trail")
+
+    k1, k2, k3 = st.columns(3)
+    k1.number_input("Courtage (bps)", 0.0, 100.0, key="cost_bps")
+    k2.number_input("Kontoränta APY", 0.0, 0.25, key="cash_rate")
+    k3.number_input("Max pos", 1, 50, key="max_pos")
+    x1, x2 = st.columns(2)
+    x1.number_input("Max exponering %", 1.0, 100.0, key="max_exp")
+    x2.number_input("% per affär", 1.0, 100.0, key="per_trade_pct")
+
+run_btn = st.sidebar.button("🚀 Kör backtest (manuellt)", width='stretch')
+
+left, right = st.columns([2, 3], gap="large")
+
+
+def _get(key: str, default):
+    return st.session_state.get(key, default)
+
+
+def _build_params() -> PortfolioParams:
+    return PortfolioParams(
+        strategy=_get("strategy", "ma_cross"),
+        use_trend_filter=bool(_get("trend_on", True)) if int(_get("trend_win", 200)) > 0 else False,
+        trend_ma_type=_get("trend_type", "EMA"),
+        trend_ma_window=int(_get("trend_win", 200)),
+        fast=int(_get("ma_fast", 15)),
+        slow=int(_get("ma_slow", 100)),
+        use_rsi_filter=bool(_get("rsi_on", False)),
+        rsi_window=int(_get("rsi_win", 14)),
+        rsi_min=float(_get("rsi_min", 30.0)),
+        rsi_max=float(_get("rsi_max", 70.0)),
+        breakout_lookback=int(_get("bo_lb", 55)),
+        exit_lookback=int(_get("bo_exit_lb", 20)),
+        use_macd_filter=bool(_get("macd_on", False)),
+        macd_fast=int(_get("macd_fast", 12)),
+        macd_slow=int(_get("macd_slow", 26)),
+        macd_signal=int(_get("macd_signal", 9)),
+        macd_mode=_get("macd_mode", "above_zero"),
+        use_bb_filter=bool(_get("bb_on", False)),
+        bb_window=int(_get("bb_window", 20)),
+        bb_nstd=float(_get("bb_nstd", 2.0)),
+        bb_mode=_get("bb_mode", "exit_below_mid"),
+        bb_percent_b_min=float(_get("bb_pb_min", 0.8)),
+        atr_window=int(_get("atr_win", 14)),
+        atr_stop_mult=float(_get("atr_stop", 0.0)),
+        atr_trail_mult=float(_get("atr_trail", 0.0)),
+        cost_bps=float(_get("cost_bps", 0.0)),
+        cash_rate_apy=float(_get("cash_rate", 0.0)),
+        max_positions=int(_get("max_pos", 1)),
+        per_trade_pct=float(_get("per_trade_pct", 100.0)),
+        max_exposure_pct=float(_get("max_exp", 100.0)),
+    )
+
+
+with left:
+    st.subheader("Universum (Börsdata)")
+    tickers = [t.strip() for t in _get("tickers_text", "ABB\nVOLV B").splitlines() if t.strip()]
+    st.write("Tickers:", ", ".join(tickers) if tickers else "—")
+
+with right:
+    st.subheader("Resultat (manuell körning)")
+
+if run_btn:
+    try:
+        start = _get("start", pd.to_datetime("2020-01-01").date())
+        end = _get("end", pd.to_datetime("today").date())
+
+        universe = _fetch_borsdata_universe(tickers, start, end)
+        if not universe:
+            st.error("Ingen data laddades – kontrollera tickers och Börsdata-nyckel.", icon="❌")
+        else:
+            params = _build_params()
+            equity, trades, stats = PB.run_portfolio_backtest(universe, params)
+
+            # KPI
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total Return", f"{stats['TotalReturn']*100:,.2f}%")
+            k2.metric("Max Drawdown", f"{stats['MaxDD']*100:,.2f}%")
+            k3.metric("Sharpe (D)", f"{stats['SharpeD']:.2f}")
+            k4.metric("Dagar", f"{stats['LengthDays']}")
+
+            # Equity-chart
+            st.line_chart(equity)
+
+            # Per ticker
+            with st.expander("Per-ticker stats", expanded=False):
+                rows = []
+                for t, s in (stats.get("per_ticker") or {}).items():
+                    rows.append(
+                        {
+                            "Ticker": t,
+                            "TotalReturn%": round(s["TotalReturn"] * 100, 2),
+                            "MaxDD%": round(s["MaxDD"] * 100, 2),
+                            "SharpeD": round(s["SharpeD"], 2),
+                            "Dagar": s["LengthDays"],
+                        }
+                    )
+                if rows:
+                    st.dataframe(pd.DataFrame(rows))
+
+            # Export
+            exp1, exp2 = st.columns(2)
+            with io.BytesIO() as buf:
+                equity.to_csv(buf, encoding="utf-8-sig")
+                exp1.download_button(
+                    "Ladda ned equity.csv", buf.getvalue(), file_name="equity.csv", mime="text/csv"
+                )
+            with io.BytesIO() as buf2:
+                trades.to_csv(buf2, encoding="utf-8-sig")
+                exp2.download_button(
+                    "Ladda ned trades.csv", buf2.getvalue(), file_name="trades.csv", mime="text/csv"
+                )
+
+            st.caption(f"PB-version: {stats.get('__version__','?')}")
+    except Exception as e:
+        st.error(f"Fel vid körning: {e}", icon="❌")
+
+
+# ======================================
+#   MA-OPTIMERARE i UI:t (minimalism)
+# ======================================
+st.divider()
+st.header("🔎 MA-optimerare (minimal indikatoruppsättning)")
+
+c1, c2, c3 = st.columns(3)
+fast_grid = c1.text_input("Fast EMA (komma-separerat)", "10,15,20")
+slow_grid = c2.text_input("Långsam EMA (komma-separerat)", "100,150,200")
+trend_grid = c3.text_input("Trendfilter EMA (0=av, komma-separerat)", "0,200")
+
+opt_btn = st.button("🎯 Kör MA-optimering per aktie", width='stretch')
+
+def _parse_list_int(s: str) -> List[int]:
+    out: List[int] = []
+    for x in s.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(int(float(x)))
+        except ValueError:
+            pass
+    return out
+
+def _buyhold_return(df: pd.DataFrame) -> float:
+    if df.empty:
+        return 0.0
+    c0 = float(df["Close"].iloc[0])
+    c1 = float(df["Close"].iloc[-1])
+    if c0 <= 0:
+        return 0.0
+    return (c1 / c0) - 1.0
+
+def _run_ma_once(df_by_ticker: Dict[str, pd.DataFrame], ticker: str, fast: int, slow: int, trend_win: int) -> Tuple[float, Dict[str, Any]]:
+    params = PortfolioParams(
+        strategy="ma_cross",
+        use_trend_filter=bool(trend_win > 0),
+        trend_ma_type="EMA",
+        trend_ma_window=int(trend_win),
+        fast=int(fast),
+        slow=int(slow),
+        # resten default/irrelevant för ma_cross
+        use_rsi_filter=False,
+        rsi_window=14,
+        rsi_min=30.0,
+        rsi_max=70.0,
+        breakout_lookback=55,
+        exit_lookback=20,
+        use_macd_filter=False,
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
+        macd_mode="above_zero",
+        use_bb_filter=False,
+        bb_window=20,
+        bb_nstd=2.0,
+        bb_mode="exit_below_mid",
+        bb_percent_b_min=0.8,
+        atr_window=14,
+        atr_stop_mult=0.0,
+        atr_trail_mult=0.0,
+        cost_bps=float(_get("cost_bps", 0.0)),
+        cash_rate_apy=float(_get("cash_rate", 0.0)),
+        max_positions=1,
+        per_trade_pct=100.0,
+        max_exposure_pct=100.0,
+    )
+    equity, trades, stats = PB.run_portfolio_backtest({ticker: df_by_ticker[ticker]}, params)
+    return float(stats.get("TotalReturn", 0.0)), stats
+
+if opt_btn:
+    try:
+        start = _get("start", pd.to_datetime("2020-01-01").date())
+        end = _get("end", pd.to_datetime("today").date())
+        tickers = [t.strip() for t in _get("tickers_text", "ABB\nVOLV B").splitlines() if t.strip()]
+        data = _fetch_borsdata_universe(tickers, start, end)
+        if not data:
+            st.error("Ingen data laddades – kan inte optimera.", icon="❌")
+        else:
+            f_list = _parse_list_int(fast_grid)
+            s_list = _parse_list_int(slow_grid)
+            t_list = _parse_list_int(trend_grid)
+
+            rows: List[Dict[str, Any]] = []
+            best_by_ticker: Dict[str, Dict[str, Any]] = {}
+
+            for tkr, df in data.items():
+                bh = _buyhold_return(df)
+                best = {"score": -1e9, "fast": None, "slow": None, "trend": None, "ret": None}
+
+                for f in f_list:
+                    for s in s_list:
+                        if f >= s:
+                            continue  # krav: fast < slow
+                        for tw in t_list:
+                            totret, stats = _run_ma_once(data, tkr, f, s, tw)
+                            rows.append({
+                                "Ticker": tkr,
+                                "Strategy": "ma_cross",
+                                "fast": f,
+                                "slow": s,
+                                "trend_ma_window": tw,
+                                "trend_ma_type": "EMA" if tw > 0 else "—",
+                                "TotalReturn%": round(totret * 100, 2),
+                                "Buy&Hold%": round(bh * 100, 2),
+                                "MaxDD%": round(float(stats.get("MaxDD", 0.0)) * 100, 2),
+                                "SharpeD": round(float(stats.get("SharpeD", 0.0)), 2),
+                                "Dagar": int(stats.get("LengthDays", 0)),
+                            })
+                            if totret > best["score"]:
+                                best = {"score": totret, "fast": f, "slow": s, "trend": tw, "ret": totret}
+                best_by_ticker[tkr] = best
+
+            df_res = pd.DataFrame(rows)
+            st.subheader("Resultat – MA-grid")
+            st.dataframe(df_res, width='stretch')
+
+            st.subheader("Bästa kombination per ticker")
+            best_rows = []
+            for tkr, best in best_by_ticker.items():
+                best_rows.append({
+                    "Ticker": tkr,
+                    "Strategy": "ma_cross",
+                    "fast": best["fast"],
+                    "slow": best["slow"],
+                    "trend_ma_window": best["trend"],
+                    "trend_ma_type": "EMA" if (best["trend"] and best["trend"] > 0) else "—",
+                    "TotalReturn%": round(best["ret"] * 100, 2),
+                })
+            df_best = pd.DataFrame(best_rows)
+            st.dataframe(df_best, width='stretch')
+
+            # Export
+            with io.BytesIO() as buf:
+                df_res.to_csv(buf, index=False, encoding="utf-8-sig")
+                st.download_button("Ladda ned alla resultat (CSV)", buf.getvalue(), file_name="ma_optimizer_results.csv", mime="text/csv")
+
+            # Använd bästa i kontrollerna
+            st.subheader("Använd bästa för en ticker")
+            if best_by_ticker:
+                sel = st.selectbox("Ticker", list(best_by_ticker.keys()))
+                if sel:
+                    best = best_by_ticker[sel]
+                    if st.button("✅ Använd bästa i kontrollerna", width='stretch'):
+                        st.session_state["strategy"] = "ma_cross"
+                        st.session_state["ma_fast"] = int(best["fast"])
+                        st.session_state["ma_slow"] = int(best["slow"])
+                        tw = int(best["trend"] or 0)
+                        st.session_state["trend_win"] = tw
+                        st.session_state["trend_on"] = bool(tw > 0)
+                        st.session_state["trend_type"] = "EMA"
+                        # stäng övrigt
+                        st.session_state["rsi_on"] = False
+                        st.session_state["macd_on"] = False
+                        st.session_state["bb_on"] = False
+                        st.success(f"Satte kontroller: {sel} | fast={best['fast']} slow={best['slow']} trend_win={tw} (EMA)")
+                        st.experimental_rerun()
+    except Exception as e:
+        st.error(f"Fel i optimeringen: {e}", icon="❌")
+
+
+# ======================================
+#   🔒 LÅS SETUP – presets + spara profil
+# ======================================
+st.divider()
+st.header("🔒 Lås setup (reproducerbarhet per papper)")
+
+def _apply_preset(preset: Dict[str, Any]) -> None:
+    # Skriv in alla fält i session_state
+    for k, v in preset.items():
+        st.session_state[k] = v
+    # Minsta möjliga indikatorer
+    strategy = preset.get("strategy", "ma_cross")
+    if strategy == "ma_cross":
+        st.session_state["rsi_on"] = False
+        st.session_state["macd_on"] = False
+        st.session_state["bb_on"] = False
+    elif strategy == "rsi":
+        st.session_state["macd_on"] = False
+        st.session_state["bb_on"] = False
+    # Re-render
+    st.experimental_rerun()
+
+def _save_locked_profile(ticker: str) -> Path:
+    # Samla nuvarande kontroller som PortfolioParams
+    params = PortfolioParams(
+        strategy=_get("strategy", "ma_cross"),
+        use_trend_filter=bool(_get("trend_on", True)) if int(_get("trend_win", 200)) > 0 else False,
+        trend_ma_type=_get("trend_type", "EMA"),
+        trend_ma_window=int(_get("trend_win", 200)),
+        fast=int(_get("ma_fast", 15)),
+        slow=int(_get("ma_slow", 100)),
+        use_rsi_filter=bool(_get("rsi_on", False)),
+        rsi_window=int(_get("rsi_win", 14)),
+        rsi_min=float(_get("rsi_min", 30.0)),
+        rsi_max=float(_get("rsi_max", 70.0)),
+        breakout_lookback=int(_get("bo_lb", 55)),
+        exit_lookback=int(_get("bo_exit_lb", 20)),
+        use_macd_filter=bool(_get("macd_on", False)),
+        macd_fast=int(_get("macd_fast", 12)),
+        macd_slow=int(_get("macd_slow", 26)),
+        macd_signal=int(_get("macd_signal", 9)),
+        macd_mode=_get("macd_mode", "above_zero"),
+        use_bb_filter=bool(_get("bb_on", False)),
+        bb_window=int(_get("bb_window", 20)),
+        bb_nstd=float(_get("bb_nstd", 2.0)),
+        bb_mode=_get("bb_mode", "exit_below_mid"),
+        bb_percent_b_min=float(_get("bb_pb_min", 0.8)),
+        atr_window=int(_get("atr_win", 14)),
+        atr_stop_mult=float(_get("atr_stop", 0.0)),
+        atr_trail_mult=float(_get("atr_trail", 0.0)),
+        cost_bps=float(_get("cost_bps", 0.0)),
+        cash_rate_apy=float(_get("cash_rate", 0.0)),
+        max_positions=int(_get("max_pos", 1)),
+        per_trade_pct=float(_get("per_trade_pct", 100.0)),
+        max_exposure_pct=float(_get("max_exp", 100.0)),
+    )
+
+    payload = {
+        "profiles": [
+            {
+                "name": f"{ticker} – locked",
+                "ticker": ticker,
+                "params": params.__dict__,
+            }
+        ]
+    }
+
+    out_dir = ROOT / "outputs" / "profiles"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_fp = out_dir / f"{ticker.replace(' ', '_')}_locked.json"
+    out_fp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return out_fp
+
+# Välj ticker att låsa
+colA, colB = st.columns([2, 3])
+with colA:
+    st.caption("Välj en ticker att låsa (måste finnas i din lista ovan):")
+    lock_ticker = st.selectbox("Ticker att låsa", [t.strip() for t in _get("tickers_text", "ABB\nVOLV B").splitlines() if t.strip()])
+
+with colB:
+    st.caption("Presets (minsta indikatoruppsättning per papper):")
+    pcol1, pcol2 = st.columns(2)
+    if pcol1.button("🔒 ABB preset (MA 10/100, ingen trend)", width='stretch'):
+        _apply_preset(PRESETS["ABB"])
+    if pcol2.button("🔒 VOLV B preset (RSI 10 → 35/75 + EMA150)", width='stretch'):
+        _apply_preset(PRESETS["VOLV B"])
+
+# Lås nuvarande kontroller till profilfil
+save_col1, save_col2 = st.columns([2, 3])
+with save_col1:
+    if st.button("💾 Lås NUVARANDE kontroller till profil", width='stretch'):
+        try:
+            fp = _save_locked_profile(lock_ticker)
+            st.success(f"Sparad: {fp}")
+        except Exception as e:
+            st.error(f"Kunde inte spara profil: {e}", icon="❌")
+with save_col2:
+    st.caption("Profilfilen kan laddas i Portfölj-fliken (”Profiler från Backtrack”).")

@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Backtrack (Streamlit)",
+      "type": "python",
+      "request": "launch",
+      "module": "streamlit",
+      "args": ["run", "ui_streamlit.py"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "STREAMLIT_SERVER_FILE_WATCHER_TYPE": "none",
+        "PYTHONUTF8": "1"
+      }
+    }
+  ]
+}

@@ -1,0 +1,143 @@
+import json
+from pathlib import Path
+from typing import List, Dict, Any
+
+import pandas as pd
+import streamlit as st
+
+from app import btwrap as W
+from app.trade_extract import to_trades_df
+
+st.set_page_config(page_title="Portfolio V2 – Trades", layout="wide")
+st.title("📒 Portfolio V2 – Trades")
+
+# 1) Val av profilfiler
+all_files = sorted(str(p) for p in Path("profiles").glob("*.json"))
+files = st.multiselect("Profilfiler (profiles/*.json)", all_files, default=all_files)
+
+if not files:
+    st.info("Inga trades att visa ännu.")
+    st.stop()
+
+def _pick_best_profile(d: Dict[str, Any]) -> Dict[str, Any] | None:
+    profs = d.get("profiles") or []
+    if not profs:
+        return None
+    # välj första om vi saknar metrics
+    best = profs[0]
+    try:
+        best = max(
+            profs,
+            key=lambda x: ((x.get("metrics") or {}).get("TotalReturn") or float("-inf")),
+        )
+    except Exception:
+        pass
+    return best
+
+def _safe_ticker_from(p: Dict[str, Any] | None, fpath: str) -> str:
+    if isinstance(p, dict):
+        params = p.get("params") or {}
+        t = p.get("ticker") or params.get("ticker")
+        if t:
+            return str(t)
+    return Path(fpath).stem
+
+rows: List[pd.DataFrame] = []
+errors: List[str] = []
+
+for f in files:
+    try:
+        d = json.loads(Path(f).read_text(encoding="utf-8"))
+    except Exception as e:
+        errors.append(f"Kan inte läsa {f}: {e}")
+        continue
+
+    p = _pick_best_profile(d)  # lokalt
+    ticker = _safe_ticker_from(p, f)
+
+    try:
+        res = W.run_backtest(p={"ticker": ticker, "params": dict((p or {}).get("params") or {})})
+    except Exception as e:
+        errors.append(f"Körning misslyckades för {ticker} ({f}): {e}")
+        continue
+
+    try:
+        df = to_trades_df(res.get("trades") or res)
+    except Exception as e:
+        errors.append(f"to_trades_df-fel för {ticker} ({f}): {e}")
+        continue
+
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        continue
+
+    # Säkerställ kolumner
+    df = df.copy()
+    if "date" not in df.index.names:
+        df = df.reset_index().rename(columns={"index": "date"}).set_index("date")
+    df.index = pd.to_datetime(df.index)
+
+    if ("ticker" not in df.columns) or df["ticker"].isna().all():
+        df["ticker"] = ticker
+
+    if "profile" in df.columns:
+        df = df.drop(columns=["profile"])
+
+    if "notional" not in df.columns:
+        if "value" in df.columns:
+            df["notional"] = df["value"].abs()
+        elif {"qty", "price"}.issubset(df.columns):
+            df["notional"] = (df["qty"] * df["price"]).abs()
+        else:
+            df["notional"] = 0.0
+
+    # begränsa till relevanta kolumner i tabellen
+    keep_cols = ["ticker", "side", "price", "qty", "notional", "pnl"]
+    for c in keep_cols:
+        if c not in df.columns:
+            df[c] = None
+    df = df[keep_cols]
+
+    rows.append(df)
+
+if errors:
+    for msg in errors:
+        st.warning(msg)
+
+if not rows:
+    st.info("Inga trades att visa ännu.")
+    st.stop()
+
+tdf = pd.concat(rows).sort_index()
+
+# Header-metrics
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("BUY", int((tdf["side"] == "BUY").sum()))
+c2.metric("SELL", int((tdf["side"] == "SELL").sum()))
+c3.metric("Omsättning (sum notional)", f"{int(tdf['notional'].sum()):,} kr".replace(",", " "))
+c4.metric("Realisera‍d PnL (SELL-rader)", f"{int(tdf.loc[tdf['side']=='SELL','pnl'].fillna(0).sum()):,} kr".replace(",", " "))
+
+st.caption(f"Rader: {len(tdf):,} | Period: {tdf.index.min().date()} → {tdf.index.max().date()}".replace(",", " "))
+
+# Datumfilter
+start_default = tdf.index.min().date()
+end_default   = tdf.index.max().date()
+date_range = st.sidebar.date_input("Datumintervall", value=(start_default, end_default))
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    ds, de = date_range
+    mask = (tdf.index.date >= ds) & (tdf.index.date <= de)
+    tdf = tdf.loc[mask]
+
+# Visa tabell
+st.dataframe(
+    tdf.reset_index()[["date", "ticker", "side", "price", "qty", "notional", "pnl"]],
+    use_container_width=True,
+    hide_index=True,
+)
+
+# Export
+st.download_button(
+    "Ladda ner CSV",
+    tdf.to_csv(index=True).encode("utf-8"),
+    file_name="portfolio_trades_ledger.csv",
+    mime="text/csv",
+)

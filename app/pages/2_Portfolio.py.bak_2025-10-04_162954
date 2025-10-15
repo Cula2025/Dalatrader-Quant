@@ -1,0 +1,286 @@
+from __future__ import annotations
+import os, traceback, datetime as dt, math, inspect
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from typing import Any, Dict, Optional, Tuple, List
+
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+# ---------- (säkra debug-funktioner, krockar inte om modulen saknas) ----------
+try:
+    from app.debuglog import setup_debug_ui, log_info, log_warn, log_error, df_brief
+except Exception:  # pragma: no cover
+    def setup_debug_ui(*a, **k): pass
+    def log_info(*a, **k): pass
+    def log_warn(*a, **k): pass
+    def log_error(*a, **k): pass
+    def df_brief(x, rows=5, cols=8):
+        try: return x.iloc[:rows, :cols]
+        except Exception: return x
+
+# ---------- Page / theme ----------
+st.set_page_config(page_title="Portfölj", page_icon="📦", layout="wide")
+PRIMARY = "#1f6feb"; ACCENT = "#d29922"
+st.markdown(f"""
+<style>
+:root {{ --primary:{PRIMARY}; --accent:{ACCENT}; }}
+.block-container {{ padding-top: .5rem; }}
+.stButton>button {{ background: var(--primary); color: white; border: 0; }}
+</style>
+""", unsafe_allow_html=True)
+
+DATA_DIR = "trader/outputs/opt_results"
+OUT_DIR  = "trader/outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ---------- Helpers ----------
+def _fix_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    if "Ticker" not in df.columns:
+        for c in list(df.columns):
+            if c.lower() == "ticker":
+                df.rename(columns={c: "Ticker"}, inplace=True)
+                break
+    return df
+
+def _coerce_bools(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = (
+                df[c]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .replace({"true": True, "false": False, "1": True, "0": False, "yes": True, "no": False})
+            )
+    return df
+
+@st.cache_data(ttl=300, show_spinner=False)
+def list_csv_files(_data_dir_mtime: float) -> list[str]:
+    if not os.path.isdir(DATA_DIR):
+        return []
+    return sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")])
+
+def _data_dir_mtime() -> float:
+    try:
+        return max(os.path.getmtime(os.path.join(DATA_DIR, f)) for f in os.listdir(DATA_DIR))
+    except Exception:
+        return 0.0
+
+@st.cache_data(show_spinner=False)
+def load_opt_csv(path: str, _mtime: float) -> pd.DataFrame:
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    df = _fix_columns(df)
+    # vanliga numeric/boolean kolumner
+    num_cols = [
+        "rsi_window","rsi_min","rsi_max","trend_ma_window","breakout_lookback","exit_lookback",
+        "macd_fast","macd_slow","macd_signal","sl","fee","slip_bps","max_hold_days",
+    ]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = _coerce_bools(df, ["use_rsi_filter","use_trend_filter","use_macd_filter","use_sl","use_tp"])
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    return df
+
+def _now_str() -> str:
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# ---------- Motor-detektering (ingen påverkan på Optimizer) ----------
+def _detect_engine() -> Tuple[Optional[Any], str]:
+    """
+    Försök hitta en backtest/portfölj-funktion.
+    Returnerar (callable, name) eller (None, "").
+    """
+    candidates = [
+        ("app.portfolio_engine", "run_for_ticker"),
+        ("app.portfolio_backtest", "run_for_ticker"),
+        ("app.portfolio_backtest", "run_backtest"),
+        ("app.backtest", "run"),
+        ("app.backtest", "run_backtest"),
+        ("app.engine", "run_backtest"),
+        ("app.backtester", "run_single"),
+    ]
+    for mod, attr in candidates:
+        try:
+            m = __import__(mod, fromlist=[attr])
+            fn = getattr(m, attr, None)
+            if callable(fn):
+                return fn, f"{mod}.{attr}"
+        except Exception:
+            continue
+    return None, ""
+
+ENGINE_FN, ENGINE_NAME = _detect_engine()
+
+def _filter_kwargs_by_signature(fn, row: pd.Series) -> Tuple[dict, Optional[str]]:
+    """
+    Plocka bara de kwargs som motorns signatur accepterar.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except Exception as e:
+        return {}, f"inspect.signature fail: {e}"
+
+    # Tillgängliga param-namn
+    accepted = {p.name for p in sig.parameters.values()}
+    # Bygg kandidat-kwargs från radens kolumner
+    row_dict = {k: row.get(k) for k in row.index}
+    # Normalisera trend_ma_type case
+    if "trend_ma_type" in row_dict and isinstance(row_dict["trend_ma_type"], str):
+        row_dict["trend_ma_type"] = row_dict["trend_ma_type"].upper().strip()
+
+    # Konvertera NaN till None
+    for k, v in list(row_dict.items()):
+        if isinstance(v, float) and math.isnan(v):
+            row_dict[k] = None
+
+    # Lägg in bara värden som motorn accepterar
+    kwargs = {k: v for k, v in row_dict.items() if k in accepted}
+
+    # Hantera ticker som särskilt fall
+    if "ticker" in accepted and "ticker" not in kwargs:
+        # Försök hitta tickerfält
+        tick = row.get("Ticker")
+        if isinstance(tick, str) and tick:
+            kwargs["ticker"] = tick
+
+    return kwargs, None
+
+def _run_one_row(row: pd.Series) -> Dict[str, Any]:
+    tck = row.get("Ticker", "?")
+    if ENGINE_FN is None:
+        # Minimal fallback – kör inget riktigt test men returnera stub
+        return {"Ticker": tck, "Trades": 0, "Ret%": float("nan"), "MaxDD%": float("nan"), "Note": "No engine detected"}
+
+    try:
+        kwargs, err = _filter_kwargs_by_signature(ENGINE_FN, row)
+        if err:
+            log_warn(f"Signature issue for {tck}: {err}")
+        # Om motorn saknar 'ticker' i kwargs men kräver positionellt, prova positionellt anrop
+        if "ticker" not in kwargs:
+            try:
+                res = ENGINE_FN(row.get("Ticker"))
+            except TypeError:
+                res = ENGINE_FN(**kwargs)
+        else:
+            res = ENGINE_FN(**kwargs)
+
+        # Normalisera resultat till en rad
+        result = {"Ticker": tck}
+        if isinstance(res, dict):
+            # trades
+            for k in ("trades","n_trades","Trades"):
+                if k in res:
+                    result["Trades"] = int(res[k]) if pd.notna(res[k]) else 0
+                    break
+            # ret%
+            for k in ("ret","return","total_return","Ret%","cagr","CAGR","score"):
+                if k in res and pd.notna(res[k]):
+                    val = float(res[k])
+                    # Om det ser ut som 0.12 snarare än 12, skala upp
+                    if -1.0 <= val <= 1.0 and abs(val) < 0.99:
+                        val *= 100.0
+                    result["Ret%"] = round(val, 2)
+                    break
+            # max drawdown
+            for k in ("maxdd","max_drawdown","mdd","MaxDD%"):
+                if k in res and pd.notna(res[k]):
+                    val = float(res[k])
+                    if -1.0 <= val <= 1.0 and abs(val) < 0.99:
+                        val *= 100.0
+                    result["MaxDD%"] = round(val, 2)
+                    break
+            # Slå ihop övrigt
+            for k, v in res.items():
+                if k not in result:
+                    result[k] = v
+        else:
+            # okänt format
+            result.update({"Trades": 0, "Ret%": float("nan"), "MaxDD%": float("nan")})
+
+        # Säkerställ nycklar
+        result.setdefault("Trades", 0)
+        result.setdefault("Ret%", float("nan"))
+        result.setdefault("MaxDD%", float("nan"))
+        return result
+
+    except Exception as e:
+        log_error(f"Exception {tck}: {e}\n{traceback.format_exc()}")
+        return {"Ticker": tck, "Trades": 0, "Ret%": float("nan"), "MaxDD%": float("nan"), "Error": str(e)}
+
+def run_parallel(df: pd.DataFrame, max_workers: int, timeout_s: int) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_run_one_row, r): r.get("Ticker","?") for _, r in df.iterrows()}
+        for fut in as_completed(futs):
+            t = futs[fut]
+            try:
+                row = fut.result(timeout=timeout_s)
+            except TimeoutError:
+                row = {"Ticker": t, "Trades": 0, "Ret%": float("nan"), "MaxDD%": float("nan"), "Error": "Timeout"}
+            except Exception as e:
+                row = {"Ticker": t, "Trades": 0, "Ret%": float("nan"), "MaxDD%": float("nan"), "Error": f"Exception: {e}"}
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+# ---------- UI ----------
+st.title("📦 Portfölj")
+
+setup_debug_ui(st)
+
+mtime_key = _data_dir_mtime()
+files = list_csv_files(_data_dir_mtime=mtime_key)
+
+left, right = st.columns([2,1])
+with left:
+    if not files:
+        st.warning(f"Hittar inga CSV i `{DATA_DIR}`.")
+        st.stop()
+    # Default till senaste fil (sista i sorterad lista)
+    picked = st.selectbox("Välj optimeringsfil (CSV)", files, index=len(files)-1)
+with right:
+    st.caption("Prestanda")
+    workers = st.slider("Parallella trådar", 1, 16, 4)
+    timeout_s = st.slider("Timeout per aktie (s)", 5, 180, 25)
+
+csv_path = os.path.join(DATA_DIR, picked)
+df = load_opt_csv(csv_path, _mtime=os.path.getmtime(csv_path) if os.path.exists(csv_path) else 0)
+
+if "Ticker" not in df.columns:
+    st.error("Filen saknar kolumnen **Ticker** (kan bero på BOM).")
+    st.dataframe(df.head(50), width="stretch")
+    st.stop()
+
+with st.expander("Förhandsgranska data", expanded=False):
+    st.dataframe(df_brief(df, rows=20, cols=10), width="stretch")
+
+st.caption(f"Motor: {'—' if ENGINE_FN is None else ENGINE_NAME}")
+
+if st.button("Kör portfölj-backtest"):
+    with st.spinner("Kör backtest i batch…"):
+        out = run_parallel(df, workers, timeout_s)
+
+    if out.empty:
+        st.info("Inga resultat.")
+    else:
+        # Sortera bästa överst om Ret% finns
+        sort_cols = ["Ret%"] if "Ret%" in out.columns else None
+        if sort_cols:
+            out = out.sort_values(by=sort_cols, ascending=False)
+
+        st.subheader("Resultat")
+        st.dataframe(out, width="stretch")
+
+        if "Ret%" in out.columns and "Ticker" in out.columns:
+            top5 = out.sort_values(by="Ret%", ascending=False).head(5)
+            st.markdown("**Topp 5 signaler**")
+            st.table(top5[["Ticker","Trades","Ret%","MaxDD%"]].reindex(columns=["Ticker","Trades","Ret%","MaxDD%"]))
+
+        save_path = os.path.join(OUT_DIR, f"portfolio_result_{_now_str()}.csv")
+        out.to_csv(save_path, index=False, encoding="utf-8-sig")
+        st.success(f"Sparat: `{save_path}`")
+
+st.caption(f"Källa: `{csv_path}` • Output: `{OUT_DIR}`")

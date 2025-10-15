@@ -1,0 +1,266 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import List, Dict, Any, Iterable, Optional
+
+import pandas as pd
+
+# --- safe date label helpers (inserted) ---
+from typing import Iterable
+import numpy as np
+def _label_date(x):
+    import pandas as pd  # local import
+    try:
+        if hasattr(x, "to_pydatetime"):
+            x = x.to_pydatetime()
+        if hasattr(x, "date"):
+            return x.date().isoformat()
+        return pd.Timestamp(x).date().isoformat()
+    except Exception:
+        return None
+
+def _to_datestr_first(seq):
+    try:
+        seq = list(seq)
+        return _label_date(seq[0]) if seq else None
+    except Exception:
+        return None
+
+def _to_datestr_last(seq):
+    try:
+        seq = list(seq)
+        return _label_date(seq[-1]) if seq else None
+    except Exception:
+        return None
+# --- end helpers ---
+import streamlit as st
+import altair as alt
+
+# Motor (för strategi-kurvor): försök backtracker, annars btwrap
+try:
+    from app.backtracker import run_backtest  # type: ignore
+    MOTOR = "backtracker"
+except Exception:
+    from app import btwrap as W  # type: ignore
+    run_backtest = W.run_backtest             # type: ignore
+    MOTOR = "btwrap"
+
+from app.equity_extract import extract_equity
+from app.data_providers import get_ohlcv
+from app.portfolio_math import (
+    pick_first,
+    equal_weight_rebalanced,
+    equal_weight_buyhold,
+)
+
+INDEX_TICKER = "OMXS30GI"   # Stockholm GI (inkl utdelningar)
+
+st.title("📈 Portfolio V2 – linjegraf (Strategi, Buy&Hold, Index)")
+st.caption(f"Motor: {MOTOR}")
+
+# ---------- Hjälpare ----------
+
+def _to_datestr_first(idx) -> Optional[str]:
+    """Försök få YYYY-MM-DD från en index första värde, annars None."""
+    try:
+        v = idx[0]
+        # pd.Timestamp
+        if hasattr(v, "strftime"):
+            return v.strftime("%Y-%m-%d")
+        # datetime.date
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+    except Exception:
+        pass
+    return None
+
+def _read_params_for_ticker(ticker: str) -> Dict[str, Any]:
+    """
+    Hitta första profil med matchande ticker i profiles/*.json.
+    Returnerar params eller {} om inget finns – motorn får då defaulta.
+    """
+    prof_dir = Path("profiles")
+    if not prof_dir.exists():
+        return {}
+    for jf in sorted(prof_dir.glob("*.json")):
+        try:
+            d = json.loads(jf.read_text(encoding="utf-8"))
+            for pr in d.get("profiles", []):
+                t = (pr.get("ticker") or pr.get("params", {}).get("ticker") or "").strip()
+                if t.lower() == ticker.lower():
+                    return dict(pr.get("params") or {})
+        except Exception:
+            continue
+    return {}
+
+def _strategy_equity_for_ticker(ticker: str) -> Optional[pd.Series]:
+    """
+    Kör backtest för tickern (med ev. profil-parametrar) och extrahera equity-serien.
+    """
+    params = _read_params_for_ticker(ticker)
+    try:
+        res = run_backtest(p={"ticker": ticker, "params": params})
+        x = pick_first(res.get("equity"), res.get("summary"), res)
+        s = extract_equity(x)
+        if s is not None and len(s):
+            return pd.to_numeric(s, errors="coerce").dropna()
+    except Exception as e:
+        st.warning(f"[Strategi] {ticker}: {type(e).__name__}: {e}")
+    return None
+
+def _bh_curve_for_tickers(tickers: Iterable[str], start: Optional[str]) -> Optional[pd.Series]:
+    """
+    Buy&Hold lika-vikt över givna tickers, normaliserad till 1.0.
+    Vi hämtar Close från Börsdata, alignar gemensam period och tar medel av nivåerna.
+    """
+    cols: List[pd.Series] = []
+    for t in tickers:
+        try:
+            df = get_ohlcv(ticker=t, start=start, end=None)[["Close"]].dropna()
+            if len(df):
+                s = df["Close"] / float(df["Close"].iloc[0])
+                s.name = t
+                cols.append(pd.to_numeric(s, errors="coerce").dropna())
+        except Exception as e:
+            st.warning(f"[BH] {t}: {type(e).__name__}: {e}")
+    if not cols:
+        return None
+    return equal_weight_buyhold(cols)
+
+def _index_curve(start: Optional[str]) -> Optional[pd.Series]:
+    try:
+        df = get_ohlcv(ticker=INDEX_TICKER, start=start, end=None)[["Close"]].dropna()
+        if len(df):
+            s = df["Close"] / float(df["Close"].iloc[0])
+            s.name = INDEX_TICKER
+            return pd.to_numeric(s, errors="coerce").dropna()
+    except Exception as e:
+        st.warning(f"[Index] {INDEX_TICKER}: {type(e).__name__}: {e}")
+    return None
+
+# ---------- UI: välj tickers ----------
+
+default_universe = ["BOL", "EQT", "epi-a"]
+tickers: List[str] = st.multiselect("Välj tickers (max 10)", default_universe, default=default_universe, max_selections=10)
+
+if not tickers:
+    st.info("Välj minst en ticker.")
+    st.stop()
+
+# ---------- 1) Strategi-portfölj (EW rebalanced på strategiers equity) ----------
+
+equities: List[pd.Series] = []
+for t in tickers:
+    s = _strategy_equity_for_ticker(t)
+    if s is not None and len(s):
+        equities.append(s)
+
+if not equities:
+    st.error("Kunde inte skapa någon strategikurva för de valda tickers.")
+    st.stop()
+
+port_reb = equal_weight_rebalanced(equities)               # röd linje
+start_str = _to_datestr_first(port_reb.index)              # används för index/BH
+# Reservstart om index blev "steg" (RangeIndex)
+if start_str is None:
+    start_str = "2020-10-04"
+
+# ---------- 2) Buy&Hold & Index (nivåserier) ----------
+
+bh = _bh_curve_for_tickers(tickers, start=start_str)
+idx = _index_curve(start=start_str)
+
+# ---------- 3) Align och rita ----------
+
+parts = [port_reb.rename("Portfolio")]
+if bh is not None:
+    parts.append(bh.rename("Buy&Hold"))
+if idx is not None:
+    parts.append(idx.rename(INDEX_TICKER))
+
+df_plot = pd.concat(parts, axis=1, join="inner").dropna(how="all")
+
+# Grafer med Altair (linjer, ingen area)
+base = alt.Chart(df_plot.reset_index()).transform_fold(
+    list(df_plot.columns), as_=["curve", "value"]
+).mark_line().encode(
+    x=alt.X(df_plot.index.name or "index", title="Tid / steg"),
+    y=alt.Y("value:Q", title="Normaliserad nivå (×)"),
+    color=alt.Color("curve:N", title="Kurva"),
+    tooltip=["curve:N", "value:Q"]
+).properties(height=420)
+
+# DISABLED: st.altair_chart(base, use_container_width=True)
+
+# ---------- 4) Nyckeltal ----------
+
+def _last(v: Optional[pd.Series]) -> Optional[float]:
+    try:
+        return float(v.iloc[-1])
+    except Exception:
+        return None
+
+m = {
+    "Portfolio_final": _last(port_reb),
+    "BuyHold_final": _last(bh) if bh is not None else None,
+    "OMXS30GI_final": _last(idx) if idx is not None else None,
+}
+
+c = st.columns(3)
+c[0].metric("Portfolio", f"{m["Portfolio_final"]:.4f}×" if m["Portfolio_final"] else "—")
+c[1].metric("Buy&Hold", f"{m["BuyHold_final"]:.4f}×" if m["BuyHold_final"] else "—")
+c[2].metric("OMXS30GI", f"{m["OMXS30GI_final"]:.4f}×" if m["OMXS30GI_final"] else "—")
+
+start_label = _to_datestr_first(df_plot.index) or "—"
+end_label   = _to_datestr_last(df_plot.index) or "—"
+st.caption(f"Start: {start_label}  •  Slut: {end_label}")
+
+# === PATCH: robust portfolio-plot (inner-join + line) ===
+try:
+    import pandas as _pd
+    import altair as _alt
+    import streamlit as _st
+
+    def __datestr(_x):
+        try:
+            return str(getattr(_x, "date", lambda: _x)())
+        except Exception:
+            return str(_x)
+
+    __series = []
+    if "port_reb" in locals() and getattr(port_reb, "empty", True) is False:
+        __series.append(port_reb.rename("Portfolio"))
+    if "bh" in locals() and getattr(bh, "empty", True) is False:
+        __series.append(bh.rename("Buy&Hold"))
+    if "idx" in locals() and getattr(idx, "empty", True) is False:
+        __series.append(idx.rename("OMXS30GI"))
+
+    if __series:
+        __df_plot = _pd.concat(__series, axis=1, join="inner").dropna()
+        if not __df_plot.empty:
+            __df_long = (
+                __df_plot
+                .reset_index()
+                .rename(columns={"index": "date"})
+                .melt("date", var_name="Kurva", value_name="value")
+            )
+            __chart = (
+                _alt.Chart(__df_long)
+                .mark_line()
+                .encode(
+                    x=_alt.X("date:T", title="Tid / steg"),
+                    y=_alt.Y("value:Q", title="Normaliserad nivå (×)"),
+                    color=_alt.Color("Kurva:N", legend=_alt.Legend(title="Kurva")),
+                    tooltip=["date:T", "Kurva:N", _alt.Tooltip("value:Q", format=".4f")],
+                )
+                .properties(height=420)
+            )
+            _st.altair_chart(__chart, use_container_width=True)
+            _st.caption(f"Motor: backtracker | Start: {__datestr(__df_plot.index[0])}  Slut: {__datestr(__df_plot.index[-1])}")
+        else:
+            _st.warning("Inget gemensamt datumintervall mellan Portfolio / Buy&Hold / OMXS30GI.")
+except Exception as __e:
+    import streamlit as _st
+    _st.error(f"[Plot-patch] {type(__e).__name__}: {__e}")
+# === /PATCH ===

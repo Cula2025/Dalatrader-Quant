@@ -1,0 +1,198 @@
+# -*- coding: utf-8 -*-
+from app.btwrap import run_backtest as _run_backtest
+from datetime import date
+from pathlib import Path
+import json
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+from app.data_providers import get_ohlcv as GET_OHLCV
+from app.portfolio_signals import (
+    load_best_params_for_ticker, run_profile_positions, run_profile_trades,
+    build_portfolio_with_caps, to_price_matrix,
+    buyhold_equity_from_price, equal_weight_buyhold_equity, index_equity,
+)
+
+
+st.set_page_config(page_title="Dala Trader – Portfolio", page_icon="💼", layout="wide")
+st.title("💼 Portfolio (profiler)")
+
+with st.sidebar:
+    # Logga (absolut sökväg)
+    _BASE = Path(__file__).resolve().parents[1]
+    _LOGO = _BASE / "assets" / "logodaladrader.png"
+    if _LOGO.exists():
+        st.image(str(_LOGO), width='stretch')
+        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+    st.subheader("Inställningar")
+    start = st.date_input("Startdatum", value=date(2020,1,1))
+    prof_dir_str = st.text_input("Profilkatalog", value="outputs/opt_results")
+    use_auto_universe = st.checkbox("Använd alla tickers i profilkatalogen", value=True)
+    tickers_text = st.text_area(
+        "Tickers (en per rad eller kommaseparerat)",
+        value="HM-B.ST", height=100, disabled=use_auto_universe
+    )
+    index_ticker = st.text_input("Index-ticker (för jämförelse)", value="OMXS30")
+    max_per_asset = st.slider("Max per aktie", 0.0, 1.0, 1.0, 0.05)
+    max_total_equity = st.slider("Max totalt i aktier", 0.0, 1.0, 1.0, 0.05)
+    max_positions = st.number_input("Max antal samtidiga innehav", min_value=1, max_value=50, value=30, step=1)
+
+profiles_dir = Path(prof_dir_str).expanduser().resolve()
+
+def _discover_tickers_from_profiles(pdir: Path) -> list[str]:
+    out = set()
+    for fp in sorted(pdir.glob("*.json")):
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            for prof in data.get("profiles", []):
+                t = prof.get("ticker")
+                if isinstance(t, str) and t.strip():
+                    t2 = t.strip().upper().replace(" ", "-")
+                    if not t2.endswith(".ST"):
+                        t2 += ".ST"
+                    out.add(t2)
+        except Exception:
+            stem = fp.stem.split("_best")[0]
+            t2 = stem.replace("_","-").upper()
+            if not t2.endswith(".ST"):
+                t2 += ".ST"
+            out.add(t2)
+    return sorted(out)
+
+if use_auto_universe:
+    tickers = _discover_tickers_from_profiles(profiles_dir)
+else:
+    raw = [t.strip() for part in tickers_text.splitlines() for t in part.replace(",", " ").split()]
+    tickers = [t for t in raw if t]
+
+if not tickers:
+    st.info("Ingen ticker hittad – lägg till profiler i katalogen eller avmarkera auto-universum.")
+    st.stop()
+
+rows = []
+positions: dict[str, pd.Series] = {}
+prices_map: dict[str, pd.DataFrame] = {}
+problems = []
+
+with st.spinner("Laddar profiler, signaler och priser..."):
+    for t in tickers:
+        try:
+            params, metrics, name, path = load_best_params_for_ticker(t, profiles_dir)
+            rows.append({
+                "Ticker": t, "Profil": name,
+                "TotalReturn": round(float(metrics.get("TotalReturn", 0.0)), 4),
+                "SharpeD": round(float(metrics.get("SharpeD", 0.0)), 4),
+                "Källa": path.name
+            })
+        except Exception as e:
+            problems.append(f"❌ {t}: ingen profil ({e})"); continue
+        try:
+            s = run_profile_positions(t, params, start)
+            positions[t] = s
+        except Exception as e:
+            problems.append(f"❌ {t}: kunde inte skapa positioner ({e})"); continue
+        try:
+            dfp = GET_OHLCV(t, start=start, source="borsdata")
+            prices_map[t] = dfp
+        except Exception as e:
+            problems.append(f"❌ {t}: kunde inte hämta priser ({e})")
+
+if problems:
+    st.warning("Några problem:\n\n" + "\n".join(problems))
+if not positions or not prices_map:
+    st.error("Inget att visa ännu."); st.stop()
+
+# Gemensamma beräkningar
+P = to_price_matrix(prices_map)
+equity, W = build_portfolio_with_caps(
+    positions, P,
+    max_per_asset=max_per_asset,
+    max_total_equity=max_total_equity,
+    lag_days=1,
+    max_positions=max_positions
+)
+port = equity["value"].rename("Portfölj")
+
+if len(tickers) == 1:
+    base_price = P.iloc[:,0]
+    bh_raw = buyhold_equity_from_price(base_price).rename("Buy&Hold")
+else:
+    bh_raw = equal_weight_buyhold_equity(P).rename("Buy&Hold")
+
+idx_raw = index_equity(index_ticker, start)
+idx_raw = idx_raw.rename("OMXS30 (index)") if len(idx_raw) else None
+
+def _norm(s: pd.Series) -> pd.Series:
+    s = s.dropna();  return s / float(s.iloc[0]) if len(s) else s
+
+bh = bh_raw.reindex(port.index).ffill()
+cols = [_norm(port), _norm(bh)]
+if idx_raw is not None:
+    idx = idx_raw.reindex(port.index).ffill()
+    cols.append(_norm(idx))
+chart = pd.concat(cols, axis=1).dropna(how="all")
+
+tab1, tab2, tab3 = st.tabs(["📈 Översikt", "🧭 Universum", "📄 Transaktioner"])
+
+with tab1:
+    st.subheader("Kapitalutveckling (normaliserad till 1.0)")
+    df_long = chart.reset_index()
+    date_col = df_long.columns[0]
+    df_long = df_long.melt(id_vars=[date_col], var_name="Series", value_name="Value")
+    sel = alt.selection_point(fields=["Series"], bind="legend")
+    ch = (alt.Chart(df_long)
+        .mark_line(interpolate="monotone")
+        .encode(
+            x=alt.X(f"{date_col}:T", title="Datum"),
+            y=alt.Y("Value:Q", title="Normaliserat (x)"),
+            color=alt.Color("Series:N"),
+            tooltip=[alt.Tooltip(f"{date_col}:T", title="Datum"), "Series:N", alt.Tooltip("Value:Q", format=".2f")]
+        )
+        .add_params(sel)
+        .transform_filter(sel)
+        .properties(height=420)
+        .configure(background="#0E1117")
+        .configure_axis(labelColor="#EAEFF2", titleColor="#EAEFF2", gridColor="#27374A")
+    )
+    st.altair_chart(ch, width='stretch')
+    st.caption("Vikter sluts med 1 dags lag, full återinvestering inom angivna kap-begränsningar.")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Portfölj slutvärde", f"{float(port.iloc[-1]):.2f}x")
+    bh_final = float((bh_raw.reindex(port.index).ffill()).iloc[-1])
+    c2.metric("Buy&Hold slutvärde", f"{bh_final:.2f}x")
+    if idx_raw is not None and len(idx_raw):
+        idx_final = float((idx_raw.reindex(port.index).ffill()).iloc[-1])
+        c3.metric("OMXS30 slutvärde", f"{idx_final:.2f}x")
+    else:
+        c3.metric("OMXS30 slutvärde", "—")
+
+with tab2:
+    st.subheader("Valda profiler")
+    df_sel = pd.DataFrame(rows)
+    st.dataframe(df_sel, width='stretch')
+    st.markdown("**Senaste vikter (topp 15):**")
+    last_w = W.iloc[-1].sort_values(ascending=False).head(15)
+    st.dataframe(last_w.to_frame("Vikt").style.format("{:.2%}"), width='stretch')
+
+with tab3:
+    st.subheader("Transaktioner per aktie")
+    for t in tickers:
+        with st.expander(f"{t} – transaktioner"):
+            try:
+                params, _, _, _ = load_best_params_for_ticker(t, profiles_dir)
+                trades = run_profile_trades(t, params, start)
+                if len(trades):
+                    st.dataframe(trades, width='stretch')
+                    st.download_button(
+                        "Ladda ned CSV",
+                        trades.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{t.replace(':','-')}_trades.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.info("Inga affärer i perioden.")
+            except Exception as e:
+                st.error(f"Kunde inte hämta transaktioner: {e}")

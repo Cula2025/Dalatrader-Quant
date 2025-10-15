@@ -1,0 +1,333 @@
+from __future__ import annotations
+import os, re, json, ast, inspect, datetime as dt
+from typing import Any, Dict, List, Optional, Tuple
+import pandas as pd
+import numpy as np
+import streamlit as st
+from app.opt_api import load_price_series, get_strategy_curve, build_portfolio
+
+# --- debug (failsafe) ---
+try:
+    from app.debuglog import setup_debug_ui, log_info, log_warn, log_error, df_brief
+except Exception:
+    def setup_debug_ui(*a, **k): pass
+    def log_info(*a, **k): pass
+    def log_warn(*a, **k): pass
+    def log_error(*a, **k): pass
+    def df_brief(x, rows=5, cols=8):
+        try: return x.iloc[:rows, :cols]
+        except Exception: return x
+
+st.set_page_config(page_title="Portfolio (profiler)", page_icon="💼", layout="wide")
+st.title("💼 Portfolio (profiler)")
+setup_debug_ui(st)
+
+DEFAULT_DIR = "/srv/trader/app/profiles"
+
+# -------------------- BÖRSDATA-LOADER (ENDA KÄLLAN) --------------------
+def _get_bors_loader():
+    """
+    Försök att hitta er Börsdata-laddare i projektet.
+    Lägg gärna till rätt modul/funktion här om ni har en specifik.
+    Denna funktion ska returnera en call: load(symbol) -> DataFrame med OHLC/Close.
+    """
+    candidates = [
+        ("app.borsdata", "load_df"),
+        ("app.borsdata", "load_ohlc"),
+        ("app.dataproviders.borsdata", "load_df"),
+        ("app.data", "borsdata_load_df"),
+    ]
+    for mod, attr in candidates:
+        try:
+            m = __import__(mod, fromlist=[attr])
+            f = getattr(m, attr, None)
+            if callable(f):
+                return lambda s: f(symbol=s)
+        except Exception:
+            continue
+    # sista fallback – om er generiska loader i sin tur är kopplad till Börsdata
+    try:
+        from app.__init__ import _load_df_any_alias as f
+        return lambda s: f(symbol=s)
+    except Exception:
+        pass
+    try:
+        from app.btwrap import _load_df_any_alias as f
+        return lambda s: f(symbol=s)
+    except Exception:
+        pass
+    return None
+
+_BD_LOAD = _get_bors_loader()
+
+def _ticker_variants_borsdata(t: str) -> List[str]:
+    """Prova några vanliga Börsdata-varianter (mellanslag, bindestreck, punkt, ihop)."""
+    b = (t or "").strip()
+    u = re.sub(r"\s+"," ", b).upper()
+    cands = [b, u]
+    for sep in [" ", "-", ".", ""]:
+        cands.append(u.replace(" ", sep))
+    # unika i ordning
+    seen=set(); out=[]
+    for c in cands:
+        if c and c not in seen:
+            out.append(c); seen.add(c)
+    return out
+
+def _load_price_series_borsdata(ticker: str) -> Optional[pd.Series]:
+    if _BD_LOAD is None:
+        log_error("Börsdata-laddare saknas – ange rätt modul i _get_bors_loader().")
+        return None
+    for cand in _ticker_variants_borsdata(ticker):
+        try:
+            df = _BD_LOAD(cand)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                # Vanliga kolumnnamn
+                col = None
+                for c in ("Adj Close","adj_close","Close","close","c"):
+                    if c in df.columns: col=c; break
+                if col is None:
+                    if all(x in df.columns for x in ("open","high","low","close")):
+                        col = "close"
+                    elif all(x in df.columns for x in ("Open","High","Low","Close")):
+                        col = "Close"
+                if not col: 
+                    continue
+                s = df[col].astype(float).dropna()
+                if s.empty: 
+                    continue
+                s.index = pd.to_datetime(df.index)
+                s = s.sort_index()
+                s = (s / s.iloc[0]).rename(ticker)  # visa originaltäckaren i grafen
+                log_info(f"Börsdata OK: {ticker} via '{cand}'")
+                return s
+        except Exception as e:
+            log_warn(f"Börsdata misslyckades för {ticker} cand={cand}: {e}")
+    log_warn(f"Ingen Börsdata-serie för {ticker}")
+    return None
+
+# -------------------- PROFIL-LÄSARE --------------------
+TICKER_KEYS = ("Ticker","ticker","symbol","code","name","shortName","short_name")
+WEIGHT_KEYS = ("weight","Weight","w","alloc","allocation","Allocation","size")
+
+def _strip_comments_and_trailing_commas(text: str) -> str:
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    return text.strip()
+
+def _try_ast_literal_eval(text: str) -> Any:
+    t = re.sub(r"\btrue\b","True", re.sub(r"\bfalse\b","False", re.sub(r"\bnull\b","None", text, flags=re.I), flags=re.I), flags=re.I)
+    try: return ast.literal_eval(t)
+    except Exception: return None
+
+def _flatten(row: Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(row)
+    # Ticker
+    for k in TICKER_KEYS:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            d["Ticker"] = v.strip(); break
+    # Eventuella kapslade params till top-level
+    for nest in ("params","config","settings","options"):
+        if isinstance(d.get(nest), dict):
+            for k,v in d[nest].items(): d.setdefault(k,v)
+            del d[nest]
+    # Vikt
+    for wk in WEIGHT_KEYS:
+        if wk in d:
+            try:
+                d["Weight"] = float(d[wk])
+            except Exception:
+                pass
+            break
+    return d
+
+def _json_to_rows(obj: Any) -> List[Dict[str, Any]]:
+    if isinstance(obj, list):
+        return [_flatten(x) for x in obj if isinstance(x, dict)]
+    if isinstance(obj, dict):
+        for k in ("profiles","rows","items","results","data","list","values"):
+            if isinstance(obj.get(k), list):
+                return [_flatten(x) for x in obj[k] if isinstance(x, dict)]
+        # dict-of-dicts: { "GETI B": {...}, "HM B": {...} }
+        if obj and all(isinstance(v, dict) for v in obj.values()):
+            out=[]
+            for tk, payload in obj.items():
+                r=_flatten(payload)
+                if "Ticker" not in r and isinstance(tk,str) and tk.strip():
+                    r["Ticker"]=tk.strip()
+                out.append(r)
+            return out
+        # single
+        return [_flatten(obj)]
+    return []
+
+def parse_json_file(path: str) -> List[Dict[str, Any]]:
+    try:
+        text = open(path,"r",encoding="utf-8-sig").read().strip()
+        if not text: return []
+        # NDJSON?
+        if "\n" in text and text.lstrip().startswith("{") and not text.strip().startswith("["):
+            out=[]
+            for ln in [ln.strip() for ln in text.splitlines() if ln.strip()]:
+                for attempt in (lambda x: json.loads(x), _try_ast_literal_eval):
+                    try:
+                        obj = attempt(_strip_comments_and_trailing_commas(ln))
+                        if isinstance(obj, dict): out.append(_flatten(obj)); break
+                    except Exception:
+                        pass
+            return out
+        # vanlig JSON
+        try:
+            obj = json.loads(_strip_comments_and_trailing_commas(text))
+        except Exception:
+            obj = _try_ast_literal_eval(_strip_comments_and_trailing_commas(text))
+        return _json_to_rows(obj) if obj is not None else []
+    except Exception as e:
+        log_warn(f"Parse fail {path}: {e}")
+        return []
+
+@st.cache_data(ttl=120, show_spinner=False)
+def list_json_files(dir_path: str) -> List[str]:
+    if not os.path.isdir(dir_path): return []
+    return sorted([f for f in os.listdir(dir_path) if f.lower().endswith((".json",".jsonl",".ndjson"))])
+
+def build_profiles_df(dir_path: str, files: List[str]) -> pd.DataFrame:
+    rows=[]
+    for f in files:
+        p=os.path.join(dir_path,f)
+        recs=parse_json_file(p)
+        if recs:
+            for r in recs:
+                rr=dict(r); rr["source_file"]=f
+                if not rr.get("Ticker"):
+                    rr["Ticker"]=os.path.splitext(f)[0]
+                rows.append(rr)
+        else:
+            rows.append({"Ticker": os.path.splitext(f)[0], "source_file": f, "_note": "empty/parse-fail"})
+    df=pd.DataFrame(rows)
+    if not df.empty:
+        df.columns=[str(c).replace("\ufeff","").strip() for c in df.columns]
+        # Numrera profiler per fil (1..n)
+        df["ProfileIdx"] = df.groupby("source_file").cumcount() + 1
+    return df
+
+# -------------------- Portfölj-beräkning --------------------
+def _build_portfolio(curves: Dict[str,pd.Series], weights: Optional[Dict[str,float]]=None) -> Optional[pd.Series]:
+    if not curves: return None
+    # gemensam tidsaxel
+    idx = sorted(set().union(*[set(s.index) for s in curves.values()]))
+    df = pd.DataFrame({k: v.reindex(idx).ffill() for k,v in curves.items()})
+    df = df.dropna(how="all")
+    if df.empty: return None
+    if not weights:
+        w = np.ones(df.shape[1]) / df.shape[1]
+    else:
+        ww = np.array([max(0.0, float(weights.get(k, 0.0))) for k in df.columns], dtype=float)
+        if ww.sum() <= 0:
+            ww = np.ones_like(ww)
+        w = ww / ww.sum()
+    port = (df * w).sum(axis=1)
+    if len(port)>0 and port.iloc[0] != 0:
+        port = port / port.iloc[0]
+    return port.rename("Portfölj")
+
+# -------------------- UI --------------------
+tabs = st.tabs(["Översikt", "Universum"])
+
+with tabs[0]:
+    colL, colR = st.columns([3,1], gap="large")
+    with colL:
+        data_dir = st.text_input("Datakatalog (JSON med tre profiler per fil)", value=st.session_state.get("portfolio_dir", DEFAULT_DIR), key="portfolio_dir")
+    with colR:
+        if os.path.isdir(DEFAULT_DIR) and st.button("Använd profiles/"):
+            st.session_state["portfolio_dir"]=DEFAULT_DIR; st.rerun()
+
+    files = list_json_files(data_dir)
+    if not files:
+        st.warning(f"Inga JSON-filer i `{data_dir}`."); st.stop()
+
+    picked = st.multiselect("Välj profilfiler", files, default=files)
+    if not picked:
+        st.info("Välj minst en fil."); st.stop()
+
+    df_prof = build_profiles_df(data_dir, picked)
+    if df_prof.empty or "Ticker" not in df_prof.columns:
+        st.error("Kunde inte hämta profiler med Ticker."); st.stop()
+
+    max_idx = int(df_prof["ProfileIdx"].max())
+    options = ["Alla"] + [f"Profil #{i}" for i in range(1, max_idx+1)]
+    profile_choice = st.selectbox("Vilken profil i varje fil ska användas?", options, index=1)  # default Profil #1
+    if profile_choice != "Alla":
+        pick = int(profile_choice.split("#")[1])
+        df_prof = df_prof[df_prof["ProfileIdx"] == pick]
+
+    # extrahera vikter om de finns
+    weight_col = next((c for c in WEIGHT_KEYS if c in df_prof.columns), None)
+    if weight_col and "Weight" not in df_prof.columns:
+        df_prof["Weight"] = pd.to_numeric(df_prof[weight_col], errors="coerce")
+
+    tickers = [t for t in df_prof["Ticker"].astype(str).str.strip().tolist() if t]
+    weights = None
+    if "Weight" in df_prof.columns:
+        wmap = {}
+        for t, w in zip(df_prof["Ticker"], df_prof["Weight"].fillna(0)):
+            wmap[str(t).strip()] = float(w)
+        weights = wmap
+
+    st.caption(f"{len(tickers)} tickers från {len(df_prof['source_file'].unique())} filer (val: {profile_choice}).")
+
+    with st.expander("⚙️ Inställningar", expanded=False):
+        index_symbol = st.text_input("Indexsymbol (t.ex. OMXS30)", value="OMXS30")
+        start_date = st.date_input("Startdatum (valfritt)", value=None)
+        run_btn = st.button("Bygg portfölj")
+
+    if run_btn:
+        curves: Dict[str,pd.Series] = {}
+        for t in sorted(set(tickers)):
+            s = _load_price_series_borsdata(t)
+            if s is not None and len(s)>5:
+                if start_date: s = s[s.index >= pd.Timestamp(start_date)]
+                curves[t] = s
+
+        if not curves:
+            st.error("Hittade inga kurvor att rita (Börsdata returnerade inget för valda tickers)."); st.stop()
+
+        port = _build_portfolio(curves, weights=weights)
+        if port is None or port.empty:
+            st.error("Kunde inte konstruera portföljen."); st.stop()
+
+        # Index (från Börsdata)
+        idx_curve = None
+        if index_symbol.strip():
+            idx_curve = _load_price_series_borsdata(index_symbol.strip())
+            if idx_curve is not None and start_date:
+                idx_curve = idx_curve[idx_curve.index >= pd.Timestamp(start_date)]
+
+        import altair as alt
+        plot_df = pd.DataFrame({"date": port.index, "Portfölj": port.values})
+        if idx_curve is not None:
+            plot_df["Index"] = idx_curve.reindex(port.index).ffill().values
+        plot_df = plot_df.melt("date", var_name="Serie", value_name="Norm")
+
+        st.subheader("Kapitalutveckling (normaliserad till 1.0)")
+        chart = alt.Chart(plot_df).mark_line().encode(
+            x=alt.X("date:T", title=None),
+            y=alt.Y("Norm:Q", title="Normaliserat (x)"),
+            color=alt.Color("Serie:N")
+        ).properties(height=420)
+        st.altair_chart(chart, theme="streamlit", width="stretch")
+
+with tabs[1]:
+    st.subheader("Universum (profiler och eventuella vikter)")
+    data_dir = st.session_state.get("portfolio_dir", DEFAULT_DIR)
+    files = list_json_files(data_dir)
+    df = build_profiles_df(data_dir, files) if files else pd.DataFrame()
+    if df.empty:
+        st.info("Inga profiler hittades.")
+    else:
+        # visa relevanta kolumner först
+        cols = [c for c in ["source_file","ProfileIdx","Ticker","Weight"] if c in df.columns]
+        cols += [c for c in df.columns if c not in cols]
+        st.dataframe(df[cols], width="stretch")

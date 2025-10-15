@@ -1,0 +1,297 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json, time, random, pathlib
+from datetime import date, timedelta
+from typing import Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# Branding (frivillig)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title="Dala Trader – Optimizer", page_icon="⚙️")
+st.title("⚙️ Optimizer")
+st.caption("Optimerar tre strategier per ticker över valt intervall. Hämtar OHLCV en gång och kör allt lokalt för fart.")
+
+# ---- Imports för motorerna
+from app.data_providers import get_ohlcv as GET_OHLCV
+from backtest import run_backtest as RUN_BT
+
+# ---- Hjälp
+def ur(rng: random.Random, a: float, b: float) -> float:
+    return a + (b - a) * rng.random()
+
+def make_params(rng: random.Random) -> Dict[str, Any]:
+    use_trend_filter = bool(rng.getrandbits(1))
+    use_macd_filter  = bool(rng.getrandbits(1))
+    use_bb_filter    = bool(rng.getrandbits(1))
+    use_stop_loss    = bool(rng.getrandbits(1))
+    use_atr_trailing = bool(rng.getrandbits(1))
+    trend_ma_type    = rng.choice(["SMA","EMA"])
+    return {
+        "use_rsi_filter": True,
+        "rsi_window": rng.randint(8, 32),
+        "rsi_min": ur(rng, 5.0, 35.0),
+        "rsi_max": ur(rng, 60.0, 85.0),
+
+        "use_trend_filter": use_trend_filter,
+        "trend_ma_type": trend_ma_type,
+        "trend_ma_window": rng.randint(20, 200),
+
+        "breakout_lookback": rng.randint(20, 120),
+        "exit_lookback":     rng.randint(10, 60),
+
+        "use_macd_filter": use_macd_filter,
+        "macd_fast":   rng.randint(8, 16),
+        "macd_slow":   rng.randint(18, 30),
+        "macd_signal": rng.randint(8, 14),
+
+        "use_bb_filter": use_bb_filter,
+        "bb_window": rng.randint(15, 30),
+        "bb_nstd":   ur(rng, 1.6, 2.4),
+        "bb_min":    ur(rng, 0.0, 0.8),
+
+        "use_stop_loss": use_stop_loss,
+        "stop_mode": rng.choice(["pct","atr"]),
+        "stop_loss_pct": ur(rng, 0.03, 0.20),
+
+        "atr_window": rng.randint(10, 20),
+        "atr_mult":   ur(rng, 1.2, 3.2),
+
+        "use_atr_trailing": use_atr_trailing,
+        "atr_trail_mult":   ur(rng, 1.2, 3.5),
+    }
+
+def score(metrics: Dict[str, Any]) -> float:
+    tr = float(metrics.get("TotalReturn") or 0.0)
+    sh = float(metrics.get("SharpeD") or 0.0)
+    mdd = float(metrics.get("MaxDD") or 0.0)  # negativt tal
+    return 2.0*tr + 1.0*sh + 0.5*(-mdd)
+
+def five_year_window():
+    end = date.today()
+    start = end - timedelta(days=365*5 + 2)
+    return start, end
+
+@st.cache_data(show_spinner=False)
+def load_ohlcv_cached(ticker: str, start: str, end: str) -> pd.DataFrame:
+    df = GET_OHLCV(ticker=ticker, start=start, end=end)
+    return df
+
+def run_optimizer_ui(ticker: str, sims: int, seed: int, start: str, end: str):
+    t0 = time.time()
+    df = load_ohlcv_cached(ticker, start, end)
+    if df is None or len(getattr(df, "index", [])) == 0:
+        st.error("Tomt OHLCV för perioden.")
+        return
+
+    rng = random.Random(seed)
+    best: List[Tuple[float, Dict[str,Any], Dict[str,Any]]] = []
+    prog = st.progress(0)
+    status = st.empty()
+
+    for i in range(1, sims+1):
+        p = make_params(rng)
+        p["from_date"] = start
+        p["to_date"]   = end
+        try:
+            res = RUN_BT(df, p)
+            m = res.get("summary", {}) if isinstance(res, dict) else {}
+            s = score(m)
+            best.append((s, p, m))
+            if len(best) > 16:
+                best.sort(key=lambda x: x[0], reverse=True)
+                best = best[:16]
+        except Exception as e:
+            # svälj enstaka fel
+            pass
+
+        if (i % max(1, sims//100)) == 0 or i == sims:
+            prog.progress(int(i*100/sims))
+            status.text(f"Kör sim {i}/{sims} …")
+
+    best.sort(key=lambda x: x[0], reverse=True)
+    top = best[:3]
+    names = ["conservative", "balanced", "aggressive"]
+    profiles = []
+    for idx, (s, p, m) in enumerate(top):
+        profiles.append({
+            "name": f"{ticker} – {names[idx]}",
+            "ticker": ticker,
+            "params": p,
+            "metrics": m,
+        })
+
+    outdir = pathlib.Path("profiles")
+    outdir.mkdir(parents=True, exist_ok=True)
+    outfile = outdir / f"{ticker}.json"
+    outfile.write_text(json.dumps({"profiles": profiles}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    st.success(f"Klar. Sparade {len(profiles)} profiler → {outfile}")
+    # visa tabell
+    rows = []
+    for pr in profiles:
+        m = pr.get("metrics", {})
+        rows.append({
+            "Name": pr.get("name",""),
+            "TotalReturn": m.get("TotalReturn"),
+            "SharpeD": m.get("SharpeD"),
+            "MaxDD": m.get("MaxDD"),
+            "Trades": m.get("Trades"),
+            "FinalEquity": m.get("FinalEquity"),
+            "BuyHold": m.get("BuyHold"),
+        })
+    st.dataframe(pd.DataFrame(rows))
+
+    # applicera bästa till sessionen
+    best_params = profiles[0]["params"] if profiles else None
+    if best_params and st.button(f"✅ Använd bästa för {ticker} i Backtest"):
+        for k, v in best_params.items():
+            st.session_state[k] = v
+        st.session_state["ticker"] = ticker
+        st.success("Applicerat till session. Gå till Backtest och kör.")
+
+# ---------- UI-kontroller ----------
+col1, col2, col3, col4 = st.columns([1.1,1,1,1])
+with col1:
+    ticker = st.text_input("Ticker", value=st.session_state.get("ticker","GETI B")).strip()
+with col2:
+    sims = st.number_input("Antal simuleringar", min_value=100, max_value=100_000, value=1000, step=100)
+with col3:
+    seed = st.number_input("Seed", min_value=0, max_value=1_000_000, value=42, step=1)
+with col4:
+    last5 = st.checkbox("5 år bakåt (auto)", value=True)
+
+if last5:
+    s, e = five_year_window()
+    start, end = s.isoformat(), e.isoformat()
+else:
+    s = st.date_input("Start", value=five_year_window()[0])
+    e = st.date_input("Slut", value=five_year_window()[1])
+    start, end = s.isoformat(), e.isoformat()
+
+st.markdown("---")
+if st.button("🚀 Kör optimering"):
+    if not ticker:
+        st.error("Ange en ticker.")
+    else:
+        run_optimizer_ui(ticker, int(sims), int(seed), start, end)
+else:
+    st.info("Tips: börja med 1 000–2 000 simuleringar. Öka när det ser rimligt ut.")
+
+# --- OPT PREVIEW CHART BLOCK ---
+import datetime as _dt
+from app.btwrap import run_backtest as _RUNBT
+from app.data_providers import get_ohlcv as _GET_OHLCV
+import pandas as _pd
+
+# === Datumväljare (påverkar optimering och graf) ===
+with st.sidebar.expander("Period", expanded=True):
+    _today = _dt.date.today()
+    _default_from = _today - _dt.timedelta(days=365*5)
+    _from = st.date_input("Startdatum", value=_default_from, key="opt_from_date")
+    _to   = st.date_input("Slutdatum",  value=_today,        key="opt_to_date")
+    # Spegla till de nycklar som används av motor/opt
+    st.session_state["from_date"] = str(_from)
+    st.session_state["to_date"]   = str(_to)
+
+# === Hjälpare för att plocka params ur state ===
+def _collect_params_from_state():
+    s = st.session_state
+    keys = [
+        "from_date","to_date",
+        "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+        "use_trend_filter","trend_ma_type","trend_ma_window",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal",
+        "use_bb_filter","bb_window","bb_nstd","bb_min",
+        "use_stop_loss","stop_mode","stop_loss_pct",
+        "atr_window","atr_mult",
+        "use_atr_trailing","atr_trail_mult",
+    ]
+    out = {}
+    for k in keys:
+        if k in s:
+            out[k] = s[k]
+    # Fallbacks
+    if not out.get("from_date") and "opt_from_date" in s:
+        out["from_date"] = str(s["opt_from_date"])
+    if not out.get("to_date") and "opt_to_date" in s:
+        out["to_date"] = str(s["opt_to_date"])
+    return out
+
+def _norm_equity_from_close(df):
+    if df is None or not isinstance(df, _pd.DataFrame) or "Close" not in df.columns:
+        return _pd.Series(dtype=float)
+    s = _pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if s.empty:
+        return s
+    return s / s.iloc[0]
+
+# === Förhands-graf: Strategi vs Buy&Hold vs OMXS30 ===
+st.markdown("### 📈 Förhandsgranskning (nuvarande inställningar)")
+_ticker = (st.session_state.get("ticker") or st.session_state.get("TICKER") or "").strip()
+_index  = (st.session_state.get("index_ticker") or "OMXS30").strip()
+
+col1, col2 = st.columns(2)
+with col1:
+    st.caption("Ticker: **{}**  |  Index: **{}**".format(_ticker or "–", _index))
+with col2:
+    st.caption("Period: **{} → {}**".format(st.session_state.get("from_date","?"), st.session_state.get("to_date","?")))
+
+if _ticker:
+    try:
+        _params = _collect_params_from_state()
+        # Strategi
+        _res = _RUNBT(_ticker, _params)
+        _eq  = _res.get("equity")
+        if isinstance(_eq, _pd.DataFrame) and {"Date","Equity"}.issubset(_eq.columns):
+            strat = _eq.set_index("Date")["Equity"]
+            strat = strat / strat.iloc[0]
+        else:
+            strat = _pd.Series(dtype=float)
+
+        # Buy&Hold (ticker) och OMXS30
+        _start = _params.get("from_date"); _end = _params.get("to_date")
+        px_t = _GET_OHLCV(_ticker, start=_start, end=_end)
+        px_i = _GET_OHLCV(_index,  start=_start, end=_end)
+        bh   = _norm_equity_from_close(px_t).rename("Buy&Hold")
+        idx  = _norm_equity_from_close(px_i).rename(_index)
+
+        # Sammanslagning
+        df_plot = _pd.concat(
+            [strat.rename("Strategi"), bh, idx],
+            axis=1
+        ).dropna(how="all")
+        if not df_plot.empty:
+            st.line_chart(df_plot)
+            # Snabb sammanfattning
+            last = df_plot.iloc[-1]
+            c1, c2, c3 = st.columns(3)
+            if "Strategi" in last:
+                c1.metric("Strategi slutvärde", "{:.2f}x".format(last["Strategi"]))
+            else:
+                c1.metric("Strategi slutvärde", "—")
+            if "Buy&Hold" in last:
+                c2.metric("Buy&Hold slutvärde", "{:.2f}x".format(last["Buy&Hold"]))
+            else:
+                c2.metric("Buy&Hold slutvärde", "—")
+            if _index in last:
+                c3.metric("{} slutvärde".format(_index), "{:.2f}x".format(last[_index]))
+            else:
+                c3.metric("{} slutvärde".format(_index), "—")
+        else:
+            st.info("Ingen data att plotta för vald period/inställningar.")
+    except Exception as _e:
+        import traceback as _tb
+        st.warning("Förhandsgranskning misslyckades: {}: {}".format(type(_e).__name__, _e))
+        st.code(_tb.format_exc())
+else:
+    st.info("Ange en ticker i Optimizern för att se grafen.")
+# --- /OPT PREVIEW CHART BLOCK ---

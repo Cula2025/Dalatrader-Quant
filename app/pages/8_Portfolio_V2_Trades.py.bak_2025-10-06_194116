@@ -1,0 +1,153 @@
+import json
+from pathlib import Path
+import pandas as pd
+import streamlit as st
+
+# Motor (btwrap som default, backtracker fallback)
+try:
+    from app import btwrap as W
+    run_backtest = W.run_backtest
+    MOTOR = "btwrap"
+except Exception:
+    from app.backtracker import run_backtest  # type: ignore
+    MOTOR = "backtracker"
+
+st.set_page_config(page_title="Trades – Portfolio V2", layout="wide")
+st.title("🧾 Trades – Portfolio V2 (läs-endast)")
+
+# --- Hjälpare ---
+def load_best_profile(p: Path):
+    d = json.loads(p.read_text(encoding="utf-8"))
+    profs = d.get("profiles") or []
+    if not profs:
+        return None
+    def tr(x):
+        m = x.get("metrics") or {}
+        v = m.get("TotalReturn")
+        try: return float(v)
+        except Exception: return float("-inf")
+    return max(profs, key=tr)
+
+def to_trades_df(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, pd.DataFrame):
+        return obj.copy()
+    if isinstance(obj, (list, tuple, dict)):
+        try:
+            return pd.DataFrame(obj)
+        except Exception:
+            return None
+    return None
+
+def pick_col(cols, *cands):
+    for c in cands:
+        if c in cols: return c
+    return None
+
+# --- Välj profilfiler ---
+all_files = sorted(Path("profiles").glob("*.json"), key=lambda p: p.name.lower())
+labels = [p.name for p in all_files]
+default = labels[:3] if labels else []
+sel = st.multiselect("Profilfiler (bästa profilen per fil)", labels, default=default)
+
+rows, summary = [], []
+
+for name in sel:
+    p = Path("profiles") / name
+    try:
+        best = load_best_profile(p)
+        if not best:
+            st.warning(f"{name}: inga profiler i filen.")
+            continue
+
+        ticker = best.get("ticker") or (best.get("params") or {}).get("ticker")
+        params = dict(best.get("params") or {})
+        if not ticker:
+            st.warning(f"{name}: kunde inte hitta ticker i profilen {best.get('name')!r}.")
+            continue
+
+        res = run_backtest(p={"ticker": ticker, "params": params})
+        df = to_trades_df(res.get("trades"))
+
+        if df is None or df.empty:
+            st.info(f"{name}: inga trades (eller okänt format).")
+            continue
+
+        # Datumfält → datetime
+        for col in ["Date","date","EntryDate","ExitDate","entry_date","exit_date","timestamp","Time","time"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # Lägg till TradeDate (prioritera EntryDate -> Date -> Time -> timestamp)
+        dcol = pick_col(df.columns, "EntryDate","entry_date","Date","date","Time","time","timestamp")
+        if dcol:
+            df["TradeDate"] = pd.to_datetime(df[dcol], errors="coerce")
+        else:
+            df["TradeDate"] = pd.NaT
+
+        # Räkna ut belopp = |Qty| * EntryPrice
+        qcol = pick_col(df.columns, "Qty","Quantity","Shares","Size")
+        pcol = pick_col(df.columns, "Entry","EntryPrice","entry_price","Price","Open","Close")
+
+        if qcol and pcol:
+            with pd.option_context('mode.use_inf_as_na', True):
+                df["Amount"] = (pd.to_numeric(df[qcol], errors="coerce").abs()
+                                * pd.to_numeric(df[pcol], errors="coerce"))
+        else:
+            df["Amount"] = pd.NA
+
+        df["Ticker"] = ticker
+        df["Profile"] = best.get("name")
+        rows.append(df)
+
+        summary.append({
+            "File": name,
+            "Ticker": ticker,
+            "Profile": best.get("name"),
+            "Trades": int(len(df)),
+            "DateCol": dcol or "-",
+            "QtyCol": qcol or "-",
+            "PriceCol": pcol or "-",
+        })
+
+    except Exception as e:
+        st.error(f"{name}: {type(e).__name__}: {e}")
+
+st.caption(f"Motor: {MOTOR}  |  Valda filer: {len(sel)}")
+
+if rows:
+    trades = pd.concat(rows, ignore_index=True, sort=False)
+
+    # Visa de mest relevanta kolumnerna först
+    preferred = [c for c in [
+        "TradeDate", "Ticker", "Profile",
+        # signal / sida
+        "Side","Action","Signal",
+        # kvantitet, pris, belopp
+        "Qty","Quantity","Shares","Size",
+        "Entry","EntryPrice","entry_price","Price",
+        "Amount",
+        # exit-info om den finns
+        "ExitDate","exit_date","Exit","ExitPrice",
+        # PnL om det finns
+        "PnL","Pnl","CumPnL","Equity","Cash",
+    ] if c in trades.columns]
+
+    show = trades[preferred] if preferred else trades
+
+    st.subheader(f"Trades ({len(trades)})")
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+    if summary:
+        st.subheader("Sammanfattning")
+        st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "⬇️ Ladda ner alla trades som CSV",
+        trades.to_csv(index=False).encode("utf-8"),
+        file_name="trades_all.csv",
+        mime="text/csv"
+    )
+else:
+    st.info("Inga trades att visa – välj en eller flera profilfiler ovan.")

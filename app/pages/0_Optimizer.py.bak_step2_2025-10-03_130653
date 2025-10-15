@@ -1,0 +1,30 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+# Minimal, known-good Optimizer shell to get the app compiling again.
+# We will add functionality step-by-step after the page loads cleanly.
+
+import streamlit as st
+
+# Branding (optional)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title="Dala Trader – Optimizer", page_icon="⚙️")
+
+st.title("⚙️ Optimizer (reset)")
+st.caption("Minimal version – inga grafer. När sidan funkar stabilt lägger vi tillbaka funktioner stegvis.")
+
+# Simple inputs (we won't call any heavy code yet)
+col1, col2, col3 = st.columns([1,1,1])
+with col1:
+    st.text_input("Ticker", key="opt_ticker", value=st.session_state.get("opt_ticker", "GETI B"))
+with col2:
+    st.text_input("Från (YYYY-MM-DD)", key="opt_from_date", value=st.session_state.get("opt_from_date","2020-10-01"))
+with col3:
+    st.text_input("Till (YYYY-MM-DD)", key="opt_to_date", value=st.session_state.get("opt_to_date","2025-10-01"))
+
+st.divider()
+st.write("✅ Sidan laddade. Vi lägger tillbaka optimering och jämförelse grafiskt i nästa steg.")

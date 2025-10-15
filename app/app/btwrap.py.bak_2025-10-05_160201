@@ -1,0 +1,105 @@
+from __future__ import annotations
+from typing import Any, Dict, Optional, Tuple
+import pandas as pd
+
+# Om ett annat btwrap redan exponerar run_backtest, återanvänd det.
+try:
+    from app.btwrap import run_backtest as _existing_run  # type: ignore
+    run_backtest = _existing_run  # type: ignore
+    __all__ = ["run_backtest"]
+except Exception:
+    # Vi är i vår shim-implementation
+    pass
+
+def _resolve_loader():
+    """Hitta Börsdata-loadern vi använder överallt."""
+    from app.data_providers import get_ohlcv  # endast Börsdata stöds
+    return get_ohlcv
+
+def _load_df_any_alias(ticker: str, from_date: Optional[str], to_date: Optional[str]) -> pd.DataFrame:
+    """Ladda OHLCV för tickern."""
+    GET = _resolve_loader()
+    try:
+        print(f"[btwrap DBG] GET call ticker={ticker!r}, from={from_date!r}, to={to_date!r}", flush=True)
+    df = GET(ticker=ticker, start=from_date, end=to_date)
+    except TypeError:
+        print(f"[btwrap DBG] GET call ticker={ticker!r}, from={from_date!r}, to={to_date!r}", flush=True)
+    df = GET(ticker, from_date, to_date)
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+def _normalize_close(df: pd.DataFrame) -> pd.Series:
+    if "Close" in df.columns:
+        s = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        return (s / s.iloc[0]) if len(s) else pd.Series(dtype="float64")
+    for c in df.columns:
+        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        if len(s):
+            return s / s.iloc[0]
+    return pd.Series(dtype="float64")
+
+def _parse_call(*args, **kwargs) -> Tuple[str, Dict[str, Any], Optional[pd.DataFrame]]:
+    """
+    Stöd båda signaturerna:
+      run_backtest(p={"ticker": "...", "params": {...}, "df": DataFrame?})
+      run_backtest("TICKER", {...})
+    """
+    ticker = ""
+    params: Dict[str, Any] = {}
+    df: Optional[pd.DataFrame] = None
+
+    if args and isinstance(args[0], str):
+        # run_backtest("TICKER", params)
+        ticker = args[0]
+        if len(args) > 1 and isinstance(args[1], dict):
+            params = dict(args[1])
+    elif "p" in kwargs and isinstance(kwargs["p"], dict):
+        p = dict(kwargs["p"])
+        ticker = p.get("ticker") or p.get("symbol") or p.get("code") or ""
+        params = dict(p.get("params") or {})
+        df = p.get("df") if isinstance(p.get("df"), pd.DataFrame) else None
+    else:
+        ticker = kwargs.get("ticker", "")
+        params = dict(kwargs.get("params", {}) or {})
+        df = kwargs.get("df") if isinstance(kwargs.get("df"), pd.DataFrame) else None
+
+    return ticker, params, df
+
+def run_backtest(*args, **kwargs) -> Dict[str, Any]:
+    """
+    Försök:
+      1) backtest.run_backtest(df, params) – din riktiga motor
+      2) BH-fallback (buy & hold) om motorn saknas/krånglar
+    Returnerar alltid dict med 'equity'.
+    """
+    ticker, params, df = _parse_call(*args, **kwargs)
+
+    from_date = params.get("from_date")
+    to_date   = params.get("to_date")
+
+    if df is None or df.empty:
+        df = _load_df_any_alias(ticker, from_date, to_date)
+    if df is None or df.empty:
+        raise ValueError(f"[btwrap.shim] Ingen data för '{ticker}'")
+
+    # Försök riktig motorn
+    try:
+        from backtest import run_backtest as _raw_bt  # din modul
+        try:
+            res = _raw_bt(df, params)
+        except TypeError:
+            res = _raw_bt(df=df, p=params)
+        if isinstance(res, dict) and ("equity" in res or "summary" in res):
+            return res
+    except Exception:
+        # saknas / fel → gå vidare till BH
+        pass
+
+    # BH-fallback
+    s = _normalize_close(df)
+    if s.empty:
+        raise ValueError("[btwrap.shim] Kunde inte skapa BH-equity (saknar Close)")
+
+    equity_list = [float(x) for x in s.values]
+    return {"equity": equity_list, "summary": {"mode": "BH-fallback"}}
+
+__all__ = ["run_backtest", "_load_df_any_alias"]

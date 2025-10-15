@@ -1,0 +1,186 @@
+from __future__ import annotations
+import os, json, datetime as dt
+from typing import Any, Dict, List, Tuple, Optional
+
+import streamlit as st
+import pandas as pd
+
+# --- trygg debug-import ---
+try:
+    from app.debuglog import setup_debug_ui, log_info, log_warn, log_error
+except Exception:
+    def setup_debug_ui(*a, **k): pass
+    def log_info(*a, **k): pass
+    def log_warn(*a, **k): pass
+    def log_error(*a, **k): pass
+
+st.set_page_config(page_title="Portfolio MIN", page_icon="📦", layout="wide")
+st.title("📦 Portfolio MIN")
+setup_debug_ui(st)
+
+OUT_DIR = "trader/outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+TICKER_KEYS = ("Ticker","ticker","symbol","code","name","shortName","short_name")
+
+def _flatten(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Platta ut params/config och mappa ticker."""
+    d = dict(rec)
+    # Extract ticker
+    for k in TICKER_KEYS:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            d["Ticker"] = v.strip()
+            break
+    # Flatten typical nested dicts
+    for nest in ("params","config","settings","options"):
+        if isinstance(d.get(nest), dict):
+            for k, v in d[nest].items():
+                d.setdefault(k, v)
+            del d[nest]
+    return d
+
+def _looks_like_single_profile(d: Dict[str, Any]) -> bool:
+    if any(k in d for k in TICKER_KEYS): return True
+    if any(k in d for k in ("params","config","settings","options")): return True
+    return False
+
+def _infer_ticker_from_filename(path: str) -> Optional[str]:
+    name = os.path.splitext(os.path.basename(path))[0]
+    # Ta delen före första "_" om den finns (ex: "GETI B_2025-10-01")
+    cand = name.split("_")[0].strip() if "_" in name else name.strip()
+    return cand or None
+
+def _json_to_rows(obj: Any) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if isinstance(obj, list):
+        rows = [ _flatten(x) for x in obj if isinstance(x, dict) ]
+    elif isinstance(obj, dict):
+        # listnycklar
+        for k in ("profiles","rows","items","results","data","list","values"):
+            if isinstance(obj.get(k), list):
+                rows = [ _flatten(x) for x in obj[k] if isinstance(x, dict) ]
+                break
+        else:
+            if _looks_like_single_profile(obj):
+                rows = [ _flatten(obj) ]
+            elif obj and all(isinstance(v, dict) for v in obj.values()):
+                # dict med tickers som keys
+                tmp = []
+                for tck, payload in obj.items():
+                    r = _flatten(payload)
+                    if "Ticker" not in r and isinstance(tck, str) and tck.strip():
+                        r["Ticker"] = tck.strip()
+                    tmp.append(r)
+                rows = tmp
+    return rows
+
+def parse_json_file(path: str) -> List[Dict[str, Any]]:
+    try:
+        text = open(path, "r", encoding="utf-8-sig").read().strip()
+        if not text:
+            return []
+        # NDJSON?
+        if "\n" in text and text.lstrip().startswith("{") and not text.strip().startswith("["):
+            out = []
+            for ln in text.splitlines():
+                ln = ln.strip()
+                if not ln: continue
+                try:
+                    out.append(_flatten(json.loads(ln)))
+                except Exception:
+                    continue
+            return out
+        obj = json.loads(text)
+        return _json_to_rows(obj)
+    except Exception as e:
+        log_warn(f"Parse fail for {path}: {e}")
+        return []
+
+@st.cache_data(ttl=120, show_spinner=False)
+def list_json_files(dir_path: str) -> List[str]:
+    if not os.path.isdir(dir_path): return []
+    return sorted([f for f in os.listdir(dir_path) if f.lower().endswith((".json",".jsonl",".ndjson"))])
+
+def build_df(dir_path: str, files: List[str]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for f in files:
+        path = os.path.join(dir_path, f)
+        recs = parse_json_file(path)
+        if not recs:
+            # skapa dummy-rad så man ser att filen fanns
+            rows.append({"Ticker": _infer_ticker_from_filename(path) or "", "source_file": f, "_note": "empty/parse-fail"})
+            continue
+        for r in recs:
+            r = dict(r)
+            r["source_file"] = f
+            if not r.get("Ticker"):
+                r["Ticker"] = _infer_ticker_from_filename(path) or ""
+            rows.append(r)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        # Städa kolumnnamn lite
+        df.columns = [str(c).replace("\ufeff","").strip() for c in df.columns]
+        # Flytta upp Ticker + filnamn först
+        cols = list(df.columns)
+        ordered = [c for c in ("Ticker","source_file") if c in cols] + [c for c in cols if c not in ("Ticker","source_file")]
+        df = df[ordered]
+    return df
+
+# ---------- UI ----------
+left_dir, right_dir = st.columns([3, 1])
+default_dir = st.session_state.get("portfolio_dir", "/srv/trader/app/profiles")
+with left_dir:
+    data_dir = st.text_input("Datakatalog (JSON)", value=default_dir, key="portfolio_dir")
+with right_dir:
+    profiles = "/srv/trader/app/profiles"
+    if os.path.isdir(profiles) and st.button("Använd profiles/"):
+        st.session_state["portfolio_dir"] = profiles
+        st.rerun()
+
+files = list_json_files(data_dir)
+if not files:
+    st.warning(f"Inga JSON-filer i `{data_dir}`.")
+    st.stop()
+
+st.caption(f"Hittade {len(files)} fil(er) i `{data_dir}`")
+
+# Låt användaren välja (default: alla)
+picked = st.multiselect("Välj filer", files, default=files)
+if not picked:
+    st.info("Välj minst en fil.")
+    st.stop()
+
+df = build_df(data_dir, picked)
+if df.empty or "Ticker" not in df.columns:
+    st.error("Lyckades inte extrahera några profiler med **Ticker**.")
+    with st.expander("Rådata (för felsök)", expanded=False):
+        st.write({"picked": picked})
+    st.stop()
+
+# Sammanfattning
+c1, c2, c3 = st.columns(3)
+with c1: st.metric("Profiler", len(df))
+with c2: st.metric("Unika tickers", df["Ticker"].astype(str).str.strip().replace("", pd.NA).dropna().nunique())
+with c3: st.metric("Filer", len(set(df["source_file"].tolist())))
+
+st.subheader("Profiler")
+st.dataframe(df, width="stretch")
+
+# Spara-knappar
+ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+save_csv = os.path.join(OUT_DIR, f"portfolio_profiles_{ts}.csv")
+save_json = os.path.join(OUT_DIR, f"portfolio_profiles_{ts}.json")
+
+colA, colB = st.columns(2)
+with colA:
+    if st.button("💾 Spara CSV"):
+        df.to_csv(save_csv, index=False, encoding="utf-8-sig")
+        st.success(f"Sparat: `{save_csv}`")
+with colB:
+    if st.button("💾 Spara JSON"):
+        with open(save_json, "w", encoding="utf-8") as f:
+            json.dump(df.to_dict(orient="records"), f, ensure_ascii=False, indent=2)
+        st.success(f"Sparat: `{save_json}`")
+
+st.caption(f"Output-katalog: `{OUT_DIR}`")

@@ -1,0 +1,285 @@
+from __future__ import annotations
+import os, math, time, traceback, datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from dataclasses import dataclass
+from typing import Callable, Optional, Dict, Any, List
+
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+# ---------- Sidhuvud / tema ----------
+st.set_page_config(page_title="Optimizer", page_icon="🧠", layout="wide")
+PRIMARY = "#1f6feb"; ACCENT = "#d29922"
+st.markdown(f"""
+<style>
+:root {{ --primary:{PRIMARY}; --accent:{ACCENT}; }}
+.block-container {{ padding-top: .5rem; }}
+.stButton>button {{ background: var(--primary); color: white; border: 0; }}
+</style>
+""", unsafe_allow_html=True)
+
+OUT_DIR = "trader/outputs/opt_results"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ---------- Utils ----------
+def _fix_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    # Normalisera Ticker-kolumn
+    if "Ticker" not in df.columns:
+        for c in list(df.columns):
+            if c.lower() == "ticker":
+                df.rename(columns={c: "Ticker"}, inplace=True)
+                break
+    return df
+
+def _read_csv_utf8sig(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    return _fix_columns(df)
+
+def _write_csv_utf8sig(df: pd.DataFrame, path: str) -> None:
+    # Skriv alltid med 'utf-8-sig' för att undvika BOM-problem åt andra hållet
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+def _now_str() -> str:
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# ---------- Dynamisk “hitta optimizer”-adapter ----------
+# Vi försöker hitta en befintlig optimeringsfunktion i projektet.
+# Om ingen hittas kör vi en enkel "grid search" över RSI-parametrar via en generisk backtest-funktion om sådan finns;
+# annars faller vi tillbaka till en minimal dummy så att UI inte kraschar.
+
+@dataclass
+class FoundOptimizer:
+    name: str
+    call: Callable[..., Dict[str, Any]]
+    notes: str = ""
+
+def _maybe_import_optimizer() -> Optional[FoundOptimizer]:
+    candidates: List[tuple[str, str]] = [
+        # (module, attribute/function)
+        ("app.optimizer", "optimize_ticker"),
+        ("app.optimizer", "optimize"),
+        ("app.optimize", "optimize_ticker"),
+        ("app.optimize", "optimize"),
+        ("app.opt_engine", "optimize_ticker"),
+        ("app.opt_engine", "optimize"),
+    ]
+    for mod, attr in candidates:
+        try:
+            m = __import__(mod, fromlist=[attr])
+            fn = getattr(m, attr, None)
+            if callable(fn):
+                return FoundOptimizer(name=f"{mod}.{attr}", call=fn, notes="direct")
+        except Exception:
+            continue
+
+    # Om ingen dedikerad optimizer hittas, kolla om vi har en backtest-funktion
+    bt_candidates: List[tuple[str, str]] = [
+        ("app.backtest", "run"),
+        ("app.backtest", "run_backtest"),
+        ("app.portfolio_backtest", "run_backtest"),
+        ("app.engine", "run_backtest"),
+        ("app.backtester", "run_single"),
+    ]
+    for mod, attr in bt_candidates:
+        try:
+            m = __import__(mod, fromlist=[attr])
+            fn = getattr(m, attr, None)
+            if callable(fn):
+                # Wrappa till en enkel grid-search
+                def grid_opt(ticker: str, *, rsi_windows=(8, 14, 21), rsi_min=(25,), rsi_max=(60,), max_hold_days=None, **kw):
+                    best = None
+                    for w in rsi_windows:
+                        for lo in rsi_min:
+                            for hi in rsi_max:
+                                if lo >= hi:
+                                    continue
+                                try:
+                                    res = fn(ticker=ticker, rsi_window=w, rsi_min=lo, rsi_max=hi, max_hold_days=max_hold_days, **kw)
+                                except TypeError:
+                                    # Om signaturen skiljer sig, prova utan namn
+                                    try:
+                                        res = fn(ticker, w, lo, hi)
+                                    except Exception:
+                                        continue
+                                except Exception:
+                                    continue
+                                # Förväntad output: dict med 'ret' eller 'equity' etc; vi normaliserar
+                                score = None
+                                if isinstance(res, dict):
+                                    for key in ("ret","return","total_return","cagr","sharpe","score"):
+                                        if key in res:
+                                            score = float(res[key])
+                                            break
+                                if score is None:
+                                    # fallback: 0
+                                    score = 0.0
+                                cand = dict(Ticker=ticker, rsi_window=w, rsi_min=lo, rsi_max=hi, score=score)
+                                if best is None or cand["score"] > best["score"]:
+                                    best = cand
+                    return best or dict(Ticker=ticker, rsi_window=None, rsi_min=None, rsi_max=None, score=float("nan"))
+                return FoundOptimizer(name=f"{mod}.{attr} (grid wrapper)", call=grid_opt, notes="grid")
+        except Exception:
+            continue
+
+    return None
+
+FOUND = _maybe_import_optimizer()
+
+# ---------- UI – vänsterspalt: universum & parametrar ----------
+st.title("🧠 Optimizer")
+
+left, right = st.columns([1,2])
+
+with left:
+    st.subheader("Universum")
+    mode = st.radio("Källa", ["Lista (manuell)", "CSV-fil"], horizontal=False)
+    tickers: List[str] = []
+    if mode == "Lista (manuell)":
+        raw = st.text_area("Tickerlista (kommaseparerat eller radbrytningar)", value="HM B, INVE B, VOLV B", height=120)
+        tickers = [t.strip() for t in raw.replace(";", ",").replace("\n", ",").split(",") if t.strip()]
+    else:
+        csv_file = st.file_uploader("Ladda upp CSV med kolumnen 'Ticker'", type=["csv"])
+        if csv_file:
+            df_u = _read_csv_utf8sig(csv_file)
+            if "Ticker" not in df_u.columns:
+                st.error("CSV saknar kolumnen 'Ticker'.")
+            else:
+                tickers = list(df_u["Ticker"].astype(str).str.strip().unique())
+
+    st.divider()
+    st.subheader("Parametrar")
+    rsi_window_opts = st.text_input("RSI-fönster (kommaseparerat)", value="8,14,21")
+    rsi_min_opts = st.text_input("RSI-min (kommaseparerat)", value="25,30")
+    rsi_max_opts = st.text_input("RSI-max (kommaseparerat)", value="60,65,70")
+    max_hold_days = st.number_input("Max håll-dagar (valfritt, 0=ingen gräns)", min_value=0, value=0, step=1)
+
+    def _parse_nums(s: str) -> List[int]:
+        out = []
+        for p in s.replace(";", ",").split(","):
+            p = p.strip()
+            if not p:
+                continue
+            try:
+                out.append(int(float(p)))
+            except Exception:
+                pass
+        return sorted(set(out))
+
+    rsi_windows = _parse_nums(rsi_window_opts)
+    rsi_mins = _parse_nums(rsi_min_opts)
+    rsi_maxs = _parse_nums(rsi_max_opts)
+    if max_hold_days <= 0:
+        max_hold_days = None
+
+    st.divider()
+    st.subheader("Prestanda")
+    workers = st.slider("Parallella trådar", 1, 12, 4)
+    timeout_s = st.slider("Timeout per ticker (s)", 5, 300, 40)
+
+    st.divider()
+    label = st.text_input("Etikett för resultatfil", value="optimizer")
+    run_btn = st.button("Kör optimering")
+
+with right:
+    st.subheader("Status / Output")
+    if FOUND is None:
+        st.warning(
+            "Ingen dedikerad optimizer hittad i projektet. Sidan kör en enkel grid-wrapper **om** det finns en backtest-funktion. "
+            "Implementera gärna t.ex. `app.optimizer.optimize_ticker(ticker, rsi_window, rsi_min, rsi_max, **kw)` för bästa resultat."
+        )
+    else:
+        st.info(f"Optimizer: **{FOUND.name}** ({FOUND.notes})")
+
+    if run_btn:
+        if not tickers:
+            st.error("Lägg till minst en ticker.")
+            st.stop()
+        if not rsi_windows or not rsi_mins or not rsi_maxs:
+            st.error("Ange minst ett värde för RSI-fönster, RSI-min och RSI-max.")
+            st.stop()
+
+        # Kör optimeringen
+        st.write(f"Antal tickers: **{len(tickers)}**")
+        progress = st.progress(0.0, text="Startar…")
+        rows: List[Dict[str, Any]] = []
+
+        def _one(ticker: str) -> Dict[str, Any]:
+            try:
+                if FOUND is None:
+                    # Dummy – vi simulerar ett resultat så UI inte dör
+                    time.sleep(0.2)
+                    return {"Ticker": ticker, "rsi_window": None, "rsi_min": None, "rsi_max": None, "score": float("nan"), "Note": "no-optimizer"}
+                # Kör vald optimizer/backtest-wrapper
+                if FOUND.notes == "grid":
+                    res = FOUND.call(
+                        ticker,
+                        rsi_windows=tuple(rsi_windows),
+                        rsi_min=tuple(rsi_mins),
+                        rsi_max=tuple(rsi_maxs),
+                        max_hold_days=max_hold_days,
+                    )
+                else:
+                    # Anta signatur (försök med namnade args; din interna funktion kan ha annan signatur)
+                    try:
+                        res = FOUND.call(ticker=ticker, rsi_window=rsi_windows, rsi_min=rsi_mins, rsi_max=rsi_maxs, max_hold_days=max_hold_days)
+                    except TypeError:
+                        res = FOUND.call(ticker, rsi_windows, rsi_mins, rsi_maxs, max_hold_days)
+                # Normalisera rad
+                if not isinstance(res, dict):
+                    res = {"Ticker": ticker, "score": float("nan")}
+                res.setdefault("Ticker", ticker)
+                return res
+            except Exception as e:
+                return {"Ticker": ticker, "score": float("nan"), "Error": str(e)}
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_one, t): t for t in tickers}
+            for fut in as_completed(futs):
+                t = futs[fut]
+                try:
+                    row = fut.result(timeout=timeout_s)
+                except TimeoutError:
+                    row = {"Ticker": t, "score": float("nan"), "Error": "Timeout"}
+                except Exception as e:
+                    row = {"Ticker": t, "score": float("nan"), "Error": f"Exception: {e}"}
+                rows.append(row)
+                done += 1
+                progress.progress(done/len(tickers), text=f"{done}/{len(tickers)} klara…")
+
+        if not rows:
+            st.error("Inga resultat returnerades.")
+            st.stop()
+
+        df = pd.DataFrame(rows)
+        df = _fix_columns(df)
+
+        # Säkerställ standardkolumner
+        for col in ("rsi_window","rsi_min","rsi_max","score"):
+            if col not in df.columns:
+                df[col] = np.nan
+
+        # Sortera bästa överst om 'score' finns
+        if "score" in df.columns:
+            df = df.sort_values(by="score", ascending=False)
+
+        st.subheader("Resultat")
+        st.dataframe(df, width="stretch")
+
+        # Spara
+        fname = f"opt_{label}_{_now_str()}.csv"
+        out_path = os.path.join(OUT_DIR, fname)
+        _write_csv_utf8sig(df, out_path)
+        st.success(f"Sparat → `{out_path}`")
+
+        # Ladda ner
+        st.download_button(
+            "Ladda ner CSV",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=fname,
+            mime="text/csv",
+        )
+
+st.caption(f"Output folder: `{OUT_DIR}`")

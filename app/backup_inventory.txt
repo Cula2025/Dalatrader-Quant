@@ -1,0 +1,593 @@
+=== INVENTORY @ 2025-10-05_170836 ===
+
+# (A) Lokala backupfiler (*.bak*) med tidstämplar
+2025-09-24 00:13  ./app/backtest.py.bak
+2025-09-24 00:13  ./archive/app/20250909_1718/portfolio_backtest.py.bak
+2025-09-24 00:13  ./archive/pages/1_Backtrack.py.bak_20250920_225257
+2025-09-24 00:13  ./archive/pages/1_Backtrack.py.bak_tailheadfix_20250920_231444
+2025-09-24 00:13  ./archive/pages/1_Backtrack.py.bak_widthfix_20250920_225751
+2025-09-24 20:13  ./app/portfolio_signals.py.bak_2025-09-24_201341
+2025-09-24 21:00  ./app/portfolio_signals.py.bak_2025-09-24_210043
+2025-09-25 12:51  ./app/data_providers.py.bak_2025-09-25_125125
+2025-09-28 02:12  ./app/portfolio_signals.py.bak_wrap_2025-09-28_021253
+2025-09-29 12:26  ./app/data_providers.py.bak_ohlcv_2025-09-29_122633
+2025-09-29 23:43  ./backtest.py.bak_2025-09-29_234357
+2025-09-29 23:44  ./backtest.py.bak_2025-09-29_234410
+2025-09-29 23:44  ./backtest.py.bak_2025-09-29_234453
+2025-09-30 00:04  ./app/data_providers.py.bak_2025-09-30_000413
+2025-09-30 00:10  ./app/data_providers.py.bak_2025-09-30_001030
+2025-09-30 00:28  ./backtest.py.bak_2025-09-30_002758
+2025-09-30 20:02  ./pages/0_Optimizer.py.bak_2025-09-30_200244
+2025-09-30 21:04  ./tools/optimize_cli.py.bak_2025-09-30_210438
+2025-10-01 14:09  ./backtest.py.bak_params_2025-10-01_140955
+2025-10-01 16:22  ./pages/1_Backtest.py.bak_fixpayload_2025-10-01_162247
+2025-10-01 16:28  ./pages/1_Backtest.py.bak_profileloader_2025-10-01_162848
+2025-10-01 23:49  ./pages/0_Optimizer.py.bak_addchart_2025-10-01_234948
+2025-10-01 23:51  ./pages/0_Optimizer.py.bak_addchart_2025-10-01_235133
+2025-10-01 23:54  ./pages/0_Optimizer.py.bak_fixpreview_2025-10-01_235402
+2025-10-02 00:09  ./pages/0_Optimizer.py.bak_addpreview_2025-10-02_000926
+2025-10-02 00:17  ./pages/0_Optimizer.py.bak_previewhook_2025-10-02_001730
+2025-10-02 00:34  ./pages/0_Optimizer.py.bak_addpreview_2025-10-02_003439
+2025-10-02 00:40  ./pages/0_Optimizer.py.bak_fixpreview_2025-10-02_004042
+2025-10-02 16:46  ./pages/0_Optimizer.py.bak_clipfix_2025-10-02_164658
+2025-10-02 16:55  ./pages/0_Optimizer.py.bak_exceptfix_2025-10-02_165557
+2025-10-02 17:06  ./pages/0_Optimizer.py.bak_2025-10-02_170615
+2025-10-02 17:30  ./pages/0_Optimizer.py.bak_2025-10-02_173016
+2025-10-02 17:54  ./pages/0_Optimizer.py.bak_fixfuture_2025-10-02_175417
+2025-10-02 18:01  ./pages/0_Optimizer.py.bak_nografs_2025-10-02_180105
+2025-10-02 18:02  ./pages/0_Optimizer.py.bak_nografs_2025-10-02_180203
+2025-10-02 18:08  ./pages/0_Optimizer.py.bak_fixfuture_2025-10-02_180856
+2025-10-02 18:09  ./pages/0_Optimizer.py.bak_fixfuture_2025-10-02_180947
+2025-10-02 18:23  ./pages/0_Optimizer.py.bak_hide_preview_2025-10-02_182339
+2025-10-02 18:35  ./pages/0_Optimizer.py.bak_hidepreview_2025-10-02_183529
+2025-10-02 18:57  ./pages/0_Optimizer.py.bak_hidemetrics_2025-10-02_185755
+2025-10-02 19:09  ./pages/0_Optimizer.py.bak_nocharts_2025-10-02_190910
+2025-10-02 19:35  ./pages/0_Optimizer.py.bak_disable_previews_2025-10-02_193549
+2025-10-02 20:14  ./pages/0_Optimizer.py.bak_2025-10-02_201439
+2025-10-03 01:42  ./pages/1_Backtest.py.bak_cleanup_2025-10-03_014244
+2025-10-03 12:23  ./pages/1_Backtest.py.bak_clean_2025-10-03_122306
+2025-10-03 13:04  ./pages/0_Optimizer.py.bak_reset_2025-10-03_130436
+2025-10-03 13:06  ./pages/0_Optimizer.py.bak_step2_2025-10-03_130653
+2025-10-03 19:21  ./backtest.py.bak_2025-09-29_234357.bak_dbg_2025-10-03_192117
+2025-10-03 19:49  ./app/btwrap.py.bak_fixprov_2025-10-03_194912
+2025-10-03 19:59  ./app/btwrap.py.bak_fixprov_2025-10-03_195923
+2025-10-03 20:12  ./app/btwrap.py.bak_resolver_2025-10-03_201242
+2025-10-03 20:37  ./backtest.py.bak_fix_loader_2025-10-03_203740
+2025-10-03 21:32  ./app/btwrap.py.bak_fixwrap_2025-10-03_212457
+2025-10-04 12:51  ./backups/2_Portfolio_MIN.py.bak_fix_bh_2025-10-04_125118
+2025-10-04 12:58  ./backups/2_Portfolio_MIN.py.bak_2025-10-04_125822
+2025-10-04 13:13  ./backups/2_Portfolio_MIN.py.bak_2025-10-04_131325
+2025-10-04 13:13  ./backups/2_Portfolio_MIN.py.bak_2025-10-04_131355
+2025-10-04 13:27  ./backups/2_Portfolio_MIN.py.bak_2025-10-04_132732
+2025-10-04 14:07  ./backups/2_Portfolio_MIN.py.bak_fix_try_2025-10-04_140703
+2025-10-04 14:41  ./backups/2_Portfolio_MIN.py.bak_fix_try_2025-10-04_144134
+2025-10-04 15:16  ./backups/2_Portfolio_MIN.py.bak_fix_block_2025-10-04_151618
+2025-10-04 15:33  ./pages/2_Portfolio_MIN.py.bak_2025-10-04_153349
+2025-10-04 15:34  ./pages/2_Portfolio_MIN.py.bak_2025-10-04_153435
+2025-10-04 16:19  ./pages/0_Optimizer.py.bak_2025-10-04_161948
+2025-10-04 16:29  ./pages/2_Portfolio.py.bak_2025-10-04_162954
+2025-10-04 16:48  ./archive/pages/1_Backtrack.py.bak
+2025-10-04 16:48  ./archive/pages/1_Backtrack.py.bak_brand_20250915_121936
+2025-10-04 16:48  ./archive/pages/1_Backtrack.py.bak_clean_20250912_123539
+2025-10-04 16:48  ./archive/pages/2_Portfölj_OLD.py.bak
+2025-10-04 16:48  ./backups/1_Backtest_MIN.py.bak_2025-10-04_000233
+2025-10-04 16:48  ./backups/1_Backtest_MIN.py.bak_2025-10-04_001524
+2025-10-04 16:48  ./backups/1_Backtest_MIN.py.bak_2025-10-04_004412
+2025-10-04 16:48  ./backups/1_Backtest.py.bak_2025-10-03_223900
+2025-10-04 16:48  ./backups/1_Backtest.py.bak_2025-10-03_225325
+2025-10-04 16:48  ./backups/1_Backtest.py.bak_2025-10-03_230821
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_20250912_215311
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_164341
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_171955
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_172621
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_173842
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_173909
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_174028
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_174606
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_175044
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_204726
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_212449
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_213820
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_214550
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_225656
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_225823
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_230429
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_233253
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_233331
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_234134
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-25_234854
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_001007
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_004717
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_012031
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_013155
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_122030
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_124117
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_124445
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_125055
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_130555
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_130610
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_131632
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_132343
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_133300
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_134739
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_135353
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_141019
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_141421
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_143456
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_144435
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_150505
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_154057
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_154854
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_155601
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_160234
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_161328
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_171223
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_172258
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_173227
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_175113
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_180501
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_205118
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_211940
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_212004
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_213037
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_214406
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_220654
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_221143
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_222004
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_222729
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-26_224655
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-27_001753
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-30_150959
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-30_153438
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_2025-09-30_171524
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_append_plot_2025-10-02_124356
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_autofix_2025-09-27_005206
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_autoticker_2025-10-02_013535
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_brand_20250914_224409
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_brand_20250915_121936
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_btnfix_2025-09-30_141326
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_btshim_2025-09-28_205619
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_btwrap_2025-09-28_015248
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_btwrap_2025-09-28_015446
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_caption_2025-09-25_182824
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_clipperiod_2025-10-02_014755
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_clip_period_2025-10-02_150720
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_DateFix_20250912_221855
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_DateFix_20250913_094943
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_diag_2025-10-03_131613
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fix_2025-09-25_180825
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fix_2025-09-25_231420
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fix_2025-09-26_230213
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fix_2025-10-03_140811
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fix_2025-10-03_141630
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixcalls_2025-09-28_013155
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fix_diag_2025-10-03_132628
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixheader_2025-09-30_132143
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixindent_2025-09-30_135634
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixindent_2025-10-02_154242
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixindent_2025-10-02_155145
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixparen_2025-10-02_015536
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixpreview_2025-10-02_163856
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixpreview2_2025-10-02_005320
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixre_2025-10-03_132037
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_fixwrap_2025-10-02_015213
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_futurefix_2025-09-28_162251
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_hdr_2025-09-27_010909
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_headerfix_2025-09-27_002633
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_hide_best_2025-10-02_153650
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_hide_best_2025-10-02_153720
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_importfix_2025-09-28_003819
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_importshim_2025-09-28_004801
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_importwrap_2025-09-28_005411
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_indent_2025-09-26_225134
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_indent_2025-09-26_225213
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_normticker_2025-10-03_152400
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_normticker_2025-10-03_152416
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_normticker_2025-10-03_153135
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_override_2025-09-28_014025
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_reset_2025-09-26_232715
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_reset_2025-10-03_125909
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_rm_2025-09-25_182318
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_rm_datesidebar
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_rmdup_2025-09-25_180005
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_rmdup_2025-10-02_130109
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_rm_extra_expander_2025-10-02_144455
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_rm_extra_expander_2025-10-02_145456
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_runbt_2025-09-28_014808
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_runwrap_2025-09-28_010733
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_save_tmp_2025-09-27_113925
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_shimfix_2025-09-28_210634
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_shimfix_2025-09-28_211425
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_sidebar_2025-09-26_231119
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_sidebarreset_2025-09-27_003452
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_srvprofiles_2025-09-25_223149
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_ticker_2025-10-02_010745
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_ticker_2025-10-02_011157
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_ui_2025-09-30_211042
+2025-10-04 16:48  ./pages/0_Optimizer.py.bak_wrapper_2025-09-28_010131
+2025-10-04 16:48  ./pages/1_Backtest_MIN.py.bak_alias_2025-10-03_190256
+2025-10-04 16:48  ./pages/1_Backtest_MIN.py.bak_aliasfix_2025-10-03_190733
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_2025-09-28_225103
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_2025-09-30_004629
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_2025-09-30_230434
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_2025-10-01_020859
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_2025-10-02_202911
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_2025-10-03_000027
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_4cols_2025-10-02_225622
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_addcollect_2025-10-01_133407
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_addpayload_2025-10-01_160724
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_add_s_2025-10-02_232313
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_apply_2025-10-01_001716
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_applyfix_2025-10-01_002352
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_autofix_2025-10-01_135631
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_autoindent_2025-09-29_010017
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_autoindent_2025-09-29_010716
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_backtestfix_2025-09-28_143027
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_black_2025-10-01_164308
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_btshim_2025-09-28_205619
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_btwrap_2025-09-28_015248
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_btwrap_2025-09-28_015446
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_classic_2025-10-01_184329
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_clean_2025-09-29_011800
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_collect_2025-10-01_022218
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_collect_2025-10-01_131912
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_cols_2025-10-01_141845
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dates_2025-10-01_153157
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dbgfix_2025-09-29_003620
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dbgsyntax_2025-09-29_004121
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_debug_2025-09-29_002007
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_debug_2025-10-01_144316
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_debug_2025-10-01_144332
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_debug_2025-10-01_155917
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_debug_2025-10-01_160303
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfguard_2025-09-28_143623
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfguard_2025-09-28_161548
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfguard_2025-09-28_212444
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfguard_2025-09-28_213724
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfguard_2025-09-28_233616
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfguard_2025-09-28_234556
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfguard2_2025-09-28_144226
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfshim_2025-09-28_215425
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_dfstate_2025-09-29_132858
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fix_2025-10-03_140811
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fix_2025-10-03_141630
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fixcollect_2025-10-01_021229
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fixkeys_2025-10-02_230559
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fixpayload_2025-10-01_162235
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fixst_2025-10-01_155446
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fix_tickerkey_2025-10-02_211246
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fix_tickerkey_2025-10-02_213158
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_flex_2025-09-28_232726
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_fullfix_2025-10-01_154830
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_futurefix_2025-09-28_162251
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_guard_2025-10-01_013701
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_hide_2025-10-01_014853
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_hide_2025-10-02_222115
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_importpath_2025-10-01_145742
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_indentdebug_2025-09-29_004550
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_indentfix_2025-09-29_121539
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_inject_2025-10-02_222135
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_injectfix_2025-09-30_221843
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_keysindent_2025-10-03_010705
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_loader_2025-09-30_223026
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_loader_2025-10-01_145205
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_main_debug_2025-10-01_173710
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_minrun_2025-10-01_181751
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_norm_2025-09-29_143849
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_params_2025-10-02_210447
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_paramsfix_2025-09-29_013911
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_payload_2025-10-01_134658
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_payload_2025-10-01_154007
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_pending_2025-09-30_223643
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_replace_s_2025-10-02_233304
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_reset_2025-10-01_150517
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_restore_2025-09-29_122633
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_rm_2025-10-01_020233
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_shimfix_2025-09-28_210634
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_shimfix_2025-09-28_211425
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_sig_2025-09-28_231124
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_sig_2025-09-28_232046
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_strayexcept_2025-09-29_005146
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_titlecase_2025-09-29_015006
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_titlecase_2025-09-29_015740
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_topblock_2025-10-02_224346
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_tupleaware_2025-09-29_012531
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_ui_2025-10-01_013257
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_ui_2025-10-01_150039
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_ui_2025-10-02_234712
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_unexpectedindent_2025-09-29_005619
+2025-10-04 16:48  ./pages/1_Backtest.py.bak_wide_2025-10-02_222100
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_2025-09-24_214224
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_2025-09-24_232355
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_2025-09-24_234611
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_2025-10-01_231510
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_2025-10-01_231702
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_2025-10-01_232127
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_btshim_2025-09-28_205619
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_btwrap_2025-09-28_015248
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_btwrap_2025-09-28_015446
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_ew_2025-10-01_205448
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_fixdoc_2025-10-01_212352
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_fixsyntax_2025-09-28_140903
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_futurefix_2025-09-28_162251
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_portfolioimport_2025-09-28_162841
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_shimfix_2025-09-28_210634
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_shimfix_2025-09-28_211425
+2025-10-04 16:48  ./pages/2_Portfolio.py.bak_step2_2025-10-01_204505
+2025-10-04 16:48  ./pages/2_Portfölj.py.bak_2025-09-24_212627
+2025-10-04 16:48  ./pages/_2_Portfölj.py.bak.OLD
+2025-10-04 16:48  ./pages/_DISABLED_2_Portfolio.py.bak_2025-10-01_201603
+2025-10-04 16:59  ./pages/2_Portfolio.py.bak_2025-10-04_165946
+2025-10-04 17:26  ./pages/1_Backtest.py.bak_2025-10-04_172621
+2025-10-04 17:28  ./pages/1_Backtest.py.bak_2025-10-04_172835
+2025-10-04 17:32  ./pages/1_Backtest.py.bak_2025-10-04_173257
+2025-10-04 17:40  ./pages/2_Portfolio_MIN.py.bak_2025-10-04_174029
+2025-10-04 17:43  ./app/btwrap.py.bak_2025-10-04_174354
+2025-10-04 17:43  ./app/btwrap.py.bak_add_dataproviders_2025-10-03_203022
+2025-10-04 17:43  ./app/btwrap.py.bak_add_dataproviders_2025-10-03_203022.bak_2025-10-04_174354
+2025-10-04 17:43  ./app/btwrap.py.bak_add_dataproviders_2025-10-03_203104
+2025-10-04 17:43  ./app/btwrap.py.bak_add_dataproviders_2025-10-03_203104.bak_2025-10-04_174354
+2025-10-04 17:43  ./app/btwrap.py.bak_autofix_2025-10-03_205555
+2025-10-04 17:43  ./app/btwrap.py.bak_autofix_2025-10-03_205555.bak_2025-10-04_174354
+2025-10-04 17:43  ./app/btwrap.py.bak_guard_2025-10-03_210527
+2025-10-04 17:43  ./app/btwrap.py.bak_guard_2025-10-03_210527.bak_2025-10-04_174354
+2025-10-04 17:43  ./app/btwrap.py.bak_stub_2025-10-03_210114
+2025-10-04 17:43  ./app/btwrap.py.bak_stub_2025-10-03_210114.bak_2025-10-04_174354
+2025-10-04 17:48  ./app/btwrap.py.bak_2025-10-04_174736
+2025-10-04 22:46  ./pages/2_Portfolio_MIN.py.bak_2025-10-04_224557
+2025-10-04 22:56  ./pages/2_Portfolio.py.bak_2025-10-04_225637
+2025-10-04 23:02  ./pages/2_Portfolio.py.bak_2025-10-04_230245
+2025-10-04 23:24  ./pages/2_Portfolio.py.bak_profiles_2025-10-04_232457
+2025-10-04 23:31  ./pages/2_Portfolio.py.bak_bdonly_2025-10-04_233122
+2025-10-05 00:06  ./pages/2_Portfolio.py.bak_2025-10-05_000636
+2025-10-05 14:58  ./app/btwrap.py.bak_2025-10-05_145825
+2025-10-05 15:02  ./app/btwrap.py.bak_2025-10-05_150207
+2025-10-05 15:53  ./app/btwrap.py.bak_2025-10-05_155328
+2025-10-05 16:02  ./app/btwrap.py.bak_2025-10-05_160201
+
+# (B) Nyckelfiler – individuella backuper
+
+## pages/2_Portfolio.py*
+  pages/2_Portfolio.py
+  pages/2_Portfolio.py.bak_2025-10-05_000636
+  pages/2_Portfolio.py.bak_bdonly_2025-10-04_233122
+  pages/2_Portfolio.py.bak_profiles_2025-10-04_232457
+  pages/2_Portfolio.py.bak_2025-10-04_230245
+  pages/2_Portfolio.py.bak_2025-10-04_225637
+  pages/2_Portfolio.py.bak_2025-10-04_165946
+  pages/2_Portfolio.py.bak_btwrap_2025-09-28_015248
+  pages/2_Portfolio.py.bak_shimfix_2025-09-28_210634
+  pages/2_Portfolio.py.bak_ew_2025-10-01_205448
+  pages/2_Portfolio.py.bak_2025-10-01_231510
+  pages/2_Portfolio.py.bak_2025-10-01_231702
+  pages/2_Portfolio.py.bak_2025-09-24_232355
+  pages/2_Portfolio.py.bak_2025-09-24_214224
+  pages/2_Portfolio.py.bak_step2_2025-10-01_204505
+  pages/2_Portfolio.py.bak_fixsyntax_2025-09-28_140903
+  pages/2_Portfolio.py.bak_2025-10-01_232127
+  pages/2_Portfolio.py.bak_fixdoc_2025-10-01_212352
+  pages/2_Portfolio.py.bak_portfolioimport_2025-09-28_162841
+  pages/2_Portfolio.py.bak_shimfix_2025-09-28_211425
+  pages/2_Portfolio.py.bak_btshim_2025-09-28_205619
+  pages/2_Portfolio.py.bak_2025-09-24_234611
+  pages/2_Portfolio.py.bak_futurefix_2025-09-28_162251
+  pages/2_Portfolio.py.bak_btwrap_2025-09-28_015446
+  pages/2_Portfolio.py.bak_2025-10-04_162954
+
+## pages/1_Backtest.py*
+  pages/1_Backtest.py
+  pages/1_Backtest.py.bak_2025-10-04_173257
+  pages/1_Backtest.py.broken_2025-10-04_173058
+  pages/1_Backtest.py.bak_2025-10-04_172835
+  pages/1_Backtest.py.bak_2025-10-04_172621
+  pages/1_Backtest.py.bak_debug_2025-10-01_160303
+  pages/1_Backtest.py.bak_dfstate_2025-09-29_132858
+  pages/1_Backtest.py.bak_minrun_2025-10-01_181751
+  pages/1_Backtest.py.bak_dfguard_2025-09-28_143623
+  pages/1_Backtest.py.bak_inject_2025-10-02_222135
+  pages/1_Backtest.py.bak_2025-09-30_004629
+  pages/1_Backtest.py.bak_add_s_2025-10-02_232313
+  pages/1_Backtest.py.bak_collect_2025-10-01_022218
+  pages/1_Backtest.py.bak_dbgfix_2025-09-29_003620
+  pages/1_Backtest.py.bak_fixst_2025-10-01_155446
+  pages/1_Backtest.py.bak_tupleaware_2025-09-29_012531
+  pages/1_Backtest.py.bak_2025-10-02_202911
+  pages/1_Backtest.py.bak_addcollect_2025-10-01_133407
+  pages/1_Backtest.py.bak_2025-10-01_020859
+  pages/1_Backtest.py.bak_addpayload_2025-10-01_160724
+  pages/1_Backtest.py.bak_applyfix_2025-10-01_002352
+  pages/1_Backtest.py.bak_black_2025-10-01_164308
+  pages/1_Backtest.py.bak_replace_s_2025-10-02_233304
+  pages/1_Backtest.py.bak_debug_2025-09-29_002007
+  pages/1_Backtest.py.bak_dfguard2_2025-09-28_144226
+  pages/1_Backtest.py.bak_dbgsyntax_2025-09-29_004121
+  pages/1_Backtest.py.bak_dfguard_2025-09-28_234556
+  pages/1_Backtest.py.bak_rm_2025-10-01_020233
+  pages/1_Backtest.py.bak_topblock_2025-10-02_224346
+  pages/1_Backtest.py.bak_dfguard_2025-09-28_233616
+  pages/1_Backtest.py.bak_fix_2025-10-03_141630
+  pages/1_Backtest.py.bak_restore_2025-09-29_122633
+  pages/1_Backtest.py.bak_injectfix_2025-09-30_221843
+  pages/1_Backtest.py.bak_pending_2025-09-30_223643
+  pages/1_Backtest.py.bak_reset_2025-10-01_150517
+  pages/1_Backtest.py.bak_4cols_2025-10-02_225622
+  pages/1_Backtest.py.bak_btwrap_2025-09-28_015248
+  pages/1_Backtest.py.bak_norm_2025-09-29_143849
+  pages/1_Backtest.py.bak_autofix_2025-10-01_135631
+  pages/1_Backtest.py.bak_autoindent_2025-09-29_010017
+  pages/1_Backtest.py.bak_clean_2025-09-29_011800
+  pages/1_Backtest.py.bak_dates_2025-10-01_153157
+  pages/1_Backtest.py.bak_payload_2025-10-01_134658
+  pages/1_Backtest.py.bak_keysindent_2025-10-03_010705
+  pages/1_Backtest.py.bak_unexpectedindent_2025-09-29_005619
+  pages/1_Backtest.py.bak_cols_2025-10-01_141845
+  pages/1_Backtest.py.bak_fix_tickerkey_2025-10-02_213158
+  pages/1_Backtest.py.bak_importpath_2025-10-01_145742
+  pages/1_Backtest.py.bak_titlecase_2025-09-29_015006
+  pages/1_Backtest.py.bak_indentfix_2025-09-29_121539
+  pages/1_Backtest.py.bak_sig_2025-09-28_231124
+  pages/1_Backtest.py.bak_btshim_2025-09-28_205619
+  pages/1_Backtest.py.bak_classic_2025-10-01_184329
+  pages/1_Backtest.py.bak_wide_2025-10-02_222100
+  pages/1_Backtest.py.bak_dfguard_2025-09-28_161548
+  pages/1_Backtest.py.bak_fullfix_2025-10-01_154830
+  pages/1_Backtest.py.bak_indentdebug_2025-09-29_004550
+  pages/1_Backtest.py.bak_fixcollect_2025-10-01_021229
+  pages/1_Backtest.py.bak_debug_2025-10-01_155917
+  pages/1_Backtest.py.bak_payload_2025-10-01_154007
+  pages/1_Backtest.py.bak_strayexcept_2025-09-29_005146
+  pages/1_Backtest.py.bak_fixpayload_2025-10-01_162235
+  pages/1_Backtest.py.bak_main_debug_2025-10-01_173710
+  pages/1_Backtest.py.bak_2025-09-30_230434
+  pages/1_Backtest.py.bak_btwrap_2025-09-28_015446
+  pages/1_Backtest.py.bak_shimfix_2025-09-28_210634
+  pages/1_Backtest.py.bak_2025-10-03_000027
+  pages/1_Backtest.py.bak_dfguard_2025-09-28_212444
+  pages/1_Backtest.py.bak_fix_2025-10-03_140811
+  pages/1_Backtest.py.bak_loader_2025-09-30_223026
+  pages/1_Backtest.py.bak_loader_2025-10-01_145205
+  pages/1_Backtest.py.bak_debug_2025-10-01_144316
+  pages/1_Backtest.py.bak_debug_2025-10-01_144332
+  pages/1_Backtest.py.bak_flex_2025-09-28_232726
+  pages/1_Backtest.py.bak_hide_2025-10-01_014853
+  pages/1_Backtest.py.bak_collect_2025-10-01_131912
+  pages/1_Backtest.py.bak_ui_2025-10-01_013257
+  pages/1_Backtest.py.bak_autoindent_2025-09-29_010716
+  pages/1_Backtest.py.bak_backtestfix_2025-09-28_143027
+  pages/1_Backtest.py.bak_fixkeys_2025-10-02_230559
+  pages/1_Backtest.py.bak_guard_2025-10-01_013701
+  pages/1_Backtest.py.bak_titlecase_2025-09-29_015740
+  pages/1_Backtest.py.bak_ui_2025-10-02_234712
+  pages/1_Backtest.py.bak_dfshim_2025-09-28_215425
+  pages/1_Backtest.py.bak_fix_tickerkey_2025-10-02_211246
+  pages/1_Backtest.py.bak_futurefix_2025-09-28_162251
+  pages/1_Backtest.py.bak_hide_2025-10-02_222115
+  pages/1_Backtest.py.bak_shimfix_2025-09-28_211425
+  pages/1_Backtest.py.bak_2025-09-28_225103
+  pages/1_Backtest.py.bak_apply_2025-10-01_001716
+  pages/1_Backtest.py.bak_dfguard_2025-09-28_213724
+  pages/1_Backtest.py.bak_paramsfix_2025-09-29_013911
+  pages/1_Backtest.py.bak_params_2025-10-02_210447
+  pages/1_Backtest.py.bak_sig_2025-09-28_232046
+  pages/1_Backtest.py.bak_ui_2025-10-01_150039
+  pages/1_Backtest.py.bak_clean_2025-10-03_122306
+  pages/1_Backtest.py.bak_cleanup_2025-10-03_014244
+  pages/1_Backtest.py.bak_profileloader_2025-10-01_162848
+  pages/1_Backtest.py.bak_fixpayload_2025-10-01_162247
+
+## app/btwrap.py*
+  app/btwrap.py
+  app/btwrap.py.bak_2025-10-05_160201
+  app/btwrap.py.bak_2025-10-05_155328
+  app/btwrap.py.bak_2025-10-05_150207
+  app/btwrap.py.bak_2025-10-05_145825
+  app/btwrap.py.bak_2025-10-04_174736
+  app/btwrap.py.bak_guard_2025-10-03_210527
+  app/btwrap.py.bak_guard_2025-10-03_210527.bak_2025-10-04_174354
+  app/btwrap.py.bak_add_dataproviders_2025-10-03_203104
+  app/btwrap.py.bak_add_dataproviders_2025-10-03_203104.bak_2025-10-04_174354
+  app/btwrap.py.bak_stub_2025-10-03_210114
+  app/btwrap.py.bak_stub_2025-10-03_210114.bak_2025-10-04_174354
+  app/btwrap.py.bak_autofix_2025-10-03_205555
+  app/btwrap.py.bak_autofix_2025-10-03_205555.bak_2025-10-04_174354
+  app/btwrap.py.bak_2025-10-04_174354
+  app/btwrap.py.bak_add_dataproviders_2025-10-03_203022
+  app/btwrap.py.bak_add_dataproviders_2025-10-03_203022.bak_2025-10-04_174354
+  app/btwrap.py.bak_fixwrap_2025-10-03_212457
+  app/btwrap.py.bak_resolver_2025-10-03_201242
+  app/btwrap.py.bak_fixprov_2025-10-03_195923
+  app/btwrap.py.bak_fixprov_2025-10-03_194912
+
+## app/data_providers.py*
+  app/data_providers.py
+  app/data_providers.py.bak_2025-09-30_001030
+  app/data_providers.py.bak_2025-09-30_000413
+  app/data_providers.py.bak_ohlcv_2025-09-29_122633
+  app/data_providers.py.bak_2025-09-25_125125
+
+## app/portfolio_backtest.py*
+  app/portfolio_backtest.py
+
+## app/portfolio.py*
+  app/portfolio.py
+
+## app/portfolio_signals.py*
+  app/portfolio_signals.py
+  app/portfolio_signals.py.bak_wrap_2025-09-28_021253
+  app/portfolio_signals.py.bak_2025-09-24_210043
+  app/portfolio_signals.py.bak_2025-09-24_201341
+
+# (C) Arkivmappar (archive/…)
+2025-09-24 00:13  archive/20250909_1716/hello_streamlit.py
+2025-09-24 00:13  archive/20250909_1716/run_backtracker_ui.py
+2025-09-24 00:13  archive/app/20250909_1718/auto_profiles.py
+2025-09-24 00:13  archive/app/20250909_1718/backtest_simple.py
+2025-09-24 00:13  archive/app/20250909_1718/bd_legacy_client.py
+2025-09-24 00:13  archive/app/20250909_1718/borsdata_client_legacy.py
+2025-09-24 00:13  archive/app/20250909_1718/grid_tuner.py
+2025-09-24 00:13  archive/app/20250909_1718/inspect_volv_2024.py
+2025-09-24 00:13  archive/app/20250909_1718/modern_client.py
+2025-09-24 00:13  archive/app/20250909_1718/portfolio_backtest.py.bak
+2025-09-24 00:13  archive/app/20250909_1718/run_ui.py
+2025-09-24 00:13  archive/app/20250909_1718/save_borsdata.py
+2025-09-24 00:13  archive/app/20250909_1718/save_prices.py
+2025-09-24 00:13  archive/app/20250909_1718/save_prices_ui.py
+2025-09-24 00:13  archive/app/20250909_1718/screener_signals.py
+2025-09-24 00:13  archive/pages/0_Optimizer_BACK.py
+2025-09-24 00:13  archive/pages/1_Backtrack.py.bak_20250920_225257
+2025-09-24 00:13  archive/pages/1_Backtrack.py.bak_tailheadfix_20250920_231444
+2025-09-24 00:13  archive/pages/1_Backtrack.py.bak_widthfix_20250920_225751
+2025-10-02 13:20  archive/20250909_1716/__pycache__/hello_streamlit.cpython-313.pyc
+2025-10-02 13:20  archive/20250909_1716/__pycache__/run_backtracker_ui.cpython-313.pyc
+2025-10-02 13:20  archive/20250909_1716/__pycache__/run_ui_050.cpython-313.pyc
+2025-10-02 13:20  archive/pages/__pycache__/0_INVEB_Smoke.cpython-313.pyc
+2025-10-02 13:20  archive/pages/__pycache__/0_Optimizer_BACK.cpython-313.pyc
+2025-10-02 13:20  archive/pages/__pycache__/1_Backtrack.cpython-313.pyc
+2025-10-04 16:48  archive/20250909_1716/run_ui_050.py
+2025-10-04 16:48  archive/app/20250909_1718/UI.py
+2025-10-04 16:48  archive/pages/0_INVEB_Smoke.py
+2025-10-04 16:48  archive/pages/1_Backtrack.py
+2025-10-04 16:48  archive/pages/1_Backtrack.py.bak
+2025-10-04 16:48  archive/pages/1_Backtrack.py.bak_brand_20250915_121936
+2025-10-04 16:48  archive/pages/1_Backtrack.py.bak_clean_20250912_123539
+2025-10-04 16:48  archive/pages/20250909_1721/(v0.6.0-backtest).py
+2025-10-04 16:48  archive/pages/2_Portfölj_OLD.py.bak
+
+# (D) Profilfiler (facit från optimizern) – senaste 15
+2025-10-01 00:54  profiles/GETI B_2025-10-01_005427.json
+2025-10-02 01:45  profiles/HM B.json
+2025-10-02 13:33  profiles/Volv b.json
+2025-10-04 21:17  profiles/GETI B.json
+2025-10-05 00:23  profiles/YUBICO.json
+
+# (E) Git – status, grenar och taggar
+## git status
+## stabilize-2025-10-05
+ M storage/signals.db
+?? app/btwrap.py.bak_2025-10-05_155328
+?? app/btwrap.py.bak_2025-10-05_160201
+?? backup_inventory.txt
+
+## lokala grenar
+  main
+  server-sync
+* stabilize-2025-10-05
+
+## taggar
+baseline-working
+v0.1-server-sync
+
+## senaste 30 commits (kort)
+9cf02a3 snapshot före stabilisering
+d453cde snapshot före stabilisering
+ece476b snapshot: working baseline before UI cleanup
+29df7b1 Sync server code to server-sync
+32513cd Sync from server: update .gitignore, requirements; ignore storage/
+f177184 Server-sync: current working code from /srv/trader/app
+
+# (F) Systembackuper (root) – om finns
+totalt 7,5M
+drwxr-xr-x 2 root root 4,0K  5 okt 00.48 .
+drwx------ 5 root root 4,0K  5 okt 00.48 ..
+-rw-r--r-- 1 root root 7,5M  5 okt 00.48 dalatrader_app_2025-10-05_004823.tgz
+-rw-r--r-- 1 root root  481  5 okt 00.48 dalatrader_sys_2025-10-05_004824.tgz

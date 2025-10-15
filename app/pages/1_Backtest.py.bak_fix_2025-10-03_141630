@@ -1,0 +1,268 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, Any, List
+
+import pandas as pd
+import streamlit as st
+from app.btwrap import run_backtest as _RUNBT
+
+# --------- KONFIG ---------
+PROFILES_DIR = Path("/srv/trader/app/profiles") if Path("/srv/trader/app/profiles").exists() else Path.cwd() / "profiles"
+PAGE_TITLE = "Dala Trader – Backtest"
+# --------------------------
+
+# Valfri branding (fail-safe)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title=PAGE_TITLE, page_icon="⏪")
+
+st.title("⏪ Backtest")
+st.caption("Ladda profil från Optimizer, finjustera parametrar, kör backtest och spara tillbaka.")
+
+# ---------------- HELPER ----------------
+def _read_profiles_file(fp: Path) -> List[dict]:
+    try:
+        with fp.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("profiles", [])
+    except Exception as e:
+        st.sidebar.error(f"Kunde inte läsa {fp.name}: {type(e).__name__}: {e}")
+        return []
+
+def _apply_profile_to_session(prof: dict) -> None:
+    """Sätter ticker + params + ev. datum till session_state (utan grafer/rerun-loopar)."""
+    s = st.session_state
+    t = (prof.get("ticker") or "").strip()
+    if t:
+        s["bt_ticker"] = t  # OBS: backtest-sidan använder bt_ticker som widget-key
+
+    params = prof.get("params") or {}
+    # Stöd även datum som ibland ligger i params
+    fd = params.get("from_date") or prof.get("from_date") or prof.get("start") or ""
+    td = params.get("to_date")   or prof.get("to_date")   or prof.get("end")   or ""
+
+    # Mappa kända nycklar -> session keys (prefix 'bt_' för att undvika krockar)
+    keymap = {
+        "from_date":"bt_from_date", "to_date":"bt_to_date",
+        "use_rsi_filter":"bt_use_rsi_filter","rsi_window":"bt_rsi_window","rsi_min":"bt_rsi_min","rsi_max":"bt_rsi_max",
+        "use_trend_filter":"bt_use_trend_filter","trend_ma_type":"bt_trend_ma_type","trend_ma_window":"bt_trend_ma_window",
+        "breakout_lookback":"bt_breakout_lookback","exit_lookback":"bt_exit_lookback",
+        "use_macd_filter":"bt_use_macd_filter","macd_fast":"bt_macd_fast","macd_slow":"bt_macd_slow","macd_signal":"bt_macd_signal",
+        "use_bb_filter":"bt_use_bb_filter","bb_window":"bt_bb_window","bb_nstd":"bt_bb_nstd","bb_min":"bt_bb_min",
+        "use_stop_loss":"bt_use_stop_loss","stop_mode":"bt_stop_mode","stop_loss_pct":"bt_stop_loss_pct",
+        "atr_window":"bt_atr_window","atr_mult":"bt_atr_mult",
+        "use_atr_trailing":"bt_use_atr_trailing","atr_trail_mult":"bt_atr_trail_mult",
+    }
+    for src, dst in keymap.items():
+        if src in params:
+            s[dst] = params[src]
+
+    if fd:
+        s["bt_from_date"] = str(fd)
+    if td:
+        s["bt_to_date"] = str(td)
+
+def _collect_params_from_state() -> Dict[str, Any]:
+    """Samlar parametrar från session_state med 'bt_' prefix och returnerar ren params-dict."""
+    s = st.session_state
+    def get(k, default=None): return s.get(k, default)
+    params: Dict[str, Any] = {}
+
+    # Datum
+    if get("bt_from_date"): params["from_date"] = get("bt_from_date")
+    if get("bt_to_date"):   params["to_date"]   = get("bt_to_date")
+
+    # Filtren/indikatorer
+    if get("bt_use_rsi_filter", False): params["use_rsi_filter"] = True
+    params["rsi_window"] = int(get("bt_rsi_window", 14) or 14)
+    params["rsi_min"]    = float(get("bt_rsi_min", 30.0) or 30.0)
+    params["rsi_max"]    = float(get("bt_rsi_max", 70.0) or 70.0)
+
+    params["use_trend_filter"] = bool(get("bt_use_trend_filter", False))
+    params["trend_ma_type"]    = str(get("bt_trend_ma_type", "SMA") or "SMA")
+    params["trend_ma_window"]  = int(get("bt_trend_ma_window", 100) or 100)
+
+    params["breakout_lookback"] = int(get("bt_breakout_lookback", 55) or 55)
+    params["exit_lookback"]     = int(get("bt_exit_lookback", 20) or 20)
+
+    params["use_macd_filter"] = bool(get("bt_use_macd_filter", False))
+    params["macd_fast"]   = int(get("bt_macd_fast", 12) or 12)
+    params["macd_slow"]   = int(get("bt_macd_slow", 26) or 26)
+    params["macd_signal"] = int(get("bt_macd_signal", 9)  or 9)
+
+    params["use_bb_filter"] = bool(get("bt_use_bb_filter", False))
+    params["bb_window"] = int(get("bt_bb_window", 20) or 20)
+    params["bb_nstd"]   = float(get("bt_bb_nstd", 2.0) or 2.0)
+    params["bb_min"]    = float(get("bt_bb_min", 0.0) or 0.0)
+
+    params["use_stop_loss"] = bool(get("bt_use_stop_loss", False))
+    params["stop_mode"]     = str(get("bt_stop_mode", "pct") or "pct")
+    params["stop_loss_pct"] = float(get("bt_stop_loss_pct", 0.10) or 0.10)
+
+    params["atr_window"] = int(get("bt_atr_window", 14) or 14)
+    params["atr_mult"]   = float(get("bt_atr_mult", 2.0) or 2.0)
+
+    params["use_atr_trailing"] = bool(get("bt_use_atr_trailing", False))
+    params["atr_trail_mult"]   = float(get("bt_atr_trail_mult", 2.0) or 2.0)
+
+    return params
+
+def _current_payload() -> Dict[str, Any]:
+    """Bygger payload för run_backtest via btwrap."""
+    ticker = (st.session_state.get("bt_ticker") or "").strip()
+    return {"ticker": ticker, "params": _collect_params_from_state()}
+
+# ---------------- SIDOPANEL: PROFILER ----------------
+with st.sidebar.expander("📂 Ladda profil från fil", expanded=True):
+    files = sorted([fp for fp in PROFILES_DIR.glob("*.json") if fp.is_file()], key=lambda x: x.name.lower())
+    file_names = [f.name for f in files]
+    file_idx = st.selectbox("Profilfil", options=range(len(file_names)) if file_names else [], format_func=lambda i: file_names[i], key="bt_file_idx")
+    profiles: List[dict] = _read_profiles_file(files[file_idx]) if files else []
+    def _lab(i: int) -> str:
+        p = profiles[i]
+        t = (p.get("ticker") or "").strip()
+        n = p.get("name") or p.get("profile") or f"Profil {i+1}"
+        return f"{t} – {n}" if t else n
+    prof_idx = st.selectbox("Välj profil", options=range(len(profiles)) if profiles else [], format_func=_lab, key="bt_prof_idx")
+    if st.button("✅ Använd denna profil", width='stretch', key="bt_apply_profile_btn"):
+        if profiles:
+            _apply_profile_to_session(profiles[prof_idx])
+            st.success("Profil inläst i formuläret.")
+
+# ---------------- PARAMETRAR (4 kolumner) ----------------
+st.markdown("### Parametrar")
+
+# Basfält (överst)
+colA, colB = st.columns([1,1])
+with colA:
+    st.text_input("Ticker", key="bt_ticker", placeholder="t.ex. GETI B eller VOLV-B.ST")
+with colB:
+    st.selectbox("Stop mode", options=["pct","atr"], key="bt_stop_mode")
+
+# 4 kolumner för resten
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
+    st.text_input("Från (YYYY-MM-DD)", key="bt_from_date")
+    st.text_input("Till (YYYY-MM-DD)", key="bt_to_date")
+    st.checkbox("RSI-filter", key="bt_use_rsi_filter")
+    st.number_input("RSI window", min_value=2, value=int(st.session_state.get("bt_rsi_window", 14) or 14), step=1, key="bt_rsi_window")
+    st.number_input("RSI min", value=float(st.session_state.get("bt_rsi_min", 30.0) or 30.0), step=0.5, key="bt_rsi_min")
+    st.number_input("RSI max", value=float(st.session_state.get("bt_rsi_max", 70.0) or 70.0), step=0.5, key="bt_rsi_max")
+
+with c2:
+    st.checkbox("Trend-filter", key="bt_use_trend_filter")
+    st.selectbox("Trend MA typ", options=["SMA","EMA"], key="bt_trend_ma_type")
+    st.number_input("Trend MA window", min_value=2, value=int(st.session_state.get("bt_trend_ma_window", 100) or 100), step=1, key="bt_trend_ma_window")
+    st.number_input("Breakout lookback", min_value=1, value=int(st.session_state.get("bt_breakout_lookback", 55) or 55), step=1, key="bt_breakout_lookback")
+    st.number_input("Exit lookback", min_value=1, value=int(st.session_state.get("bt_exit_lookback", 20) or 20), step=1, key="bt_exit_lookback")
+
+with c3:
+    st.checkbox("MACD-filter", key="bt_use_macd_filter")
+    st.number_input("MACD fast", min_value=1, value=int(st.session_state.get("bt_macd_fast", 12) or 12), step=1, key="bt_macd_fast")
+    st.number_input("MACD slow", min_value=1, value=int(st.session_state.get("bt_macd_slow", 26) or 26), step=1, key="bt_macd_slow")
+    st.number_input("MACD signal", min_value=1, value=int(st.session_state.get("bt_macd_signal", 9) or 9), step=1, key="bt_macd_signal")
+    st.checkbox("Bollinger-filter", key="bt_use_bb_filter")
+    st.number_input("BB window", min_value=2, value=int(st.session_state.get("bt_bb_window", 20) or 20), step=1, key="bt_bb_window")
+
+with c4:
+    st.number_input("BB nstd", min_value=0.1, value=float(st.session_state.get("bt_bb_nstd", 2.0) or 2.0), step=0.1, key="bt_bb_nstd")
+    st.number_input("BB min", min_value=0.0, value=float(st.session_state.get("bt_bb_min", 0.0) or 0.0), step=0.05, key="bt_bb_min")
+    st.checkbox("Stop loss", key="bt_use_stop_loss")
+    st.number_input("Stop loss %", min_value=0.0, value=float(st.session_state.get("bt_stop_loss_pct", 0.10) or 0.10), step=0.01, key="bt_stop_loss_pct")
+    st.number_input("ATR window", min_value=1, value=int(st.session_state.get("bt_atr_window", 14) or 14), step=1, key="bt_atr_window")
+    st.number_input("ATR mult", min_value=0.1, value=float(st.session_state.get("bt_atr_mult", 2.0) or 2.0), step=0.1, key="bt_atr_mult")
+    st.checkbox("ATR trailing", key="bt_use_atr_trailing")
+    st.number_input("ATR trail mult", min_value=0.1, value=float(st.session_state.get("bt_atr_trail_mult", 2.0) or 2.0), step=0.1, key="bt_atr_trail_mult")
+
+# ---------------- Körning ----------------
+from app.btwrap import run_backtest as RUN_BT
+
+st.markdown("---")
+col_run, col_save = st.columns([1,1])
+with col_run:
+    if st.button("▶️ Kör backtest", type="primary", width='stretch', key="bt_run_btn"):
+        payload = _current_payload()
+        if not payload.get("ticker"):
+            st.error("Ange en ticker.")
+        else:
+            with st.spinner("Kör backtest..."):
+                try:
+                    res = RUN_BT(payload)  # förväntas ge {'summary': dict, 'equity': df, 'trades': df}
+                    st.session_state["bt_last_result"] = res
+                    st.success("Klar.")
+                except Exception as e:
+                    st.error(f"Backtest misslyckades: {type(e).__name__}: {e}")
+
+with col_save:
+    if st.button("💾 Spara som profil", width='stretch', key="bt_save_btn"):
+        try:
+            PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+            t = (st.session_state.get("bt_ticker") or "TICKER").replace("/", "-")
+            out = {
+                "profiles": [{
+                    "name": f"{t} – edited",
+                    "ticker": t,
+                    "params": _collect_params_from_state(),
+                }]
+            }
+            out_path = PROFILES_DIR / f"{t}.json"
+            out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+            st.success(f"Sparat till {out_path}")
+        except Exception as e:
+            st.error(f"Spara misslyckades: {type(e).__name__}: {e}")
+
+# ---------------- Resultat ----------------
+st.markdown("---")
+st.subheader("Resultat")
+
+res = st.session_state.get("bt_last_result")
+if not res:
+    st.info("Kör ett backtest för att se resultat.")
+else:
+    summ = res.get("summary", {}) or {}
+    eq   = res.get("equity", None)
+    tr   = res.get("trades", None)
+
+    # Metrics
+    cols = st.columns(6)
+    def fmt(x, pct=False):
+        if x is None: return "—"
+        try:
+            return f"{x:.2%}" if pct else f"{x:.4f}"
+        except Exception:
+            return str(x)
+
+    with cols[0]: st.metric("Trades", f"{int(summ.get('Trades', 0))}")
+    with cols[1]: st.metric("TotalReturn", fmt(summ.get("TotalReturn"), pct=True))
+    with cols[2]: st.metric("MaxDD", fmt(summ.get("MaxDD"), pct=True))
+    with cols[3]: st.metric("SharpeD", fmt(summ.get("SharpeD")))
+    with cols[4]: st.metric("BuyHold", fmt(summ.get("BuyHold"), pct=True))
+    with cols[5]: st.metric("FinalEquity", f"{float(summ.get('FinalEquity', 0.0)):.2f}")
+
+    # Trades-tabell
+    st.markdown("#### Trades")
+    try:
+        if isinstance(tr, pd.DataFrame) and len(tr):
+            st.dataframe(tr.reset_index(drop=True), width='stretch', hide_index=True)
+        else:
+            st.caption("Inga affärer.")
+    except Exception as e:
+        st.warning(f"Kunde inte visa trades: {type(e).__name__}: {e}")
+
+# ---------------- Debug ----------------
+with st.sidebar.expander("DEBUG", expanded=False):
+    try:
+        st.caption("Payload")
+        st.json(_current_payload())
+        if res:
+            st.caption("Summary")
+            st.json(res.get("summary", {}))
+    except Exception as e:
+        st.write("DEBUG-fel:", type(e).__name__, str(e))

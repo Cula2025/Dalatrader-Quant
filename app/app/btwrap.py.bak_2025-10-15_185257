@@ -1,0 +1,58 @@
+from typing import Dict, Any
+import os, importlib.util, pandas as pd
+from app.data_providers import get_ohlcv
+
+PAGES_OPT = os.path.abspath('/srv/trader/app/pages/0_optimizer.py')
+
+def _load():
+    spec = importlib.util.spec_from_file_location("optmod_from_pages", PAGES_OPT)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod
+
+def _to_series(eq):
+    s = pd.Series(dtype="float64") if eq is None else pd.to_numeric(pd.Series(eq), errors="coerce").dropna()
+    try:
+        s.index = pd.to_datetime(s.index); s = s.sort_index()
+    except Exception:
+        pass
+    if len(s): s.iloc[0] = 1.0
+    return s
+
+def run_backtest(p: Dict[str, Any], df=None):
+    t = (p or {}).get("ticker", "AAK")
+    params = (p or {}).get("params", {}) or {}
+    start = params.get("start") or "2020-10-05"
+    end   = params.get("end")
+
+    if df is None:
+        df = get_ohlcv(t, start=str(start), end=end)
+
+    m = _load()
+    out = None
+    for fn_name in ("backtest","run_backtest","run","simulate"):
+        fn = getattr(m, fn_name, None)
+        if callable(fn):
+            try:
+                out = fn(t, params, df)
+            except TypeError:
+                try:
+                    out = fn(t, params)
+                except TypeError:
+                    out = fn()
+            break
+    if out is None:
+        raise RuntimeError("Hittar ingen backtest-funktion i pages/0_optimizer.py")
+
+    if isinstance(out, dict):
+        eq = out.get("equity") or out.get("equity_curve") or out.get("eq")
+        trades = (out.get("trades") or out.get("orders") or out.get("signals")
+                  or out.get("transactions") or out.get("trade_list") or [])
+    elif isinstance(out, (list,tuple)):
+        eq = out[0] if len(out)>0 else None
+        trades = out[1] if len(out)>1 else []
+    else:
+        eq, trades = None, []
+
+    return {"equity": _to_series(eq), "trades": trades}

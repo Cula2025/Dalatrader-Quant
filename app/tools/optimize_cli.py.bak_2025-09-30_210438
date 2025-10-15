@@ -1,0 +1,206 @@
+from __future__ import annotations
+import sys, pathlib
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
+# -*- coding: utf-8 -*-
+import argparse, json, math, os, random
+from dataclasses import dataclass
+from datetime import date
+from typing import Dict, Any, List, Tuple
+
+import pandas as pd
+
+# Kör backtest via wrappern
+from app.btwrap import run_backtest as RUN_BT
+
+# ---------- sampling & validering ----------
+def ur(a: float, b: float, rng: random.Random) -> float:
+    return float(rng.uniform(a, b))
+
+def sample_params(rng: random.Random) -> Dict[str, Any]:
+    use_trend_filter = rng.random() < 0.5
+    use_macd_filter  = rng.random() < 0.4
+    use_bb_filter    = rng.random() < 0.4
+    use_stop_loss    = rng.random() < 0.3
+    use_atr_trailing = rng.random() < 0.3
+
+    p = {
+        "use_rsi_filter": True,
+        "rsi_window": rng.randint(8, 28),
+        "rsi_min": ur(5.0, 35.0, rng),
+        "rsi_max": ur(60.0, 85.0, rng),
+
+        "use_trend_filter": use_trend_filter,
+        "trend_ma_type": rng.choice(["EMA","SMA"]),
+        "trend_ma_window": rng.randint(20, 200),
+
+        "breakout_lookback": rng.randint(20, 120),
+        "exit_lookback":     rng.randint(10, 60),
+
+        "use_macd_filter": use_macd_filter,
+        "macd_fast":   rng.randint(8, 16),
+        "macd_slow":   rng.randint(18, 30),
+        "macd_signal": rng.randint(8, 14),
+
+        "use_bb_filter": use_bb_filter,
+        "bb_window": rng.randint(15, 30),
+        "bb_nstd":   ur(1.6, 2.4, rng),
+        "bb_min":    ur(0.0, 0.8, rng),
+
+        "use_stop_loss": use_stop_loss,
+        "stop_mode": rng.choice(["pct","atr"]),
+        "stop_loss_pct": ur(0.03, 0.20, rng),
+
+        "atr_window": rng.randint(10, 20),
+        "atr_mult":   ur(1.2, 3.2, rng),
+
+        "use_atr_trailing": use_atr_trailing,
+        "atr_trail_mult":   ur(1.2, 3.5, rng),
+    }
+    return p
+
+def validate_params(p: Dict[str, Any]) -> Tuple[bool, str]:
+    if p.get("use_rsi_filter"):
+        if not (2 <= p.get("rsi_window", 0) <= 250): return False, "rsi_window"
+        if not (0 <= p.get("rsi_min", 0) < p.get("rsi_max", 100)): return False, "rsi_min/max"
+    if p.get("use_trend_filter"):
+        if p.get("trend_ma_type") not in ("SMA","EMA"): return False, "trend_ma_type"
+        if p.get("trend_ma_window", 0) < 2: return False, "trend_ma_window"
+    if p.get("use_macd_filter"):
+        if not (p.get("macd_fast", 0) < p.get("macd_slow", 0)): return False, "macd fast>=slow"
+        if p.get("macd_signal", 0) < 1: return False, "macd_signal"
+    if p.get("use_bb_filter"):
+        if p.get("bb_window", 0) < 2: return False, "bb_window"
+        if p.get("bb_nstd", 0) <= 0: return False, "bb_nstd"
+        if not (0.0 <= p.get("bb_min", 0.0) <= 1.5): return False, "bb_min"
+    if p.get("use_stop_loss"):
+        if p.get("stop_mode") not in ("pct","atr"): return False, "stop_mode"
+        if p["stop_mode"] == "pct":
+            if not (0.01 <= p.get("stop_loss_pct", 0.0) <= 0.90): return False, "stop_loss_pct"
+        else:
+            if p.get("atr_window", 0) < 5: return False, "atr_window"
+            if p.get("atr_mult", 0) <= 0: return False, "atr_mult"
+            if p.get("use_atr_trailing") and p.get("atr_trail_mult", 0) <= 0:
+                return False, "atr_trail_mult"
+    return True, ""
+
+def five_year_window() -> Tuple[str, str]:
+    today = date.today()
+    try:
+        start = date(today.year - 5, today.month, today.day)
+    except ValueError:
+        # om samma dag inte finns (t.ex. 29 feb), backa en dag
+        start = date(today.year - 5, today.month, max(1, today.day - 1))
+    return str(start), str(today)
+
+def score(metrics: Dict[str, Any]) -> float:
+    tr  = float(metrics.get("TotalReturn", 0.0) or 0.0)
+    sh  = float(metrics.get("SharpeD", 0.0) or 0.0)
+    mdd = float(metrics.get("MaxDD", 0.0) or 0.0) # typiskt negativ
+    # Viktning: prioritera riskjusterad avkastning, belöna TR, straffa stor DD
+    return 1.00*sh + 0.30*tr - 0.20*abs(min(mdd, 0.0))
+
+# ---------- optimizer ----------
+def run_optimizer(ticker: str, sims: int = 10000, seed: int | None = None) -> Dict[str, Any]:
+    rng = random.Random(seed)
+    from_date, to_date = five_year_window()
+
+    results: List[Tuple[float, Dict[str,Any], Dict[str,Any]]] = []
+    errors: List[str] = []
+
+    for i in range(sims):
+        p = sample_params(rng)
+        ok, why = validate_params(p)
+        if not ok:
+            errors.append(f"invalid: {why}")
+            continue
+
+        # tvinga 5-årsfönster
+        p["from_date"] = from_date
+        p["to_date"]   = to_date
+
+        try:
+            res = RUN_BT({"ticker": ticker, "params": p})
+            summ = res.get("summary", {}) or {}
+            tr   = summ.get("Trades")
+            trn  = summ.get("TotalReturn")
+            # markera ogiltiga
+            if tr is None or trn is None or (isinstance(trn, float) and (math.isnan(trn) or math.isinf(trn))):
+                errors.append("invalid: metrics")
+                continue
+            if int(tr) == 0:
+                errors.append("invalid: 0 trades")
+                continue
+            sc = score(summ)
+            results.append((sc, p, summ))
+        except Exception as e:
+            errors.append(f"{type(e).__name__}: {e}")
+
+    # välj tre profiler
+    profiles: List[Dict[str,Any]] = []
+    if results:
+        results.sort(key=lambda t: t[0], reverse=True)
+        top = results[:max(50, min(200, len(results)))]  # arbetsmängd
+
+        # conservative = min MaxDD
+        cons = min(top, key=lambda t: float(t[2].get("MaxDD", 0.0)))
+        # aggressive = max TotalReturn
+        aggr = max(top, key=lambda t: float(t[2].get("TotalReturn", 0.0)))
+        # balanced = max SharpeD
+        balc = max(top, key=lambda t: float(t[2].get("SharpeD", 0.0)))
+
+        picks = [("conservative", cons), ("balanced", balc), ("aggressive", aggr)]
+        # deduplikera (om samma tuple vann flera kriterier tar vi nästa bästa på score)
+        used = set()
+        final = []
+        for label, item in picks:
+            if id(item) in used:
+                # hitta nästa bästa som inte redan är vald
+                for cand in results:
+                    if id(cand) not in used:
+                        item = cand
+                        break
+            used.add(id(item))
+            final.append((label, item))
+
+        for label, (sc, p, summ) in final:
+            name = f"{ticker} \u2013 {label}"
+            profiles.append({
+                "name": name,
+                "ticker": ticker,
+                "params": p,
+                "metrics": {
+                    k: summ.get(k) for k in ("TotalReturn","MaxDD","SharpeD","BuyHold","CAGR")
+                },
+            })
+
+    out = {"profiles": profiles, "errors": errors}
+    return out
+
+# ---------- main ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ticker", help="Ticker (t.ex. 'GETI B' eller 'VOLV B')")
+    ap.add_argument("--sims", type=int, default=10000, help="Antal simuleringar (default 10000)")
+    ap.add_argument("--seed", type=int, default=None, help="Slump-seed (default: None)")
+    ap.add_argument("--outdir", default="profiles", help="Ut-katalog (default: profiles)")
+    args = ap.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    data = run_optimizer(args.ticker, sims=args.sims, seed=args.seed)
+
+    # skriv fil
+    out_path = os.path.join(args.outdir, f"{args.ticker}.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[ok] sparade: {out_path}")
+    print(f"[info] profiler: {len(data.get('profiles', []))}, errors: {len(data.get('errors', []))}")
+    # toppa loggen lite
+    if data.get("profiles"):
+        for i, prof in enumerate(data["profiles"], 1):
+            m = prof.get("metrics", {})
+            print(f"  {i}. {prof.get('name')} TR={m.get('TotalReturn'):.4f} SharpeD={m.get('SharpeD'):.4f} MaxDD={m.get('MaxDD'):.4f}")
+
+if __name__ == "__main__":
+    main()

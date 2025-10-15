@@ -1,0 +1,686 @@
+from __future__ import annotations
+from app.safebt import run as SAFE_RUN_BT
+from app.debug_banner import show as debug_banner
+
+# --- FLEX UI RUNNER (auto-normalize args) ---
+def _FLEX_RUNBT(*args, **kwargs):
+    """
+    Accepterar:
+      (df, params)  -> skickas direkt
+      (ticker, start, end, params) -> hämtar OHLCV, bygger DataFrame, normaliserar OHLCV-namn, skickar (df, params)
+    Loggar i UI om st.session_state['debug_bt'] är True.
+    """
+    # Lazy imports inuti funktionen (minimerar importordnings-problem)
+    import pandas as pd
+    try:
+        import streamlit as _st
+        _debug = bool(_st.session_state.get("debug_bt", False))
+        def _log(msg):
+            if _debug:
+                try:
+                    _st.info(msg)
+                except Exception:
+                    print(msg)
+    except Exception:
+        _st = None
+        _debug = False
+        def _log(msg):  # fallback
+            print(msg)
+
+    def _coerce_to_df(obj):
+        """Försök robust konvertera valfri struktur till pandas.DataFrame."""
+        import pandas as pd
+        try:
+            import numpy as np  # ev. behövs
+        except Exception:
+            np = None
+
+        if obj is None:
+            raise ValueError("OHLCV-data är tom (None).")
+
+        # Redan en DF
+        if hasattr(obj, "head") and hasattr(obj, "columns"):
+            return obj.copy()
+
+        # Dict-varianter
+        if isinstance(obj, dict):
+            # Vanligt API-mönster: {"data": [ {row}, ... ]}
+            if "data" in obj and isinstance(obj["data"], list):
+                return pd.DataFrame(obj["data"])
+            # Annars: direkt DataFrame(dict) om det går
+            try:
+                return pd.DataFrame(obj)
+            except Exception:
+                # Dict med dict-värden -> lista av värden
+                if all(isinstance(v, dict) for v in obj.values()):
+                    return pd.DataFrame(list(obj.values()))
+                raise
+
+        # Lista/tuple-varianter
+        if isinstance(obj, (list, tuple)):
+            if len(obj) == 0:
+                raise ValueError("OHLCV-lista är tom.")
+            # list[dict]
+            if all(isinstance(x, dict) for x in obj):
+                return pd.DataFrame(obj)
+            # (dates, values)
+            if len(obj) == 2 and all(hasattr(x, '__iter__') for x in obj):
+                dates, values = obj
+                df = pd.DataFrame({'date': dates, 'close': values})
+                df['date'] = pd.to_datetime(df['date'])
+                return df.set_index('date')
+            # list[list]
+            if all(isinstance(x, (list, tuple)) for x in obj):
+                df = pd.DataFrame(obj)
+                # försök ge kolumnnamn om minst 5 kolumner
+                if df.shape[1] >= 5:
+                    extras = [f'extra{i}' for i in range(df.shape[1]-5)]
+                    df.columns = ['open','high','low','close','volume'] + extras
+                return df
+            # fallback
+            return pd.DataFrame(obj)
+
+        # numpy array
+        try:
+            import numpy as np
+            if isinstance(obj, np.ndarray):
+                return pd.DataFrame(obj)
+        except Exception:
+            pass
+
+        raise TypeError(f"Kan inte konvertera typ {type(obj).__name__} till DataFrame")
+
+    def _ensure_datetime_index(df):
+        import pandas as pd
+        if hasattr(df.index, "inferred_type") and "date" in (df.index.inferred_type or ""):
+            return df
+        # leta datumkolumn
+        date_col = None
+        for cand in ("date","time","timestamp","Date","DATETIME"):
+            if cand in df.columns:
+                date_col = cand
+                break
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col])
+            df = df.set_index(date_col)
+        else:
+            df.index = pd.to_datetime(df.index)
+        return df.sort_index()
+
+    def _normalize_ohlcv(df):
+        lower = {c.lower(): c for c in df.columns}
+        def pick(cands):
+            for c in cands:
+                if c in lower:
+                    return lower[c]
+            return None
+        mapping = {
+            "open":  pick(["open","o","open_price"]),
+            "high":  pick(["high","h","high_price"]),
+            "low":   pick(["low","l","low_price"]),
+            "close": pick(["close","c","adjclose","adj_close","price","last"]),
+            "volume":pick(["volume","v","vol","turnover"]),
+        }
+        for std, src in list(mapping.items()):
+            if src is not None and std not in df.columns:
+                df.rename(columns={src: std}, inplace=True)
+        # se till att minst 'close' finns
+        if "close" not in df.columns:
+            # försök skapa 'close' om OHLC finns
+            if all(c in df.columns for c in ("open","high","low")):
+                df["close"] = (df["open"] + df["high"] + df["low"]) / 3.0
+        return df
+
+    # --- fall 1: redan (df, params)
+    if len(args) >= 2 and hasattr(args[0], "head"):
+        _log("▶️ Kör (df, params) direkt till __CORE_RUNBT")
+        try:
+            return __CORE_RUNBT(args[0], args[1])
+        except Exception as e:
+            _log(f"❌ Fel i __CORE_RUNBT(df, params): {type(e).__name__}: {e}")
+            raise
+
+    # --- fall 2: (ticker, start, end, params)
+    if len(args) >= 4 and isinstance(args[0], str):
+        ticker, start, end, params = args[0], args[1], args[2], args[3]
+        _log(f"▶️ Hämtar OHLCV för {ticker} från {start} till {end}")
+        from app.data_providers import get_ohlcv as GET_OHLCV
+        import pandas as pd
+
+        def _to_datestr(d):
+            try:
+                return pd.to_datetime(d).date().isoformat()
+            except Exception:
+                return None
+
+        s = _to_datestr(start)
+        e = _to_datestr(end)
+
+        raw = GET_OHLCV(ticker, s, e)
+        _log(f"ℹ️ GET_OHLCV typ: {type(raw).__name__}")
+
+        try:
+            df = _coerce_to_df(raw)
+        except Exception as e:
+            _log(f"❌ Misslyckades konvertera till DataFrame: {type(e).__name__}: {e}")
+            raise
+
+        try:
+            df = _ensure_datetime_index(df)
+            df = _normalize_ohlcv(df)
+        except Exception as e:
+            _log(f"❌ Misslyckades normalisera/indexera DF: {type(e).__name__}: {e}")
+            raise
+
+        _log(f"✅ DF klar: shape={df.shape}, cols={list(df.columns)[:8]}")
+        try:
+            return __CORE_RUNBT(df, params)
+        except Exception as e:
+            _log(f"❌ Fel i __CORE_RUNBT(df, params): {type(e).__name__}: {e}")
+            raise
+
+    # --- fallback: skicka vidare orört (kan ge fel, men bevarar andra anrop)
+    _log("⚠️ Fallback: vidarebefordrar args orört till __CORE_RUNBT")
+    return __CORE_RUNBT(*args, **kwargs)
+# --- END FLEX UI RUNNER ---
+
+# --- FLEX UI RUNNER (_RUNBT/_run_backtest) ---
+# Accepterar (df, params) eller (ticker, start, end, params)
+try:
+    __CORE_RUNBT = _RUNBT
+except NameError:
+    try:
+        __CORE_RUNBT = _run_backtest
+    except NameError:
+        from app.btwrap import run_backtest as __CORE_RUNBT
+
+from datetime import date, datetime
+
+def _to_datestr(x):
+    if isinstance(x, (date, datetime)):
+        return x.strftime("%Y-%m-%d")
+    return str(x)
+
+def _flex_ui_runner(*args, **kwargs):
+    # (df, params)
+    if len(args) == 2 and hasattr(args[0], "head"):
+        return __CORE_RUNBT(*args, **kwargs)
+
+    # (ticker, start, end, params)
+    if len(args) >= 4 and isinstance(args[0], str):
+        ticker, start, end, params = args[0], args[1], args[2], args[3]
+        df = GET_OHLCV(ticker.strip(), _to_datestr(start), _to_datestr(end))
+        if df is None or not hasattr(df, "empty") or df.empty:
+            raise ValueError(f"Ingen prisdata för {ticker} mellan {_to_datestr(start)} och {_to_datestr(end)}.")
+        return __CORE_RUNBT(df, params)
+
+    # övriga fall – lämna vidare
+    return __CORE_RUNBT(*args, **kwargs)
+
+# Överskugga båda namnen så UI:t hamnar här
+try:
+    _RUNBT = _flex_ui_runner
+except Exception:
+    pass
+try:
+    _run_backtest = _flex_ui_runner
+except Exception:
+    pass
+# --- END FLEX UI RUNNER (_RUNBT/_run_backtest) ---
+debug_banner('Debug 0.1')
+
+# --- BEGIN _import_backtest df-shim ---
+# Denna shim gör gamla anrop som _import_backtest(ticker, params, start, end)
+# kompatibla med nya _FLEX_RUNBT(df, params). Den hanterar:
+#  - ticker (str) -> hämtar OHLCV via GET_OHLCV
+#  - params (dict) -> bygg Params via _maybe_build_params
+#  - start/end (date/datetime/str) -> skickas till GET_OHLCV
+try:
+    from app.portfolio_signals import _import_backtest as __orig_import_backtest
+    from app.portfolio_signals import _maybe_build_params
+    from app.data_providers import get_ohlcv as GET_OHLCV
+    import datetime as _dt
+
+    def _as_date(x, default=None):
+        if x is None:
+            return default
+        if hasattr(x, "date"):
+            try:
+                return x.date()
+            except Exception:
+                return x
+        return x  # anta str YYYY-MM-DD eller date redan
+
+    def _import_backtest(*args, **kwargs):  # skuggar namnet i denna sida
+        mod = __orig_import_backtest()
+
+        # Om inga args -> bete dig som förr (returnera modulen)
+        if not args and not kwargs:
+            return mod
+
+        # extrahera signaturtyper vi kan hantera
+        a0 = args[0] if len(args) > 0 else None
+        a1 = args[1] if len(args) > 1 else None
+        a2 = args[2] if len(args) > 2 else None
+        a3 = args[3] if len(args) > 3 else None
+
+        # Bygg df
+        if isinstance(a0, str):
+            # gamlat läge: ticker, params, (start), (end)
+            start = kwargs.get("start") or _as_date(a2, _dt.date.today().replace(year=_dt.date.today().year - 5))
+            end   = kwargs.get("end")   or _as_date(a3, _dt.date.today())
+            df = GET_OHLCV(a0, start=start, end=end)
+        else:
+            # nytt läge: df direkt
+            df = a0
+
+        # Bygg Params-objekt från dict om behövs
+        params = a1
+        try:
+            params = _maybe_build_params(params) if params is not None else None
+        except Exception:
+            # om Params redan är korrekt klass – lämna som den är
+            pass
+
+        # hitta körbar funktion i modulen
+        for name in ("run_backtest", "backtest", "simulate", "run"):
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                return fn(df, params)
+
+        if callable(mod):
+            return mod(df, params)
+
+        raise TypeError("Hittar ingen backtest-funktion i modulen från _import_backtest()")
+except Exception:
+    # Om något är knas i importerna, låt originalet vara orört
+    pass
+
+# --- END _import_backtest df-shim ---
+# --- BEGIN _import_backtest shim (idempotent) ---
+try:
+    from app.portfolio_signals import _import_backtest as __orig__import_backtest
+    def _run_bt_safe(*args, **kwargs):
+        """
+        Compat shim:
+        - _import_backtest()            -> returns module or (RUN_BT, Params)
+        - _run_bt_safe(df, params)  -> runs backtest with args (legacy call sites)
+        """
+        mod_or_tuple = __orig__import_backtest()
+        if not args and not kwargs:
+            return mod_or_tuple
+        if isinstance(mod_or_tuple, tuple):
+            run_bt = mod_or_tuple[0]
+            return run_bt(*args, **kwargs)
+        for name in ("backtest", "run_backtest", "simulate", "run"):
+            fn = getattr(mod_or_tuple, name, None)
+            if callable(fn):
+                return fn(*args, **kwargs)
+        if callable(mod_or_tuple):
+            return mod_or_tuple(*args, **kwargs)
+        raise TypeError("Hittar ingen backtest-funktion i modulen från _import_backtest()")
+except Exception:
+    pass
+# --- END _import_backtest shim ---
+
+import re
+
+from app.btwrap import run_backtest as _RUNBT
+# --- DF VALIDATION & SAFE RUN_BT ---
+import pandas as pd
+import streamlit as st
+def _normalize_ohlcv_df(obj):
+    # Till DataFrame
+    if isinstance(obj, tuple) and len(obj) > 0:
+        obj = obj[0]
+    if isinstance(obj, dict):
+        if 'df' in obj: obj = obj['df']
+        elif 'data' in obj: obj = obj['data']
+    if not isinstance(obj, pd.DataFrame):
+        try:
+            obj = pd.DataFrame(obj)
+        except Exception as e:
+            raise TypeError(f"Förväntade en DataFrame, fick {type(obj).__name__}: {e}")
+    if obj is None or obj.empty:
+        raise ValueError("DataFrame är tom (ingen kursdata).")
+
+    # Kolumnnamn -> Open/High/Low/Close/Volume
+    lower = {c.lower(): c for c in obj.columns}
+    rename = {}
+    for w in ("open","high","low","close","volume"):
+        if w in lower:
+            rename[lower[w]] = w.capitalize()
+    if rename:
+        obj = obj.rename(columns=rename)
+
+    missing = [c for c in ("Open","High","Low","Close") if c not in obj.columns]
+    if missing:
+        raise ValueError(f"Saknar kolumner: {missing}. Hittade: {list(obj.columns)}")
+
+    # Datumindex
+    if not isinstance(obj.index, pd.DatetimeIndex):
+        date_col = None
+        for cand in ("date","Date","time","Time"):
+            if cand in obj.columns:
+                date_col = cand; break
+        if date_col:
+            obj[date_col] = pd.to_datetime(obj[date_col])
+            obj = obj.set_index(date_col)
+        else:
+            obj.index = pd.to_datetime(obj.index)
+
+    obj = obj.sort_index()
+    return obj
+
+def _RUN_BT_SAFE(df_like, params):
+    try:
+        df = _normalize_ohlcv_df(df_like)
+    except Exception as e:
+        # Visa tydligt fel i UI OCH re-raise så "Backtest misslyckades: ..." fångar det
+        st.error(f"Förbehandling av data misslyckades: {e}")
+        raise
+    return _RUN_BT_SAFE(df, params)
+# --- END DF VALIDATION & SAFE RUN_BT ---
+RUN_BT, Params = _import_backtest()
+
+# -*- coding: utf-8 -*-
+"""
+Backtest (ren sida)
+- Laddar/projicerar profiler från outputs/opt_results/*.json
+- Fyller UI-parametrar
+- Kör backtest mot vald ticker och datum
+- Sparar "TICKER_tmp.json" (singelprofil) vid behov
+"""
+from app.btwrap import run_backtest as _run_backtest
+
+import json
+import math
+import datetime as dt
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+# --- DEBUG TOGGLE (Backtest) ---
+st.sidebar.checkbox('Debug 0.1', key='debug_bt', help='Visa extra logg vid körning')
+import pandas as pd
+import streamlit as st
+
+# Din appkod
+try:
+    from app.portfolio_signals import _import_backtest, _maybe_build_params, buyhold_equity_from_price  # type: ignore
+except Exception:  # skydd om modulnamn skiljer sig
+    _import_backtest = None
+    _maybe_build_params = None
+    buyhold_equity_from_price = None
+try:
+    from app.data_providers import get_ohlcv as GET_OHLCV  # type: ignore
+except Exception:
+    GET_OHLCV = None  # endast om du vill hämta prisdata lokalt
+
+PROFILES_DIR = (Path("outputs") / "opt_results").resolve()
+
+
+# ---------- Hjälpare för profiler ----------
+
+def _normalize_ticker(t: str) -> str:
+    t = (t or "").strip().upper().replace("_", "-").replace(" ", "-")
+    return t if t.endswith(".ST") else (t + ".ST")
+
+
+def _read_profiles_file(fp: Path) -> List[Dict[str, Any]]:
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "profiles" in data and isinstance(data["profiles"], list):
+        src = data["profiles"]
+    else:
+        # single profil-format
+        src = [data]
+    out: List[Dict[str, Any]] = []
+    for p in src:
+        if not isinstance(p, dict):
+            continue
+        name = p.get("name") or p.get("profile") or fp.stem
+        ticker = _normalize_ticker(p.get("ticker") or "")
+        params = p.get("params") or {}
+        metrics = p.get("metrics") or {}
+        out.append({"name": name, "ticker": ticker, "params": params, "metrics": metrics})
+    return out
+
+
+def _apply_profile_to_state(profile: Dict[str, Any]) -> None:
+    """Skriv profilens värden till session_state så formuläret fylls."""
+    if not profile:
+        return
+    t = (profile.get("ticker") or "").strip()
+    if t:
+        st.session_state["ticker"] = _normalize_ticker(t)
+
+    params = profile.get("params") or {}
+    for k, v in params.items():
+        st.session_state[k] = v
+
+
+# ---------- UI-defaults ----------
+
+DEFAULTS: Dict[str, Any] = {
+    "ticker": "VOLV B",
+    "from_date": (dt.date.today().replace(year=dt.date.today().year - 5)).isoformat(),
+    "to_date": dt.date.today().isoformat(),
+    # Trend/EMA
+    "use_trend_filter": False,
+    "trend_ma_window": 100,
+    # RSI
+    "rsi_window": 8,
+    "rsi_min": 30.0,
+    "rsi_max": 70.0,
+    # Breakouts
+    "breakout_lookback": 55,
+    "exit_lookback": 20,
+    # MACD
+    "use_macd_filter": False,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    # Bollinger
+    "use_bb_filter": False,
+    "bb_window": 20,
+    "bb_nstd": 2.0,
+    "bb_min": 0.0,
+    # Stops
+    "use_stop_loss": False,
+    "stop_mode": "pct",           # "pct" eller "atr"
+    "stop_loss_pct": 0.08,        # 8%
+    "atr_window": 14,
+    "atr_mult": 2.0,
+    "use_atr_trailing": False,
+    "atr_trail_mult": 1.5,
+}
+
+for k, v in DEFAULTS.items():
+    st.session_state.setdefault(k, v)
+
+
+# ---------- Sidopanel: välj & applicera profil ----------
+
+st.sidebar.header("Profiler")
+st.sidebar.caption(f"Katalog: `{PROFILES_DIR}`")
+
+files = sorted([fp for fp in PROFILES_DIR.glob("*.json") if fp.is_file()])
+if files:
+    file_idx = st.sidebar.selectbox(
+        "Välj optimeringsfil (.json)",
+        options=list(range(len(files))),
+        format_func=lambda i: files[i].name,
+        key="back_file_idx",
+    )
+    fp = files[file_idx]
+    try:
+        profiles = _read_profiles_file(fp)
+    except Exception as e:
+        profiles = []
+        st.sidebar.error(f"Kunde inte läsa profiler: {e}")
+
+    if profiles:
+        prof_idx = st.sidebar.selectbox(
+            "Välj profil i filen",
+            options=list(range(len(profiles))),
+            format_func=lambda i: f"{profiles[i]['ticker'] or ''} – {profiles[i]['name']}",
+            key="back_prof_idx",
+        )
+        if st.sidebar.button("Använd vald profil", type="primary", width='stretch'):
+            _apply_profile_to_state(profiles[prof_idx])
+            st.sidebar.success("Profil applicerad till parametrarna.")
+else:
+    st.sidebar.info("Inga *.json-filer hittades i katalogen.")
+
+
+# ---------- Huvud: formulär ----------
+
+st.title("Backtest")
+
+with st.expander("Parametrar", expanded=True):
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.text_input("Ticker", key="ticker")
+        st.text_input("Från (YYYY-MM-DD)", key="from_date")
+        st.text_input("Till (YYYY-MM-DD)", key="to_date")
+
+        st.checkbox("EMA trend-gate", key="use_trend_filter")
+        st.number_input("EMA-fönster", min_value=1, value=int(st.session_state.get("trend_ma_window", 100)), step=1, key="trend_ma_window")
+
+        st.number_input("RSI-fönster", min_value=1, value=int(st.session_state.get("rsi_window", 8)), step=1, key="rsi_window")
+        st.number_input("RSI min (köp-kors upp)", value=float(st.session_state.get("rsi_min", 30.0)), step=1.0, key="rsi_min")
+        st.number_input("RSI max (sälj-kors ned)", value=float(st.session_state.get("rsi_max", 70.0)), step=1.0, key="rsi_max")
+
+        st.number_input("Breakout lookback (0=av)", min_value=0, value=int(st.session_state.get("breakout_lookback", 55)), step=1, key="breakout_lookback")
+        st.number_input("Exit lookback (0=av)", min_value=0, value=int(st.session_state.get("exit_lookback", 20)), step=1, key="exit_lookback")
+
+    with colB:
+        st.checkbox("MACD-filter (histogram > 0)", key="use_macd_filter")
+        st.number_input("MACD fast", min_value=1, value=int(st.session_state.get("macd_fast", 12)), step=1, key="macd_fast")
+        st.number_input("MACD slow", min_value=1, value=int(st.session_state.get("macd_slow", 26)), step=1, key="macd_slow")
+        st.number_input("MACD signal", min_value=1, value=int(st.session_state.get("macd_signal", 9)), step=1, key="macd_signal")
+
+        st.checkbox("Bollinger %B-filter", key="use_bb_filter")
+        st.number_input("BB fönster", min_value=1, value=int(st.session_state.get("bb_window", 20)), step=1, key="bb_window")
+        st.number_input("BB std", min_value=0.1, value=float(st.session_state.get("bb_nstd", 2.0)), step=0.1, key="bb_nstd")
+        st.number_input("BB min (köp-kors upp)", min_value=0.0, value=float(st.session_state.get("bb_min", 0.0)), step=0.05, key="bb_min")
+
+        st.checkbox("Stop-loss", key="use_stop_loss")
+        st.selectbox("Stop-typ", options=["pct", "atr"], key="stop_mode")
+        st.number_input("Stop-loss % (om pct)", min_value=0.001, value=float(st.session_state.get("stop_loss_pct", 0.08)), step=0.005, key="stop_loss_pct")
+        st.number_input("ATR fönster", min_value=1, value=int(st.session_state.get("atr_window", 14)), step=1, key="atr_window")
+        st.number_input("ATR multipel", min_value=0.1, value=float(st.session_state.get("atr_mult", 2.0)), step=0.1, key="atr_mult")
+        st.checkbox("ATR trailing", key="use_atr_trailing")
+        st.number_input("ATR trailing multipel", min_value=0.1, value=float(st.session_state.get("atr_trail_mult", 1.5)), step=0.1, key="atr_trail_mult")
+
+
+# ---------- Kör backtest ----------
+
+def _collect_params_from_state() -> Dict[str, Any]:
+    p = {}
+    for k in DEFAULTS.keys():
+        p[k] = st.session_state.get(k, DEFAULTS[k])
+    return p
+
+
+def _coerce_date(s: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(str(s))
+    except Exception:
+        return dt.date(2020, 1, 1)
+
+
+def _try_run_backtest(ticker: str, params: Dict[str, Any], start: dt.date, end: dt.date) -> Dict[str, Any]:
+    """Anropa din backtest-funktion, men var tolerant med signaturer."""
+    # försök #1
+    if _import_backtest is None:
+        raise RuntimeError("Backtest-funktion (_import_backtest) kunde inte importeras.")
+
+    try:
+        res = SAFE_RUN_BT(
+            ticker=ticker, params=_maybe_build_params(params) if _maybe_build_params else params,
+            start=start, end=end
+        )
+        return res
+    except TypeError:
+        # försök #2 – annan ordning/namn
+        try:
+            res = SAFE_RUN_BT(ticker, params, start, end)  # type: ignore
+            return res
+        except Exception as e2:
+            raise
+
+@st.cache_data(show_spinner=False)
+def _simple_metrics_from_equity(equity: pd.Series) -> Dict[str, float]:
+    # grova nyckeltal om pipeline inte returnerar metrics
+    eq = equity.dropna().astype(float)
+    if len(eq) < 2:
+        return {}
+    total = float(eq.iloc[-1] / eq.iloc[0])
+    ret = np.log(eq).diff().dropna()
+    cagr = (total ** (252.0 / max(1, len(eq)))) - 1.0  # antag dagliga data
+    dd = (eq / eq.cummax() - 1.0).min()
+    sharpe_d = (ret.mean() / (ret.std() + 1e-9)) * np.sqrt(252.0)
+    return {"TotalReturn": total, "CAGR": cagr, "SharpeD": sharpe_d, "MaxDD": dd}
+
+col_run, col_save = st.columns([1,1])
+if col_run.button("Kör backtest", type="primary", width='stretch'):
+    ticker = _normalize_ticker(st.session_state.get("ticker", ""))
+    params = _collect_params_from_state()
+    start = _coerce_date(st.session_state.get("from_date", DEFAULTS["from_date"]))
+    end = _coerce_date(st.session_state.get("to_date", DEFAULTS["to_date"]))
+
+    try:
+        res = _try_run_backtest(ticker, params, start, end)
+        # Försök hitta metrics
+        metrics = {}
+        if isinstance(res, dict):
+            metrics = res.get("metrics") or res.get("summary") or {}
+            # equity-kurva?
+            eq = res.get("equity")
+            if (not metrics) and isinstance(eq, (pd.Series, list)):
+                if isinstance(eq, list):
+                    eq = pd.Series(eq)
+                metrics = _simple_metrics_from_equity(eq)
+        st.session_state["_last_metrics"] = metrics or {}
+        st.success("Backtest klart.")
+    except Exception as e:
+        st.error(f"Backtest misslyckades: {e}")
+
+# Visa metrics om vi har dem
+m = st.session_state.get("_last_metrics") or {}
+if m:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("TotalReturn", f"{m.get('TotalReturn', 0):.3f}×")
+    c2.metric("CAGR", f"{m.get('CAGR', 0):.3f}")
+    c3.metric("SharpeD", f"{m.get('SharpeD', 0):.3f}")
+    c4.metric("MaxDD", f"{m.get('MaxDD', 0):.3f}")
+    c5.metric("Buy&Hold", f"{m.get('BuyHold', m.get('Buy&Hold', float('nan'))):.3f}" if not math.isnan(float(m.get('BuyHold', m.get('Buy&Hold', float('nan'))))) else "–")
+
+# ---------- Spara som TMP ----------
+
+def _current_params_payload() -> Dict[str, Any]:
+    params = _collect_params_from_state()
+    return {
+        "profiles": [
+            {
+                "name": st.text_input("Profilnamn att spara", value="TMP från UI", key="tmp_profile_name"),
+                "ticker": _normalize_ticker(st.session_state.get("ticker", "")),
+                "params": params,
+                "metrics": st.session_state.get("_last_metrics", {}),
+            }
+        ]
+    }
+
+payload = _current_params_payload()
+if col_save.button("Spara som TMP", width='stretch'):
+    try:
+        t = payload["profiles"][0]["ticker"]
+        base = t.replace(".ST", "").replace(" ", "_")
+        dst = PROFILES_DIR / f"{base}_tmp.json"
+        dst.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        st.success(f"Sparade: {dst}")
+    except Exception as e:
+        st.error(f"Kunde inte spara: {e}")
+

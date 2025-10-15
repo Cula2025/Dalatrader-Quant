@@ -1,0 +1,103 @@
+
+# -*- coding: utf-8 -*-
+from datetime import date
+from pathlib import Path
+import pandas as pd
+import streamlit as st
+
+from app.data_providers import get_ohlcv as GET_OHLCV
+from app.portfolio_signals import (
+    load_best_params_for_ticker, run_profile_positions,
+    build_portfolio_with_caps, to_price_matrix,
+    buyhold_equity_from_price, equal_weight_buyhold_equity, index_equity,
+)
+
+st.set_page_config(page_title="Dala Trader – Portfölj", page_icon="💼", layout="wide")
+st.title("💼 Portfölj (profiler) – Jämförelse")
+
+with st.sidebar:
+    st.subheader("Inställningar")
+    start = st.date_input("Startdatum", value=date(2020,1,1))
+    prof_dir_str = st.text_input("Profilkatalog", value="outputs/opt_results")
+    index_ticker = st.text_input("Index-ticker (för jämförelse)", value="OMXS30")
+    tickers_text = st.text_area("Tickers (en per rad eller kommaseparerat)", value="HM-B.ST", height=100)
+    max_per_asset = st.slider("Max per aktie", 0.0, 1.0, 1.0, 0.05)
+    max_total_equity = st.slider("Max totalt i aktier", 0.0, 1.0, 1.0, 0.05)
+
+# parse tickers
+raw = [t.strip() for part in tickers_text.splitlines() for t in part.replace(",", " ").split()]
+tickers = [t for t in raw if t]
+
+if not tickers:
+    st.info("Lägg till minst en ticker i sidofältet.")
+    st.stop()
+
+profiles_dir = Path(prof_dir_str).expanduser().resolve()
+
+# 1) Bygg signaler (positioner) & hämta priser
+positions = {}
+prices_map = {}
+
+errors = []
+for t in tickers:
+    try:
+        params, metrics, name, path = load_best_params_for_ticker(t, profiles_dir)
+    except Exception as e:
+        errors.append(f"❌ {t}: hittade ingen profil ({e})")
+        continue
+    try:
+        s = run_profile_positions(t, params, start)
+        positions[t] = s
+    except Exception as e:
+        errors.append(f"❌ {t}: kunde inte skapa positioner ({e})")
+        continue
+    try:
+        dfp = GET_OHLCV(t, start=start, source="borsdata")
+        prices_map[t] = dfp
+    except Exception as e:
+        errors.append(f"❌ {t}: kunde inte hämta priser ({e})")
+
+if errors:
+    st.warning("Några problem:\n\n" + "\n".join(errors))
+
+if not positions or not prices_map:
+    st.error("Inget att visa ännu.")
+    st.stop()
+
+# 2) Portfölj-ekvitet
+P = to_price_matrix(prices_map)
+equity, W = build_portfolio_with_caps(positions, P, max_per_asset=max_per_asset, max_total_equity=max_total_equity, lag_days=1)
+port = equity["value"].rename("Portfölj")
+
+# 3) Buy & Hold-baslinje
+if len(tickers) == 1:
+    base_price = P.iloc[:,0]
+    bh_raw = buyhold_equity_from_price(base_price).rename("Buy&Hold")
+else:
+    bh_raw = equal_weight_buyhold_equity(P).rename("Buy&Hold")
+
+# 4) Index (valfri)
+idx_series_raw = index_equity(index_ticker, start)
+idx_series_raw = idx_series_raw.rename("OMXS30 (index)") if not idx_series_raw.empty else None
+
+# 5) Samla & normalisera (start = 1.0) – LINJERA MOT PORTFÖLJENS DATUM
+def _norm(s: pd.Series) -> pd.Series:
+    s = s.dropna()
+    return s / float(s.iloc[0]) if len(s) else s
+
+bh = bh_raw.reindex(port.index).ffill()
+cols = [ _norm(port), _norm(bh) ]
+
+if idx_series_raw is not None and len(idx_series_raw):
+    idx_series = idx_series_raw.reindex(port.index).ffill()
+    cols.append(_norm(idx_series))
+
+chart = pd.concat(cols, axis=1).dropna(how="all")
+
+st.subheader("Kapitalutveckling (normaliserad till 1.0)")
+st.line_chart(chart, height=420)
+st.caption("Beräkning: dagliga logikvikter med 1 dags lag; återinvesterar inom givna kap-begränsningar.")
+
+# Snabbtabell sista värden
+last = chart.dropna().iloc[-1:].T.rename(columns={chart.index[-1]: "Sista värde"})
+st.dataframe(last, width='stretch')

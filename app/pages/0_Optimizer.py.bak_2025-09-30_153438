@@ -1,0 +1,245 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import itertools
+from datetime import date
+from typing import Dict, Any, Iterable, Tuple, List
+
+import pandas as pd
+import streamlit as st
+
+# Brandning (frivillig)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title="Dala Trader – Optimizer", page_icon="⚙️")
+
+st.title("⚙️ Optimizer")
+st.caption("Optimerar tre strategier per vald ticker och period. Inga uppladdade profiler – bara sök över små gridar.")
+
+# ------------------------------------------------------------
+# Hjälpare
+# ------------------------------------------------------------
+def _profile(ticker: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ticker": ticker, "params": params}
+
+def _score(s: Dict[str, Any]) -> float:
+    # Högre är bättre. MaxDD är negativt → bidrar nedåt naturligt.
+    tr = float(s.get("TotalReturn", 0.0) or 0.0)
+    sh = float(s.get("SharpeD", 0.0) or 0.0)
+    dd = float(s.get("MaxDD", 0.0) or 0.0)
+    return tr + 0.2 * sh + dd
+
+def _safe_summary(d: Dict[str, Any]) -> Dict[str, Any]:
+    s = d.get("summary", {}) if isinstance(d, dict) else {}
+    return {
+        "Bars": s.get("Bars"),
+        "Trades": s.get("Trades"),
+        "FinalEquity": s.get("FinalEquity"),
+        "TotalReturn": s.get("TotalReturn"),
+        "MaxDD": s.get("MaxDD"),
+        "SharpeD": s.get("SharpeD"),
+        "BuyHold": s.get("BuyHold"),
+    }
+
+@st.cache_data(show_spinner=False)
+def _grid(params_grid: Dict[str, Iterable[Any]]) -> List[Dict[str, Any]]:
+    keys = list(params_grid.keys())
+    combos = []
+    for values in itertools.product(*[list(params_grid[k]) for k in keys]):
+        combos.append({k: v for k, v in zip(keys, values)})
+    return combos
+
+def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    c = dict(a)
+    c.update(b)
+    return c
+
+# ------------------------------------------------------------
+# Sidebar – indata
+# ------------------------------------------------------------
+with st.sidebar:
+    st.header("Indata")
+    t_raw = st.text_input("Ticker", value=st.session_state.get("ticker", "VOLV-B.ST"))
+    col = st.columns(2)
+    with col[0]:
+        d_from = st.date_input("Från", value=date(2020, 1, 1))
+    with col[1]:
+        d_to = st.date_input("Till", value=date.today())
+
+    st.divider()
+    st.markdown("**Strategier att optimera**")
+    use_rsi_trend = st.checkbox("RSI + Trend", value=True)
+    use_breakout   = st.checkbox("Donchian Breakout", value=True)
+    use_macd_rsi   = st.checkbox("MACD + RSI", value=True)
+
+    st.divider()
+    run_btn = st.button("🚀 Kör optimering")
+
+# ------------------------------------------------------------
+# Strategi-definitioner (små gridar, snabba körningar)
+# ------------------------------------------------------------
+BASE_KEYS = dict(
+    rsi_window=8,
+    rsi_min=30.0,
+    rsi_max=70.0,
+    use_trend_filter=False,
+    trend_ma_window=100,
+    breakout_lookback=0,
+    exit_lookback=0,
+    use_macd_filter=False,
+    macd_fast=12,
+    macd_slow=26,
+    macd_signal=9,
+    use_bb_filter=False,
+    bb_window=20,
+    bb_nstd=2.0,
+    bb_min=0.0,
+    use_stop_loss=False,
+    stop_mode="pct",
+    stop_loss_pct=0.08,
+    atr_window=14,
+    atr_mult=2.0,
+    use_atr_trailing=False,
+    atr_trail_mult=1.5,
+)
+
+STRATS: List[Tuple[str, Dict[str, Iterable[Any]]]] = []
+
+# 1) RSI + Trend
+STRATS.append((
+    "RSI + Trend",
+    dict(
+        rsi_window=[6, 8, 10],
+        rsi_min=[25.0, 30.0, 35.0],
+        rsi_max=[65.0, 70.0, 75.0],
+        use_trend_filter=[True],
+        trend_ma_window=[50, 100, 150],
+        breakout_lookback=[0],
+        exit_lookback=[10, 20],
+    )
+))
+
+# 2) Donchian Breakout
+STRATS.append((
+    "Donchian Breakout",
+    dict(
+        breakout_lookback=[20, 55, 100],
+        exit_lookback=[10, 20],
+        use_trend_filter=[True, False],
+        trend_ma_window=[50, 100],
+        rsi_window=[8],
+        rsi_min=[30.0],
+        rsi_max=[70.0],
+    )
+))
+
+# 3) MACD + RSI
+STRATS.append((
+    "MACD + RSI",
+    dict(
+        use_macd_filter=[True],
+        macd_fast=[8, 12],
+        macd_slow=[24, 26],
+        macd_signal=[9, 12],
+        rsi_window=[6, 8],
+        rsi_min=[25.0, 30.0],
+        rsi_max=[65.0, 70.0],
+        use_trend_filter=[True],
+        trend_ma_window=[50, 100],
+        breakout_lookback=[0],
+        exit_lookback=[10, 20],
+    )
+))
+
+enabled = {
+    "RSI + Trend": use_rsi_trend,
+    "Donchian Breakout": use_breakout,
+    "MACD + RSI": use_macd_rsi,
+}
+
+# ------------------------------------------------------------
+# Körning
+# ------------------------------------------------------------
+results_tables = {}
+
+if run_btn:
+    from app.btwrap import run_backtest
+
+    if not t_raw.strip():
+        st.error("Ange en ticker.")
+        st.stop()
+
+    base = dict(BASE_KEYS)
+    base["from_date"] = str(d_from)
+    base["to_date"] = str(d_to)
+
+    for name, grid in STRATS:
+        if not enabled.get(name, False):
+            continue
+
+        st.subheader(name)
+        combos = _grid(grid)
+        rows = []
+
+        prog = st.progress(0, text=f"Kör {name} ({len(combos)} kombinationer)…")
+        for i, g in enumerate(combos, start=1):
+            params = _merge(base, g)
+            try:
+                res = run_backtest(_profile(t_raw, params))
+                summ = _safe_summary(res)
+                row = dict(
+                    Strategy=name,
+                    **{k: params.get(k) for k in g.keys()},
+                    **summ,
+                )
+                row["Score"] = _score(summ)
+                rows.append(row)
+            except Exception as e:
+                rows.append(dict(Strategy=name, Error=str(e), **{k: params.get(k) for k in g.keys()}))
+            finally:
+                prog.progress(i / len(combos), text=f"Kör {name} {i}/{len(combos)}")
+
+        prog.empty()
+
+        if not rows:
+            st.warning("Inga resultat.")
+            continue
+
+        df = pd.DataFrame(rows)
+        if "Score" in df.columns:
+            df_ok = df[df["Score"].notna()].copy()
+            df_ok.sort_values("Score", ascending=False, inplace=True)
+        else:
+            df_ok = df.copy()
+
+        results_tables[name] = df_ok
+
+        if not df_ok.empty:
+            st.write("**Bästa hittade:**")
+            best = df_ok.iloc[0].to_dict()
+            nice = {k: best.get(k) for k in [
+                "Score","TotalReturn","SharpeD","MaxDD","Trades","FinalEquity","BuyHold"
+            ] if k in best}
+            st.json(nice)
+
+            with st.expander("Visa topplista"):
+                st.dataframe(df_ok.reset_index(drop=True), width='stretch')
+
+            if st.button(f"✅ Använd bästa för {name}", key=f"apply_{name}"):
+                bt_keys = set(BASE_KEYS.keys()) | set(grid.keys()) | {"from_date","to_date"}
+                best_params = {k: best.get(k) for k in bt_keys if k in best}
+                st.session_state["ticker"] = t_raw.strip()
+                st.session_state["from_date"] = str(d_from)
+                st.session_state["to_date"] = str(d_to)
+                for k, v in best_params.items():
+                    st.session_state[k] = v
+                st.success("Applicerat till session. Gå till Backtest för att köra.")
+        else:
+            st.warning("Alla körningar felade – se tabellen nedan för felorsaker.")
+            st.dataframe(pd.DataFrame(rows), width='stretch')
+
+st.markdown("---")
+st.caption("Tips: börja med små gridar. När det ser rimligt ut kan du bredda intervallen.")

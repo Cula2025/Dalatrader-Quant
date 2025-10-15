@@ -1,0 +1,262 @@
+from __future__ import annotations
+import json
+from pathlib import Path
+import datetime as dt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ---------------- THEME (high-contrast + base64-logo) ----------------
+import base64
+BG      = "#0D1B2A"   # mörk men något ljusare
+CARD    = "#0F2233"
+TEXT    = "#F1F5F9"   # mycket ljus text
+MUTED   = "#C7D2FE"
+PRIMARY = "#F5A623"   # Dalatrader orange
+ACCENT  = "#22C55E"
+
+st.set_page_config(page_title="Dalatrader – Optimizer", layout="wide")
+st.markdown(f"""
+<style>
+:root {{ --bg:{BG}; --card:{CARD}; --text:{TEXT}; --muted:{MUTED}; --primary:{PRIMARY}; --accent:{ACCENT}; }}
+html, body, [data-testid="stAppViewContainer"] {{ background:var(--bg); color:var(--text); }}
+[data-testid="stSidebar"] {{ background:#0B1726; border-right:1px solid rgba(255,255,255,.08); }}
+.block-container {{ padding-top:.5rem; }}
+.stButton>button {{ background:var(--primary); color:#111; border:0; padding:.9rem 1.1rem; font-size:1.05rem; border-radius:12px; font-weight:800; }}
+.stDownloadButton>button {{ background:var(--accent); color:#062410; border:0; padding:.6rem .9rem; font-weight:800; border-radius:10px; }}
+.card {{ background:var(--card); border:1px solid rgba(255,255,255,.10); border-radius:14px; padding:1rem 1.25rem; margin:.5rem 0; }}
+.brand {{ display:flex; align-items:center; gap:14px; padding:.25rem 0 .75rem 0; border-bottom:1px solid rgba(255,255,255,.10); margin-bottom:.75rem; }}
+.brand .title {{ font-size:1.35rem; font-weight:900; letter-spacing:.2px; }}
+.brand .subtitle {{ color:var(--muted); font-size:.95rem; }}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------- HEADER (inline logo) ----------------
+ROOT = Path(__file__).resolve().parents[1]
+LOGO = ROOT / "assets" / "dalatrader_logo.png"
+if LOGO.exists():
+    _b64 = base64.b64encode(LOGO.read_bytes()).decode("ascii")
+    st.markdown(f'''
+    <div class="brand">
+      <img alt="Dalatrader" src="data:image/png;base64,{_b64}" style="height:42px;border-radius:8px"/>
+      <div>
+        <div class="title">Dalatrader • Optimizer</div>
+        <div class="subtitle">Quant trading specialists</div>
+      </div>
+    </div>''', unsafe_allow_html=True)
+else:
+    st.markdown('<div class="brand"><div><div class="title">Dalatrader • Optimizer</div><div class="subtitle">Quant trading specialists</div></div></div>', unsafe_allow_html=True)
+
+# ---------------- PATHS ----------------
+OUT_DIR  = ROOT / "outputs" / "opt_results"
+DATA_OUT = ROOT / "outputs" / "data"
+OUT_DIR.mkdir(parents=True, exist_ok=True); DATA_OUT.mkdir(parents=True, exist_ok=True)
+
+# ---------------- LOADER ----------------
+def load_csv(file_or_df) -> pd.DataFrame:
+    import pandas as _pd, numpy as _np
+    if isinstance(file_or_df, _pd.DataFrame):
+        df = file_or_df.copy()
+    else:
+        def _read_any(src):
+            try:    return _pd.read_csv(src, sep=None, engine="python", encoding="utf-8-sig")
+            except:
+                try:    return _pd.read_csv(src, sep=";", encoding="utf-8-sig")
+                except: return _pd.read_csv(src, encoding_errors="replace")
+        df = _read_any(str(file_or_df) if isinstance(file_or_df,(str,Path)) else file_or_df)
+    if df is None or len(df)==0:
+        return _pd.DataFrame(columns=["Date","Open","High","Low","Close","Volume"])
+    # normalize names
+    cmap={}
+    for c in df.columns:
+        lc=str(c).strip().lower()
+        if lc=="date": cmap[c]="Date"
+        elif lc=="open": cmap[c]="Open"
+        elif lc=="high": cmap[c]="High"
+        elif lc=="low":  cmap[c]="Low"
+        elif lc=="close":cmap[c]="Close"
+        elif lc in ("volume","vol"): cmap[c]="Volume"
+    df=df.rename(columns=cmap)
+    if "Date" not in df.columns:
+        if df.index.name and str(df.index.name).lower()=="date":
+            df=df.reset_index().rename(columns={df.index.name:"Date"})
+        elif len(df.columns)>0:
+            first=df.columns[0]
+            if str(first).lower() in ("date",) or str(first).lower().startswith("unnamed"):
+                df=df.rename(columns={first:"Date"})
+        if "Date" not in df.columns:
+            cand=[c for c in df.columns if "date" in str(c).lower()]
+            if cand: df=df.rename(columns={cand[0]:"Date"})
+    if "Date" not in df.columns:
+        df=df.reset_index().rename(columns={df.columns[0]:"Date"})
+    df["Date"]=_pd.to_datetime(df["Date"], errors="coerce")
+    for c in ("Open","High","Low","Close","Volume"):
+        if c in df.columns: df[c]=_pd.to_numeric(df[c], errors="coerce")
+        else: df[c]=_np.nan
+    return df.dropna(subset=["Date","Close"]).sort_values("Date").reset_index(drop=True)
+
+# ---------------- INDICATORS / ENGINE ----------------
+def ema(s, n): n=max(1,int(n)); return s.ewm(span=n, adjust=False).mean()
+def rsi(c, n=14):
+    n=max(1,int(n)); ch=c.diff(); up=ch.clip(lower=0); dn=(-ch).clip(lower=0)
+    ru=up.ewm(alpha=1/n, adjust=False).mean(); rd=dn.ewm(alpha=1/n, adjust=False).mean()
+    rs=ru/rd.replace(0,np.nan); return 100-(100/(1+rs)).fillna(50)
+def sharpe_daily(eq):
+    r=eq.pct_change().dropna()
+    if len(r)<2: return float("nan")
+    sd=r.std(ddof=1); 
+    return float(r.mean()/sd) if sd not in (0,np.nan) else float("nan")
+
+def simulate(df, p, execution="close"):
+    N=int(p.get("breakout_lookback",55)); M=int(p.get("exit_lookback",20))
+    rwin=int(p.get("rsi_window",7)); rmin=float(p.get("rsi_min",25)); rmax=float(p.get("rsi_max",75))
+    use_trend=bool(p.get("use_trend_filter",False)); fast=int(p.get("fast",15)); slow=int(p.get("slow",100))
+    cost=float(p.get("cost_bps",0))*1e-4; slip=float(p.get("slip_bps",0))*1e-4
+    c=df["Close"].astype(float); o=df["Open"].astype(float); h=df["High"].astype(float); l=df["Low"].astype(float)
+    R=rsi(c,rwin); HH=h.rolling(N,min_periods=N).max().shift(1); LL=l.rolling(M,min_periods=M).min().shift(1)
+    if use_trend: EMAf=ema(c,fast); EMAs=ema(c,slow)
+    cash=100000.0; shares=0.0; in_pos=False; entry=None; eq=np.empty(len(df))
+    trades=[]
+    for i in range(len(df)):
+        ci,oi=float(c.iat[i]),float(o.iat[i]); ent=(not np.isnan(HH.iat[i])) and (ci>HH.iat[i]) and (rmin<=float(R.iat[i])<=rmax)
+        exi=(not np.isnan(LL.iat[i]) and ci<LL.iat[i]) or (float(R.iat[i])>rmax)
+        if use_trend: ent = ent and (EMAf.iat[i]>EMAs.iat[i])
+        if execution=="next_open":
+            if i>0:
+                ce,hhe,lle,re=float(c.iat[i-1]),HH.iat[i-1],LL.iat[i-1],float(R.iat[i-1])
+                ent_y=(not np.isnan(hhe)) and (ce>hhe) and (rmin<=re<=rmax); 
+                if use_trend: ent_y=ent_y and (EMAf.iat[i-1]>EMAs.iat[i-1])
+                exi_y=(not np.isnan(lle) and ce<lle) or (re>rmax)
+                if (not in_pos) and ent_y:
+                    px=oi*(1+slip); fee=px*cost; shares=(cash-fee)/px; cash=0; in_pos=True; entry=px
+                    trades.append(dict(EntryTime=df["Date"].iat[i],EntryPrice=float(px),ExitTime=pd.NaT,ExitPrice=np.nan,PnL=np.nan))
+                elif in_pos and exi_y:
+                    px=oi*(1-slip); fee=px*cost; cash=shares*px-fee; pnl=(px/entry-1)
+                    trades[-1].update(dict(ExitTime=df["Date"].iat[i],ExitPrice=float(px),PnL=float(pnl)))
+                    shares=0; in_pos=False; entry=None
+        else:
+            if (not in_pos) and ent:
+                px=ci*(1+slip); fee=px*cost; shares=(cash-fee)/px; cash=0; in_pos=True; entry=px
+                trades.append(dict(EntryTime=df["Date"].iat[i],EntryPrice=float(px),ExitTime=pd.NaT,ExitPrice=np.nan,PnL=np.nan))
+            elif in_pos and exi:
+                px=ci*(1-slip); fee=px*cost; cash=shares*px-fee; pnl=(px/entry-1)
+                trades[-1].update(dict(ExitTime=df["Date"].iat[i],ExitPrice=float(px),PnL=float(pnl)))
+                shares=0; in_pos=False; entry=None
+        eq[i]=cash+shares*ci
+    if in_pos:
+        px=(c.iat[-1] if execution=="close" else o.iat[-1])*(1-slip); fee=px*cost
+        cash=shares*px-fee; pnl=(px/entry-1); trades[-1].update(dict(ExitTime=df["Date"].iat[-1],ExitPrice=float(px),PnL=float(pnl)))
+    eql=pd.Series(eq, index=df.index, dtype=float); bh=100000.0*(c/c.iat[0])
+    return dict(summary=dict(TotalReturn=float(eql.iat[-1]/eql.iat[0]-1), BuyHold=float(bh.iat[-1]/bh.iat[0]-1),
+                             MaxDD=float((eql/eql.cummax()-1).min()), SharpeD=float(sharpe_daily(eql))),
+                trades=pd.DataFrame(trades), equity=eql, bh_equity=bh)
+
+# ---------------- SIDEBAR ----------------
+st.sidebar.header("Data")
+mode = st.sidebar.radio("Source", ["Upload CSV","Fetch from Borsdata"], index=0)
+ticker_for_save = st.sidebar.text_input("Ticker (for file names)", value="INVE B")
+today=dt.date.today(); cA,cB=st.sidebar.columns(2)
+from_date=cA.date_input("From", value=today-dt.timedelta(days=365*5))
+to_date  =cB.date_input("To",   value=today)
+
+df_all=None; csv_file=None
+if mode=="Upload CSV":
+    csv_file = st.sidebar.file_uploader("Upload OHLCV CSV", type=["csv"])
+    if csv_file: df_all=load_csv(csv_file)
+else:
+    try:
+        from app.data_providers import get_ohlcv
+        tkr=st.sidebar.text_input("Borsdata ticker", value=ticker_for_save)
+        if st.sidebar.button("Download data", width='stretch'):
+            raw=get_ohlcv(tkr, start=from_date.isoformat(), end=to_date.isoformat(), source="borsdata")
+            if isinstance(raw, pd.DataFrame):
+                df_all=load_csv(raw)
+                fname=f"{tkr.replace(' ','_')}_{from_date}_{to_date}.csv".replace(":","-")
+                p=DATA_OUT/fname; df_all.to_csv(p, index=False)
+                st.success(f"Saved: {p}")
+                st.download_button("Download CSV", data=df_all.to_csv(index=False).encode("utf-8"),
+                                   file_name=fname, mime="text/csv")
+            else:
+                st.error(f"Borsdata client returned {type(raw)}; expected DataFrame.")
+    except Exception as e:
+        st.sidebar.error(f"Could not fetch from Borsdata: {e}")
+
+st.sidebar.header("Search")
+n_sims=int(st.sidebar.number_input("Simulations", min_value=2000, max_value=10000, value=2000, step=100))
+seed=int(st.sidebar.number_input("Random seed", min_value=0, max_value=10_000_000, value=42))
+exec_mode=st.sidebar.selectbox("Execution", ["close","next_open"], index=0)
+
+st.sidebar.header("Costs")
+cost_bps=float(st.sidebar.number_input("Cost (bps)", min_value=0.0, max_value=200.0, value=0.0, step=0.5))
+slip_bps=int(st.sidebar.number_input("Slippage (bps)", min_value=0, max_value=200, value=0, step=1))
+
+run = st.button("Run optimizer", width='stretch')
+if not run:
+    st.markdown('<div class="card">Select/Fetch data and click <b>Run optimizer</b>.</div>', unsafe_allow_html=True)
+    st.stop()
+
+# ---------------- DATA SLICE ----------------
+if df_all is None:
+    try: df_all=load_csv(csv_file)
+    except Exception as e: st.error(f"Failed to read CSV: {e}"); st.stop()
+
+min_d=pd.to_datetime(df_all["Date"].min()).date(); max_d=pd.to_datetime(df_all["Date"].max()).date()
+st.markdown(f'<div class="card">Data range detected: <b>{min_d}</b> â†’ <b>{max_d}</b></div>', unsafe_allow_html=True)
+
+mask=(df_all["Date"]>=pd.to_datetime(from_date)) & (df_all["Date"]<=pd.to_datetime(to_date))
+df=df_all.loc[mask].copy().reset_index(drop=True)
+if df.empty:
+    st.warning("No rows in selected period â€” using full data range.")
+    df=df_all.copy().reset_index(drop=True)
+if df.empty: st.error("Still no rows after fallback."); st.stop()
+
+# ---------------- SEARCH ----------------
+rng=np.random.default_rng(seed)
+def sample_params():
+    use_trend=bool(rng.integers(0,2)); fast=int(rng.integers(5,40))
+    slow=int(rng.integers(max(fast+5,30),200)); rwin=int(rng.integers(4,21))
+    rmin=float(rng.integers(5,45)); rmax=float(rng.integers(max(int(rmin)+20,55),90))
+    N=int(rng.integers(10,100)); M=int(rng.integers(5,60))
+    return dict(strategy="rsi", trend_ma_type="EMA", use_trend_filter=use_trend, trend_ma_window=slow,
+                fast=fast, slow=slow, use_rsi_filter=True, rsi_window=rwin, rsi_min=rmin, rsi_max=rmax,
+                breakout_lookback=N, exit_lookback=M, use_macd_filter=False, use_bb_filter=False,
+                atr_window=14, atr_stop_mult=0.0, atr_trail_mult=0.0, cost_bps=cost_bps, slip_bps=slip_bps,
+                cash_rate_apy=0.0, max_positions=1, per_trade_pct=100.0, max_exposure_pct=100.0)
+
+best=None; best_score=-1e9; rows=[]; prog=st.progress(0, text="Running...")
+for i in range(1, n_sims+1):
+    p=sample_params()
+    try: s=simulate(df,p,execution=exec_mode)["summary"]
+    except Exception: continue
+    tr=float(s["TotalReturn"]); mdd=float(s["MaxDD"])  # mdd<=0
+    score=tr + 0.30*mdd
+    rows.append(dict(i=i, Score=score, TotalReturn=tr, MaxDD=mdd, SharpeD=float(s["SharpeD"]),
+                     BuyHold=float(s["BuyHold"]), fast=p["fast"], slow=p["slow"],
+                     rsi_window=p["rsi_window"], rsi_min=p["rsi_min"], rsi_max=p["rsi_max"],
+                     breakout_lookback=p["breakout_lookback"], exit_lookback=p["exit_lookback"],
+                     use_trend_filter=p["use_trend_filter"]))
+    if score>best_score: best_score=score; best=dict(params=p, metrics=s)
+    if i % max(1, n_sims//100)==0: prog.progress(min(100, int(100*i/n_sims)), text=f"Running... {i}/{n_sims}")
+prog.progress(100, text="Done.")
+
+dfres=pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
+st.markdown('<div class="card"><b>Top results</b></div>', unsafe_allow_html=True)
+st.dataframe(dfres.head(25), width='stretch')
+
+# ---------------- SAVE PROFILE ----------------
+tkr=(ticker_for_save or "TICKER").strip()
+fname=f"{tkr.replace(' ','_')}_best_backtrack.json"
+profile={"profiles":[{"name":f"{tkr} - auto_best_{n_sims}","ticker":tkr,"params":best["params"],"metrics":best["metrics"]}]}
+out=(OUT_DIR/fname); out.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+st.success(f"Saved best profile to: {out.name}")
+st.download_button("Download best profile (JSON)",
+                   data=json.dumps(profile, ensure_ascii=False, indent=2).encode("utf-8"),
+                   file_name=fname, mime="application/json")
+
+# ---------------- METRICS ----------------
+bt=best["metrics"]["TotalReturn"]; bh=best["metrics"]["BuyHold"]; md=best["metrics"]["MaxDD"]; sh=best["metrics"]["SharpeD"]
+c1,c2,c3,c4=st.columns(4)
+with c1: st.metric("TotalReturn", f"{(bt*100 if -5<=bt<=5 else bt):.2f}%")
+with c2: st.metric("Buy&Hold",   f"{(bh*100 if -5<=bh<=5 else bh):.2f}%")
+with c3: st.metric("MaxDD",      f"{(md*100 if -5<=md<=5 else md):.2f}%")
+with c4: st.metric("SharpeD",    f"{sh:.2f}")

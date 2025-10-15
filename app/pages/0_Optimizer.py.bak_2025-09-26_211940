@@ -1,0 +1,800 @@
+# -*- coding: utf-8 -*-
+import json, re, random, datetime as dt
+from datetime import date
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import streamlit as st
+from app.data_providers import get_ohlcv as GET_OHLCV
+from app.portfolio_signals import _import_backtest, _maybe_build_params, buyhold_equity_from_price
+
+# --- compat shim for older code paths ---
+from pathlib import Path as _P
+PROFILES_DIR = PROFILES_DIR if 'PROFILES_DIR' in globals() else _P('outputs/opt_results').resolve()
+def _discover_profile_files(pdir):
+    try:
+        return sorted([fp for fp in _P(pdir).glob('*.json') if fp.is_file()])
+    except Exception:
+        return []
+# --- end compat shim ---
+
+
+# --- Fallback: profilsida i sidopanelen (läser från outputs/opt_results) ---
+
+def render_profiles_sidebar():
+    import streamlit as st, json
+    from pathlib import Path as _P
+
+    # Katalog med profiler
+    pdir = PROFILES_DIR if "PROFILES_DIR" in globals() else _P("outputs/opt_results").resolve()
+    st.sidebar.subheader("Profiler")
+    st.sidebar.caption("Profilkatalog: `{}`".format(pdir))
+
+    files = sorted(pdir.glob("*.json"))
+    if not files:
+        st.sidebar.info("Inga profiler hittades i katalogen.")
+        return
+
+    fp = st.sidebar.selectbox(
+        "Välj optimeringsfil",
+        options=files,
+        format_func=lambda p: p.name,
+        key="srv_profile_file"
+    )
+
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        profiles = data.get("profiles") or []
+    except Exception as e:
+        st.sidebar.error("Profilmport misslyckades: {}".format(e))
+        return
+
+    if not profiles:
+        st.sidebar.warning("Filen innehåller inga profiler.")
+        return
+
+    names = [
+        (p.get("name") or p.get("profile") or "Profil {}".format(i+1))
+        for i, p in enumerate(profiles)
+    ]
+
+    prof_idx = st.sidebar.selectbox(
+        "Välj profil i filen",
+        options=list(range(len(profiles))),
+        index=0,
+        format_func=lambda i: names[i],
+        key="srv_profile_idx"
+    )
+
+    sel = profiles[prof_idx]
+
+    # Applicera till UI
+    if st.sidebar.button("Använd vald profil", type="primary", key="apply_srv_profile"):
+        # Ticker
+        t = (sel.get("ticker") or "").strip()
+        if t:
+            st.session_state["ticker"] = t
+
+        # Parametrar -> session_state (widgets läser härifrån)
+        params = sel.get("params") or {}
+        for k, v in params.items():
+            st.session_state[k] = v
+
+        # Datum om de finns
+        fd = (sel.get("from_date") or "").strip()
+        td = (sel.get("to_date") or "").strip()
+        if fd:
+            st.session_state["from_date"] = fd
+        if td:
+            st.session_state["to_date"] = td
+
+        st.sidebar.success("Profilen har applicerats – parametrarna uppdaterades.")
+
+
+def _normalize_ticker(t: str) -> str:
+    t2 = (t or "").strip().upper().replace(" ", "-")
+    return t2 if t2.endswith(".ST") else (t2 + ".ST")
+
+def _read_profiles(fp: Path) -> list[dict]:
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    profs = data.get("profiles") or []
+    # Säkerställ "name","params","metrics","ticker"
+    out = []
+    for p in profs:
+        name = p.get("name") or p.get("profile") or fp.stem
+        params = p.get("params") or {}
+        metrics = p.get("metrics") or {}
+        ticker = _normalize_ticker(p.get("ticker") or "")
+        out.append({"name": name, "params": params, "metrics": metrics, "ticker": ticker})
+    return out
+
+def _discover_profile_files(pdir: Path) -> list[Path]:
+    return sorted(p for p in pdir.glob("*.json") if p.is_file())
+
+def _best_profile(profiles: list[dict]) -> dict | None:
+    if not profiles:
+        return None
+    # välj högst TotalReturn om finns, annars första
+    try:
+        return max(profiles, key=lambda p: float(p.get("metrics", {}).get("TotalReturn", 0.0)))
+    except Exception:
+        return profiles[0]
+
+# -------- UI --------
+st.set_page_config(page_title="Dala Trader – Optimizer", page_icon="🧠", layout="wide")
+st.title("🧠 Optimizer (serverprofiler)")
+
+with st.sidebar:
+    st.subheader("Inställningar")
+    from pathlib import Path as _P; st.caption("Profilkatalog: `%s`" % _P("outputs/opt_results").resolve())
+
+    files = _discover_profile_files(PROFILES_DIR)
+    if not files:
+        st.error("Hittar inga profiler i outputs/opt_results/. Lägg dit JSON-filerna (…_best_backtrack.json).")
+        st.stop()
+
+    file_labels = [f"{fp.name}" for fp in files]
+    file_idx = st.selectbox("Välj optimeringsfil", options=list(range(len(files))),
+                            format_func=lambda i: file_labels[i], index=0, key="opt_file_select")
+    chosen_fp = files[file_idx]
+
+    # Läs profiler i vald fil
+    try:
+        profiles = _read_profiles(chosen_fp)
+    except Exception as e:
+        st.error(f"Kunde inte läsa {chosen_fp.name}: {e}")
+        st.stop()
+
+    if not profiles:
+        st.error(f"Inga profiler i {chosen_fp.name}.")
+        st.stop()
+
+    prof_names = [p["name"] for p in profiles]
+    # default till "bästa"
+    default_prof = _best_profile(profiles)
+    def_idx = prof_names.index(default_prof["name"]) if default_prof else 0
+
+    prof_idx = st.selectbox(
+        "Välj profil i filen",
+        options=list(range(len(profiles))),
+        index=def_idx,
+        format_func=lambda i: prof_names[i],
+        key="_server_profile_select",
+    )
+
+    sel = profiles[prof_idx]
+    ticker = sel["ticker"] or _normalize_ticker(chosen_fp.stem.split("_best")[0])
+    start = st.date_input("Startdatum", value=dt.date(2020,1,1))
+    end = st.date_input("Slutdatum", value=dt.date.today())
+    index_ticker = st.text_input("Index-ticker (för jämförelse)", value="OMXS30")
+    run = st.button("Kör backtest", type="primary")
+
+# -------- Körning --------
+st.markdown(f"**Vald fil:** `{chosen_fp.name}`  |  **Profil:** `{sel['name']}`  |  **Ticker:** `{ticker}`")
+
+# Visa profilens nyckelmetrik
+m = sel.get("metrics", {})
+colm1, colm2, colm3, colm4, colm5 = st.columns(5)
+colm1.metric("TotalReturn", f"{m.get('TotalReturn', 0):.3f}")
+colm2.metric("CAGR", f"{m.get('CAGR', 0):.3f}")
+colm3.metric("SharpeD", f"{m.get('SharpeD', 0):.3f}")
+colm4.metric("MaxDD", f"{m.get('MaxDD', 0):.3f}")
+colm5.metric("Buy&Hold", f"{m.get('BuyHold', 0):.3f}")
+
+if run:
+    # 1) Priser
+    try:
+        dfp = GET_OHLCV(ticker, start=start, source="borsdata")
+        dfp = dfp[(dfp.index.date >= start) & (dfp.index.date <= end)]
+        if dfp.empty:
+            st.error("Inga prisdata i vald period.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Kunde inte hämta priser för {ticker}: {e}")
+        st.stop()
+
+    # 2) Backtest (för att få trades), och positions via equity-bygg
+    try:
+        RUN_BT, Params = _import_backtest()
+        built_params = _maybe_build_params(Params, sel["params"])
+        res = RUN_BT(dfp, built_params)  # ska returnera dict m. 'trades' och 'equity' eller liknande
+        trades = res.get("trades")
+    except Exception as e:
+        st.error(f"Kunde inte köra backtest: {e}")
+        st.stop()
+
+    # 3) Portfölj-equity från positioner: antag hel exponering när inne (vi använder build_portfolio_with_caps)
+    try:
+        P = to_price_matrix({ticker: dfp})
+        # Enkel positionsserie från trades (om equity saknas): vi bygger 1/0 perioder
+        pos = pd.Series(0.0, index=dfp.index)
+        if isinstance(trades, pd.DataFrame) and len(trades) > 0:
+            # tolka EntryTime/ExitTime
+            cols = {c.lower(): c for c in trades.columns}
+            ed = next((cols.get(n) for n in ("entrytime","entry_time","entry","in","in_date")), None)
+            xd = next((cols.get(n) for n in ("exittime","exit_time","exit","out","out_date")), None)
+            ent = pd.to_datetime(trades[ed]).dt.normalize() if ed else pd.Series([], dtype="datetime64[ns]")
+            exi = pd.to_datetime(trades[xd]).dt.normalize() if xd else pd.Series(pd.NaT, index=trades.index)
+            for a,b in zip(ent, exi):
+                if pd.isna(b) or b <= a:
+                    pos.loc[pos.index.normalize() >= a] = 1.0
+                else:
+                    mask = (pos.index.normalize() >= a) & (pos.index.normalize() < b)
+                    pos.loc[mask] = 1.0
+
+        equity, _W = build_portfolio_with_caps({ticker: pos}, P, max_per_asset=1.0, max_total_equity=1.0, lag_days=1)
+        port = equity["value"].rename("Portfölj")
+    except Exception as e:
+        st.error(f"Kunde inte bygga portfölj-kurva: {e}")
+        st.stop()
+
+    # 4) Buy&Hold + Index
+    bh = buyhold_equity_from_price(P.iloc[:,0]).rename("Buy&Hold")
+    idx = index_equity(index_ticker, start).rename(f"{index_ticker} (index)")
+    bh = bh.reindex(port.index).ffill()
+    idx = idx.reindex(port.index).ffill()
+
+    def _norm(s: pd.Series) -> pd.Series:
+        s = s.dropna()
+        return s / float(s.iloc[0]) if len(s) else s
+
+    chart = pd.concat([_norm(port), _norm(bh), _norm(idx)], axis=1).dropna(how="all")
+
+    st.subheader("Kapitalutveckling (normaliserad till 1.0)")
+    st.line_chart(chart, height=420)
+
+    # 5) Trades
+    st.subheader("Transaktioner")
+    if isinstance(trades, pd.DataFrame) and len(trades):
+        st.dataframe(trades, width='stretch')
+        st.download_button(
+            "Ladda ned trades (CSV)",
+            trades.to_csv(index=False).encode("utf-8"),
+            file_name=f"{ticker.replace(':','-')}_trades.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("Inga affärer i perioden.")
+# === PARAM UI (auto) ===
+
+# === RUN/BT + SAVE (from current UI params) ===
+try:
+    RUN_BT, Params = _import_backtest()
+except Exception as _e:
+    RUN_BT, Params = None, None
+    st.error(f"Backtest-motorn kunde inte laddas: {_e}")
+
+def _normalize_ticker(t: str) -> str:
+    t = (t or "").strip().upper().replace(" ", "-").replace("_","-")
+    if not t.endswith(".ST"):
+        t += ".ST"
+    return t
+
+# Plocka ut just nu valda UI-värden -> params-dict
+def _ui_params_dict() -> dict:
+    ui = st.session_state
+    keys = [
+        "use_trend_filter","trend_ma_window",
+        "rsi_window","rsi_min","rsi_max",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal",
+        "use_bb_filter","bb_window","bb_nstd","bb_min",
+        "use_stop_loss","stop_mode","stop_loss_pct","atr_window","atr_mult",
+        "use_trailing_stop","atr_trail_window","atr_trail_mult",
+    ]
+    out = {}
+    for k in keys:
+        if k in ui:
+            out[k] = ui[k]
+    return out
+
+st.subheader("Kör backtest på dina parametrar")
+
+colA, colB, colC = st.columns([2,1,1])
+with colA:
+    bt_go = st.button("▶ Kör backtest", type="primary")
+with colB:
+    prof_name = st.text_input("Profilnamn att spara", value=st.session_state.get("loaded_profile_name") or "Min profil")
+with colC:
+    save_go = st.button("💾 Spara profil")
+
+if bt_go:
+    try:
+        t = st.session_state.get("selected_ticker") or st.session_state.get("ticker")
+        t = _normalize_ticker(t)
+        start_date = dt.date.fromisoformat(st.session_state.get("from_date"))
+        df = GET_OHLCV(t, start=start_date, source="borsdata")
+
+        params_d = _ui_params_dict()
+        built = _maybe_build_params(Params, params_d) if Params is not None else params_d
+        res = RUN_BT(df, built)
+
+        summ = res.get("summary", {})
+        eq   = res.get("equity")
+        tr   = res.get("trades")
+
+        # Linjegraf: strategi vs buy&hold (normaliserat)
+        price = df["Close"].rename(t)
+        bh = buyhold_equity_from_price(price).rename("Buy&Hold")
+        eq_s = pd.Series(eq["Equity"].values, index=pd.to_datetime(eq["Date"]), name="Strategi")
+        chart = pd.concat([
+            (eq_s/eq_s.iloc[0]).rename("Strategi"),
+            (bh.reindex(eq_s.index).ffill()/bh.dropna().iloc[0]).rename("Buy&Hold"),
+        ], axis=1).dropna()
+        st.line_chart(chart, height=360)
+
+        st.markdown("**Summering**")
+        st.json(summ)
+
+        st.markdown("**Transaktioner**")
+        if tr is not None and len(tr):
+            st.dataframe(tr, width='stretch')
+        else:
+            st.info("Inga affärer i perioden.")
+
+        st.session_state["_last_bt"] = {"ticker": t, "params": params_d, "summary": summ, "trades": tr}
+    except Exception as e:
+        st.error(f"Backtest misslyckades: {e}")
+
+if save_go:
+    last = st.session_state.get("_last_bt")
+    if not last:
+        st.warning("Kör ett backtest först.")
+    else:
+        try:
+            t = last["ticker"]; params_d = last["params"]; summ = last["summary"]
+            out = {"profiles":[{"ticker": t, "name": prof_name, "params": params_d, "metrics": summ}]}
+            outdir = Path("outputs/opt_results"); outdir.mkdir(parents=True, exist_ok=True)
+            stem = t.split(".")[0].replace("-","_")
+            fp = outdir / f"{stem}_final.json"
+            fp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+            st.success(f"Sparat: {fp}")
+        except Exception as e:
+            st.error(f"Kunde inte spara: {e}")
+
+import streamlit as st
+from datetime import date as _date
+
+try:
+    _defaults = default_ui_params()
+except Exception:
+    _defaults = {
+        "use_trend_filter": False,
+        "trend_ma_window": 100,
+        "rsi_window": 8,
+        "rsi_min": 30.0,
+        "rsi_max": 70.0,
+        "breakout_lookback": 55,
+        "exit_lookback": 20,
+        "use_macd_filter": False,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+        "use_bb_filter": False,
+        "bb_window": 20,
+        "bb_nstd": 2.0,
+        "bb_min": 0.5,
+        "use_stop_loss": True,
+        "stop_mode": "pct",
+        "stop_loss_pct": 0.08,
+        "atr_window": 14,
+        "atr_mult": 2.0,
+        "use_atr_trailing": False,
+        "atr_trail_mult": 1.5,
+    }
+
+for k, v in _defaults.items():
+    st.session_state.setdefault(k, v)
+
+st.session_state.setdefault("ticker", st.session_state.get("ticker", "VOLV B"))
+st.session_state.setdefault("from_date", st.session_state.get("from_date", "2020-01-01"))
+st.session_state.setdefault("to_date", st.session_state.get("to_date", _date.today().isoformat()))
+
+render_profiles_sidebar()
+
+with st.expander("⚙️ Parametrar", expanded=True):
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.text_input("Ticker", key="ticker")
+        st.text_input("Från (YYYY-MM-DD)", key="from_date")
+        st.text_input("Till (YYYY-MM-DD)", key="to_date")
+
+        st.checkbox("EMA trend-gate", key="use_trend_filter")
+        st.number_input("EMA-fönster", min_value=5, max_value=300, step=1, key="trend_ma_window")
+        st.number_input("RSI-fönster", min_value=5, max_value=50, step=1, key="rsi_window")
+        st.number_input("RSI min (köp-kors upp)", min_value=5.0, max_value=50.0, step=0.5, key="rsi_min")
+        st.number_input("RSI max (sälj-kors ned)", min_value=50.0, max_value=95.0, step=0.5, key="rsi_max")
+        st.number_input("Breakout lookback (0=av)", min_value=0, max_value=200, step=1, key="breakout_lookback")
+
+    with c2:
+        st.number_input("Exit lookback (0=av)", min_value=0, max_value=200, step=1, key="exit_lookback")
+        st.checkbox("MACD-filter (histogram > 0)", key="use_macd_filter")
+        st.number_input("MACD fast", min_value=3, max_value=30, step=1, key="macd_fast")
+        st.number_input("MACD slow", min_value=5, max_value=60, step=1, key="macd_slow")
+        st.number_input("MACD signal", min_value=2, max_value=30, step=1, key="macd_signal")
+
+        st.checkbox("Bollinger %B-filter", key="use_bb_filter")
+        st.number_input("BB fönster", min_value=5, max_value=60, step=1, key="bb_window")
+        st.number_input("BB std", min_value=1.0, max_value=5.0, step=0.1, key="bb_nstd")
+        st.number_input("%B ≤ (entry-tak)", min_value=0.0, max_value=1.0, step=0.05, key="bb_min")
+
+        st.checkbox("Aktivera stop-loss", key="use_stop_loss")
+        st.selectbox("Stop-mod", options=["pct","atr"],
+                    index=0 if st.session_state.get("stop_mode","pct")=="pct" else 1,
+                    key="stop_mode")
+        st.number_input("Stop % (vid pct)", min_value=0.01, max_value=0.50, step=0.01, key="stop_loss_pct")
+        st.number_input("ATR fönster", min_value=5, max_value=100, step=1, key="atr_window")
+        st.number_input("ATR multipel", min_value=0.5, max_value=5.0, step=0.1, key="atr_mult")
+        st.checkbox("ATR trailing", key="use_atr_trailing")
+        st.number_input("ATR trailing multipel", min_value=0.5, max_value=5.0, step=0.1, key="atr_trail_mult")
+# === END PARAM UI (auto) ===
+# === OPTIMIZER (random search) ===============================================
+import json, re, random, datetime as dt
+import numpy as np
+import pandas as pd
+import streamlit as st
+from pathlib import Path
+from app.portfolio_signals import _import_backtest, _maybe_build_params
+from app.data_providers import get_ohlcv as GET_OHLCV
+
+def _norm_ticker(t: str) -> str:
+    t = (t or "").strip().upper().replace("_","-").replace(" ", "-")
+    return t if t.endswith(".ST") else (t + ".ST")
+
+def _clip(v, lo, hi): 
+    return max(lo, min(hi, v))
+
+def _sample_params() -> dict:
+    # Slumpa över rimliga intervall
+    # (enkelt & robust – räcker fint för en demo/random search)
+    use_trend = random.choice([True, False])
+    use_macd  = random.choice([True, False])
+    use_bb    = random.choice([True, False])
+    use_sl    = random.choice([True, False])
+    stop_mode = random.choice(["pct","atr"])
+    use_trail = random.choice([True, False])
+
+    rsi_min = round(random.uniform(5.0, 45.0), 1)
+    rsi_max = round(random.uniform(55.0, 90.0), 1)
+    if rsi_max <= rsi_min + 5.0:
+        rsi_max = _clip(rsi_min + 5.0, 55.0, 90.0)
+
+    macd_fast = random.randint(3, 30)
+    macd_slow = random.randint(max(macd_fast+1, 5), 60)  # slow > fast
+    macd_signal = random.randint(2, 30)
+
+    params = {
+        "use_trend_filter": use_trend,
+        "trend_ma_window": random.randint(5, 300),
+
+        "rsi_window": random.randint(5, 50),
+        "rsi_min": rsi_min,
+        "rsi_max": rsi_max,
+
+        "breakout_lookback": random.randint(0, 200),
+        "exit_lookback": random.randint(0, 200),
+
+        "use_macd_filter": use_macd,
+        "macd_fast": macd_fast,
+        "macd_slow": macd_slow,
+        "macd_signal": macd_signal,
+
+        "use_bb_filter": use_bb,
+        "bb_window": random.randint(5, 60),
+        "bb_nstd": round(random.uniform(1.0, 5.0), 1),
+        "bb_min": round(random.uniform(0.0, 1.0), 2),
+
+        "use_stop_loss": use_sl,
+        "stop_mode": stop_mode,
+        "stop_loss_pct": round(random.uniform(0.01, 0.50), 2),
+
+        "atr_window": random.randint(5, 100),
+        "atr_mult": round(random.uniform(0.5, 5.0), 1),
+        "use_atr_trailing": use_trail,
+        "atr_trail_mult": round(random.uniform(0.5, 5.0), 1),
+    }
+    return params
+
+def _score(summary: dict, target: str) -> float:
+    try:
+        return float(summary.get(target, float("-inf")))
+    except Exception:
+        return float("-inf")
+
+st.divider()
+st.subheader("🧪 Optimizer (random search)")
+
+c1, c2, c3, c4 = st.columns(4)
+N    = int(c1.number_input("Simuleringar (N)", 10, 100_000, 200, step=50, key="opt_N"))
+seed = int(c2.number_input("Slumpfrö", 0, 999_999, 42, step=1, key="opt_seed"))
+target = c3.selectbox("Målfunktion", ["SharpeD", "TotalReturn", "CAGR"], index=0, key="opt_target")
+start_btn = c4.button("Starta optimering", type="primary", key="opt_start")
+
+if start_btn:
+    random.seed(seed); np.random.seed(seed)
+
+    # Plocka datum & ticker från UI (Parametrar-rutan vi lade tillbaka)
+    _t_raw = st.session_state.get("ticker", "VOLV B")
+    _t = _norm_ticker(_t_raw)
+    try:
+        _from = dt.date.fromisoformat(st.session_state.get("from_date", "2020-01-01"))
+    except Exception:
+        _from = dt.date(2020,1,1)
+
+    st.info(f"Kör optimering för **{_t}** från **{_from.isoformat()}** …")
+    df = GET_OHLCV(_t, start=_from, source="borsdata")
+
+    RUN_BT, Params = _import_backtest()
+
+    prog = st.progress(0.0, text="Initierar …")
+    best = {"score": float("-inf"), "params": None, "summary": None}
+    rows = []
+
+    for i in range(1, N+1):
+        cand = _sample_params()
+        built = _maybe_build_params(Params, cand)
+        try:
+            res = RUN_BT(df, built)  # vi vet att denna ger dict med 'summary'
+            summ = res.get("summary", {})
+            sc = _score(summ, target)
+            rows.append({"i": i, "score": sc, **{k: summ.get(k) for k in ("SharpeD","TotalReturn","CAGR","MaxDD","FinalEquity")}})
+            if sc > best["score"]:
+                best = {"score": sc, "params": cand, "summary": summ}
+        except Exception as e:
+            rows.append({"i": i, "score": -1e9, "error": str(e)})
+
+        if i % max(1, N//100) == 0 or i == N:
+            prog.progress(i/N, text=f"Kör {i}/{N} … bästa {target} = {best['score']:.4f}")
+
+    prog.empty()
+
+    # Visa resultat
+    st.success(f"Bäst {target}: **{best['score']:.4f}**")
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**Bästa parametrar**")
+        st.json(best["params"])
+    with colB:
+        st.markdown("**Bästa sammanfattning**")
+        st.json(best["summary"])
+
+    # Topplista
+    try:
+        dfres = pd.DataFrame(rows).sort_values("score", ascending=False).head(25)
+        st.markdown("**Top 25 kandidater**")
+        st.dataframe(dfres, width='stretch')
+    except Exception:
+        pass
+
+    # Spara som profil
+    def _file_safe(name: str) -> str:
+        name = name.upper()
+        name = re.sub(r"[^A-Z0-9]+", "_", name).strip("_")
+        return name
+
+    if st.button("💾 Spara bästa som profil (JSON)", key="opt_save_best"):
+        outdir = Path("outputs/opt_results"); outdir.mkdir(parents=True, exist_ok=True)
+        base = _file_safe(_t_raw) or _file_safe(_t)
+        fp = outdir / f"{base}_final.json"
+        payload = {
+            "profiles": [{
+                "ticker": _t,
+                "name": f"{_t_raw} – optimized",
+                "params": best["params"],
+            }],
+            "summary": best["summary"],
+            "created": dt.datetime.utcnow().isoformat()+"Z",
+            "target": target,
+            "random_search": {"N": N, "seed": seed},
+        }
+        fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        st.success(f"Sparat: `{fp}`")
+# === END OPTIMIZER ============================================================
+
+
+
+# === AUTO PROFILE APPLY & AUTOBACKTEST ===
+def _param_keys_map():
+    # Mappar UI-nycklar vi använder i sidan
+    return {
+        "use_trend_filter": "use_trend_filter",
+        "trend_ma_window": "trend_ma_window",
+        "rsi_window": "rsi_window",
+        "rsi_min": "rsi_min",
+        "rsi_max": "rsi_max",
+        "breakout_lookback": "breakout_lookback",
+        "exit_lookback": "exit_lookback",
+        "use_macd_filter": "use_macd_filter",
+        "macd_fast": "macd_fast",
+        "macd_slow": "macd_slow",
+        "macd_signal": "macd_signal",
+        "use_bb_filter": "use_bb_filter",
+        "bb_window": "bb_window",
+        "bb_nstd": "bb_nstd",
+        "bb_min": "bb_min",
+        "use_stop_loss": "use_stop_loss",
+        "stop_mode": "stop_mode",            # "pct" eller "atr"
+        "stop_loss_pct": "stop_loss_pct",
+        "atr_window": "atr_window",
+        "atr_mult": "atr_mult",
+        # Valfria/tillägg
+        "atr_trail_mult": "atr_trail_mult",
+    }
+
+def _apply_profile_to_state(_prof: dict):
+    import streamlit as st
+    params = _prof.get("params") or {}
+    # Sätt ticker om den finns i profilen
+    t = (_prof.get("ticker") or "").strip()
+    if t:
+        st.session_state["ticker"] = t
+    # Skriv in alla kända parametrar
+    for src_key, dst_key in m.items():
+        if src_key in params:
+            st.session_state[dst_key] = params[src_key]
+
+def _read_first_profile(fp: Path) -> dict:
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    profs = data.get("profiles") or []
+    if profs and isinstance(profs[0], dict):
+        return profs[0]
+    # fallback: vissa av dina äldre filer kan ha top-level "params"
+    if "params" in data:
+        return data
+    return {}
+
+# --- Auto-apply när valet ändras ---
+try:
+    import streamlit as st
+    _profiles_dir = Path("outputs/opt_results").resolve()
+    _sel = st.session_state.get("_server_profile_select")  # dropdownens key som vi redan använder
+    _last = st.session_state.get("_last_applied_profile")
+    if _sel and _sel != _last:
+        # Förväntar oss att _sel innehåller själva filnamnet, t.ex. "HM_B_best_backtrack.json"
+        fp = (_profiles_dir / _sel)
+        if fp.exists():
+            _prof = _read_first_profile(fp)
+            if _prof:
+                _apply_profile_to_state(_prof)
+                st.session_state["_last_applied_profile"] = _sel
+                # Flagga för auto-backtest efter widgets renderats
+                st.session_state["_auto_run_profile_bt"] = True
+                st.rerun()
+except Exception as _e:
+    try:
+        import streamlit as st
+        st.warning(f"Auto-apply av profil misslyckades: {_e}")
+    except Exception:
+        pass
+
+# --- Auto-backtest, körs i slutet av sidan ---
+try:
+    import streamlit as st
+    if st.session_state.get("_auto_run_profile_bt"):
+        st.session_state["_auto_run_profile_bt"] = False
+        from datetime import date as _date
+        from app.portfolio_signals import _import_backtest, _maybe_build_params
+        from app.data_providers import get_ohlcv as GET_OHLCV
+
+        # Hämta ticker + datum från state (sidan använder redan dessa)
+        ticker = st.session_state.get("ticker", "HM-B.ST")
+        # Sidan använder strängdatum i inputs – gardera mot bägge format
+        _from = st.session_state.get("from_date")
+        _to   = st.session_state.get("to_date")
+        if isinstance(_from, str):
+            start = _date.fromisoformat(_from)
+        else:
+            start = _from or _date(2020,1,1)
+
+        # Bygg Params från state
+        RUN_BT, Params = _import_backtest()
+        m = _param_keys_map()
+        params = {k: st.session_state.get(v) for k,v in m.items() if v in st.session_state}
+        built = _maybe_build_params(Params, params)
+
+        # Hämta data + kör
+        df = GET_OHLCV(ticker, start=start, source="borsdata")
+        res = RUN_BT(df, built)  # dict med 'summary','equity','trades' (enligt våra tester)
+
+        st.success("Auto-backtest körd från vald profil ✅")
+
+        # Visa equity-linje + kort summering så du ser att den körts
+        import pandas as pd
+        eq = res.get("equity")
+        if isinstance(eq, pd.DataFrame) and "Equity" in eq.columns:
+            s = pd.Series(eq["Equity"].values, index=pd.to_datetime(eq["Date"]))
+            s = s / float(s.iloc[0])
+            st.line_chart(s.rename("Equity (norm 1.0)"), height=240)
+        summ = res.get("summary", {})
+        if summ:
+            cols = st.columns(4)
+            cols[0].metric("TotalReturn", f"{summ.get('TotalReturn', 0):.2f}×")
+            cols[1].metric("MaxDD", f"{summ.get('MaxDD', 0)*100:.1f}%")
+            cols[2].metric("SharpeD", f"{summ.get('SharpeD', 0):.2f}")
+            cols[3].metric("Trades", f"{summ.get('Trades', 0)}")
+except Exception as _e:
+    try:
+        import streamlit as st
+        st.error(f"Auto-backtest fel: {_e}")
+    except Exception:
+        pass
+
+
+
+# === AUTO APPLY SERVER PROFILE → SESSION STATE ===
+def _ui_param_keymap():
+    # Mappar profilens params → dina widget-keys
+    return {
+        "use_trend_filter": "use_trend_filter",
+        "trend_ma_window": "trend_ma_window",
+        "rsi_window": "rsi_window",
+        "rsi_min": "rsi_min",
+        "rsi_max": "rsi_max",
+        "breakout_lookback": "breakout_lookback",
+        "exit_lookback": "exit_lookback",
+        "use_macd_filter": "use_macd_filter",
+        "macd_fast": "macd_fast",
+        "macd_slow": "macd_slow",
+        "macd_signal": "macd_signal",
+        "use_bb_filter": "use_bb_filter",
+        "bb_window": "bb_window",
+        "bb_nstd": "bb_nstd",
+        "bb_min": "bb_min",
+        "use_stop_loss": "use_stop_loss",
+        "stop_mode": "stop_mode",          # "pct" / "atr"
+        "stop_loss_pct": "stop_loss_pct",
+        "atr_window": "atr_window",
+        "atr_mult": "atr_mult",
+        "atr_trail_mult": "atr_trail_mult",
+    }
+
+def _read_profile_first(fp: Path) -> dict:
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    profs = data.get("profiles") or []
+    if profs and isinstance(profs[0], dict):
+        return profs[0]
+    # fallback om det är "platt" json med params
+    if isinstance(data, dict) and "params" in data:
+        return data
+    return {}
+
+def _apply_profile_to_session(prof: dict):
+    import streamlit as st
+    params = prof.get("params") or {}
+    # fyll ticker om den finns
+    t = (prof.get("ticker") or "").strip()
+    if t:
+        st.session_state["ticker"] = t
+    # fyll alla kända parametrar
+    for pkey, uikey in _ui_param_keymap().items():
+        if pkey in params:
+            st.session_state[uikey] = params[pkey]
+
+# --- auto-apply när dropdownen ändras ---
+try:
+    import streamlit as st
+    PROFILES_DIR = Path("outputs/opt_results").resolve()
+    sel = st.session_state.get("_server_profile_select")  # dropdownens key i din sida
+    last = st.session_state.get("_last_applied_profile")
+    if sel and sel != last:
+        fp = PROFILES_DIR / sel
+        if fp.exists():
+            prof = _read_profile_first(fp)
+            if prof:
+                _apply_profile_to_session(prof)
+                st.session_state["_last_applied_profile"] = sel
+                # uppdatera widgets direkt
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
+except Exception as _e:
+    try:
+        import streamlit as st
+        st.warning(f"Profilimport misslyckades: {_e}")
+    except Exception:
+        pass
+
+
+

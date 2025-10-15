@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Envs & local stuff
+.venv/
+.env
+.env.* 
+*.tgz
+*.tar.gz
+*.zip
+
+# Artifacts / data / logs
+logs/
+results/
+outputs/
+backup*/
+backups/
+runtime/
+*.sqlite
+*.db
+
+# Streamlit & misc
+.streamlit/secrets.toml
+.ssh/

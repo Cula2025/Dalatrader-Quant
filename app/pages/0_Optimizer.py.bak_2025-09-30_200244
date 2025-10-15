@@ -1,0 +1,237 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import math
+import random
+from datetime import date, datetime
+from pathlib import Path
+from typing import Dict, Any, List
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# Branding (frivillig)
+try:
+    from app.branding import apply as brand
+except Exception:
+    def brand(*a, **k): pass
+
+brand(page_title="Dala Trader – Optimizer", page_icon="⚙️")
+
+st.title("⚙️ Optimizer")
+st.caption("Slumpa många parametrar (Monte Carlo), välj tre profiler per ticker (conservative/balanced/aggressive) och spara som JSON.")
+
+# -----------------------------
+# UI – indata
+# -----------------------------
+colA, colB, colC = st.columns([1,1,1], vertical_alignment="bottom")
+with colA:
+    ticker = st.text_input("Ticker", value=st.session_state.get("ticker","VOLV-B.ST")).strip()
+with colB:
+    from_date = st.date_input("Från", value=date(2020,9,29))
+with colC:
+    to_date   = st.date_input("Till",  value=date(2025,9,29))
+
+col1, col2, col3, col4 = st.columns([1,1,1,1], vertical_alignment="bottom")
+with col1:
+    n_sims = st.number_input("Antal simuleringar", min_value=100, max_value=100000, step=100, value=10000)
+with col2:
+    seed = st.number_input("Slumpfrö", min_value=0, max_value=1_000_000_000, step=1, value=42)
+with col3:
+    show_table = st.checkbox("Visa full resultat-tabell", value=False)
+with col4:
+    run_btn = st.button("🚀 Kör optimering")
+
+st.markdown("---")
+
+def _ticker_label(t: str) -> str:
+    t = (t or "").strip()
+    if t.upper().endswith(".ST"):
+        t = t[:-3]
+    return t.replace("-", " ").strip() or "TICKER"
+
+def _years_between(a: date, b: date) -> float:
+    days = abs((b - a).days)
+    return max(days / 365.25, 1e-9)
+
+# Poängfunktion – väga SharpeD högst, sen TotalReturn, mild bonus för mindre (mindre negativ) MaxDD
+def _score_row(r: Dict[str, Any]) -> float:
+    sharpe = float(r.get("SharpeD", 0.0) or 0.0)
+    tr     = float(r.get("TotalReturn", 0.0) or 0.0)
+    maxdd  = float(r.get("MaxDD", -1.0) or -1.0)
+    return sharpe*1.0 + tr*0.3 + maxdd*0.2
+
+# Slumpa en parameteruppsättning (håll intervallet rimligt men brett)
+def _rand_params(rng: random.Random) -> Dict[str, Any]:
+    # bool med 50% sannolikhet
+    b50 = lambda: bool(rng.getrandbits(1))
+    # floats
+    def ur(a,b): return a + (b-a)*rng.random()
+
+    # strategiflaggor
+    use_rsi_filter   = b50()
+    use_trend_filter = b50()
+    use_macd_filter  = b50()
+    use_bb_filter    = b50()
+    use_stop_loss    = b50()
+    use_atr_trailing = b50()
+
+    trend_ma_type = rng.choice(["SMA","EMA"])
+
+    params = {
+        "use_rsi_filter": use_rsi_filter,
+        "rsi_window":     rng.randint(5, 35),
+        "rsi_min":        ur(5.0, 35.0),
+        "rsi_max":        ur(60.0, 85.0),
+
+        "use_trend_filter": use_trend_filter,
+        "trend_ma_type":  trend_ma_type,
+        "trend_ma_window": rng.randint(20, 200),
+
+        "breakout_lookback": rng.randint(20, 120),
+        "exit_lookback":     rng.randint(10, 60),
+
+        "use_macd_filter": use_macd_filter,
+        "macd_fast":   rng.randint(8, 16),
+        "macd_slow":   rng.randint(18, 30),
+        "macd_signal": rng.randint(8, 14),
+
+        "use_bb_filter": use_bb_filter,
+        "bb_window": rng.randint(15, 30),
+        "bb_nstd":   ur(1.6, 2.4),
+        "bb_min":    ur(0.0, 0.8),
+
+        "use_stop_loss": use_stop_loss,
+        "stop_mode": rng.choice(["pct","atr"]),
+        "stop_loss_pct": ur(0.03, 0.20),
+
+        "atr_window": rng.randint(10, 20),
+        "atr_mult":   ur(1.2, 3.2),
+
+        "use_atr_trailing": use_atr_trailing,
+        "atr_trail_mult":   ur(1.2, 3.5),
+    }
+    return params
+
+def _run_one(profile: Dict[str, Any]) -> Dict[str, Any]:
+    # Kör via btwrap (samma väg som UI)
+    from app.btwrap import run_backtest
+    res = run_backtest(profile)
+    summ = res.get("summary", {}) if isinstance(res, dict) else {}
+    out: Dict[str, Any] = {}
+    # kopiera metrics vi bryr oss om
+    for k in ("TotalReturn","MaxDD","SharpeD","BuyHold","FinalEquity","Bars","Trades"):
+        out[k] = summ.get(k)
+    return out
+
+def _build_profile(ticker: str, params: Dict[str, Any], from_date: str, to_date: str) -> Dict[str, Any]:
+    p = params.copy()
+    p["from_date"] = from_date
+    p["to_date"]   = to_date
+    return {"ticker": ticker, "params": p}
+
+if run_btn:
+    if not ticker:
+        st.error("Ange en ticker.")
+        st.stop()
+
+    rng = random.Random(int(seed))
+    rows: List[Dict[str,Any]] = []
+
+    # Kör Monte Carlo
+    with st.spinner(f"Kör {int(n_sims):,} simuleringar …"):
+        for i in range(int(n_sims)):
+            params = _rand_params(rng)
+            prof = _build_profile(ticker, params, str(from_date), str(to_date))
+            try:
+                metrics = _run_one(prof)
+                # bygg rad
+                row = params.copy()
+                row.update(metrics)
+                rows.append(row)
+            except Exception as e:
+                # spara felrad om du vill analysera — här hoppar vi bara
+                pass
+
+    if not rows:
+        st.error("Inga resultat (alla körningar felade?).")
+        st.stop()
+
+    df = pd.DataFrame(rows)
+    # rensa konstigheter
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["TotalReturn","MaxDD","SharpeD"], how="any")
+    if df.empty:
+        st.error("Alla resultat saknar nödvändiga metrics.")
+        st.stop()
+
+    # CAGR (approx) från periodlängd
+    yrs = _years_between(from_date, to_date)
+    with np.errstate(invalid="ignore"):
+        df["CAGR"] = ((1.0 + df["TotalReturn"].astype(float)) ** (1.0/yrs)) - 1.0
+
+    # score
+    df["Score"] = df.apply(lambda r: _score_row(r.to_dict()), axis=1)
+
+    # risk-buckets på MaxDD (mer negativ = högre risk)
+    q1, q2 = df["MaxDD"].quantile([0.33, 0.66])
+    low_risk  = df[df["MaxDD"] >= q2]                             # minst DD
+    mid_risk  = df[(df["MaxDD"] < q2) & (df["MaxDD"] >= q1)]
+    high_risk = df[df["MaxDD"] < q1]                              # störst DD
+
+    pick_cons = low_risk.sort_values(["Score","SharpeD","TotalReturn"], ascending=False).head(1)
+    pick_bal  = mid_risk.sort_values(["Score","SharpeD","TotalReturn"], ascending=False).head(1)
+    pick_aggr = high_risk.sort_values(["TotalReturn","Score","SharpeD"], ascending=False).head(1)
+
+    # packa profiler
+    param_keys = [
+        "use_rsi_filter","rsi_window","rsi_min","rsi_max",
+        "use_trend_filter","trend_ma_type","trend_ma_window",
+        "breakout_lookback","exit_lookback",
+        "use_macd_filter","macd_fast","macd_slow","macd_signal",
+        "use_bb_filter","bb_window","bb_nstd","bb_min",
+        "use_stop_loss","stop_mode","stop_loss_pct","atr_window","atr_mult",
+        "use_atr_trailing","atr_trail_mult",
+    ]
+
+    def _row_to_profile(row: pd.Series, name_prefix: str, ticker_label: str) -> Dict[str, Any]:
+        r = row.to_dict()
+        params = {k: r[k] for k in param_keys if k in r}
+        metrics = {
+            "TotalReturn": float(r.get("TotalReturn", 0.0) or 0.0),
+            "MaxDD":       float(r.get("MaxDD", 0.0) or 0.0),
+            "SharpeD":     float(r.get("SharpeD", 0.0) or 0.0),
+            "BuyHold":     float(r.get("BuyHold", 0.0) or 0.0),
+            "CAGR":        float(r.get("CAGR", 0.0) or 0.0),
+        }
+        return {
+            "name":   f"{ticker_label} – {name_prefix}",
+            "ticker": ticker_label,
+            "params": params,
+            "metrics": metrics,
+        }
+
+    label = _ticker_label(ticker)
+    profiles: List[Dict[str, Any]] = []
+    if len(pick_cons): profiles.append(_row_to_profile(pick_cons.iloc[0], "conservative", label))
+    if len(pick_bal):  profiles.append(_row_to_profile(pick_bal.iloc[0],  "balanced",     label))
+    if len(pick_aggr): profiles.append(_row_to_profile(pick_aggr.iloc[0], "aggressive",   label))
+
+    out = {"profiles": profiles}
+
+    # spara fil
+    outdir = Path("profiles_out")
+    outdir.mkdir(exist_ok=True)
+    outfile = outdir / f"{label.replace(' ','_').upper()}_optimized.json"
+    outfile.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # UI-output
+    st.success(f"Sparade tre profiler till: {outfile}")
+    if show_table:
+        st.dataframe(df.sort_values("Score", ascending=False).reset_index(drop=True))
+    st.json(out)
+
+else:
+    st.info("Fyll i ticker och period, välj antal simuleringar, klicka sedan **Kör optimering**.")
