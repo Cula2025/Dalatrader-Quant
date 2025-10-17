@@ -1,0 +1,20 @@
+# --- V3 ignores ---
+.venv/
+.env
+.cache_v3/
+logs_v3/
+runs_v3/
+__pycache__/
+*.parquet
+*.pkl
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# --- extra ignores ---
+.ssh/
+.cache/
+.bash_history
+
+.git-credentials
