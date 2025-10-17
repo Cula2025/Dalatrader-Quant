@@ -1,0 +1,25 @@
+{
+  "ticker": "GETI B",
+  "generated_at": "2025-10-16 17:15:14",
+  "profiles": [
+    {
+      "name": "best",
+      "params": {
+        "fast": 16,
+        "slow": 20,
+        "fee_bps": 5,
+        "slippage_bps": 2,
+        "start": "2020-10-14",
+        "end": "2025-10-14"
+      },
+      "metrics": {
+        "FinalEquity": 2.1164283901435463,
+        "TotalReturn": 1.1164283901435463,
+        "SharpeD": 0.7595655644288571,
+        "MaxDD": -0.3216622989798408,
+        "BuyHold": 0.981896141019533,
+        "BTx": 2.1164283901435463
+      }
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "profiles": [
+    {
+      "name": "BOL \u2013 rank1",
+      "ticker": "BOL",
+      "params": {
+        "fast": 26,
+        "slow": 46,
+        "fee_bps": 0.0,
+        "slippage_bps": 0.0,
+        "start": "2020-10-14",
+        "end": "2025-10-14"
+      },
+      "metrics": {
+        "Bars": 1259,
+        "Trades": 15,
+        "FinalEquity": 203937.78770098643,
+        "TotalReturn": 1.0393778770098643,
+        "BuyHold": 1.6215155084413035,
+        "MaxDD": -0.3268904554359391,
+        "SharpeD": 0.7016228990035668,
+        "CAGR": 0.1532089798413967
+      }
+    },
+    {
+      "name": "BOL \u2013 rank2",
+      "ticker": "BOL",
+      "params": {
+        "fast": 26,
+        "slow": 46,
+        "fee_bps": 0.0,
+        "slippage_bps": 0.0,
+        "start": "2020-10-14",
+        "end": "2025-10-14"
+      },
+      "metrics": {
+        "Bars": 1259,
+        "Trades": 15,
+        "FinalEquity": 203937.78770098643,
+        "TotalReturn": 1.0393778770098643,
+        "BuyHold": 1.6215155084413035,
+        "MaxDD": -0.3268904554359391,
+        "SharpeD": 0.7016228990035668,
+        "CAGR": 0.1532089798413967
+      }
+    },
+    {
+      "name": "BOL \u2013 rank3",
+      "ticker": "BOL",
+      "params": {
+        "fast": 26,
+        "slow": 46,
+        "fee_bps": 0.0,
+        "slippage_bps": 0.0,
+        "start": "2020-10-14",
+        "end": "2025-10-14"
+      },
+      "metrics": {
+        "Bars": 1259,
+        "Trades": 15,
+        "FinalEquity": 203937.78770098643,
+        "TotalReturn": 1.0393778770098643,
+        "BuyHold": 1.6215155084413035,
+        "MaxDD": -0.3268904554359391,
+        "SharpeD": 0.7016228990035668,
+        "CAGR": 0.1532089798413967
+      }
+    }
+  ]
+}
