@@ -25,3 +25,17 @@ runtime/
 # Streamlit & misc
 .streamlit/secrets.toml
 .ssh/
+# v3 local
+sitecustomize.py
+portfolio_v3/
+profiles_v3/portfolio.json
+runs/
+uploads_v3/
+data_cache/
+logs/
+tmp/
+__pycache__/
+*.log
+backups_v3/
+*.bak_*
+*.bak_trades_*
